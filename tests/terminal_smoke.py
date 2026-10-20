@@ -5,12 +5,14 @@ Run after cargo build. Requires Python 3, redis-server, redis-cli, and a Unix PT
 No third-party Python dependencies or existing Redis instance are needed.
 """
 import fcntl
+import errno
 import json
 import os
 from pathlib import Path
 import pty
 import re
 import select
+import socket as sockets
 import struct
 import subprocess
 import tempfile
@@ -53,21 +55,24 @@ class Frame:
         width = max((x + 1 for y, x in self.cells if y == row), default=0)
         return "".join(self.cells.get((row, x), " ") for x in range(width)).rstrip()
 
-    def hint_is_inline(self, typed, hint):
+    def hint_is_inline(self, typed, hint, colors=("90", "38;5;8")):
         prompt = "rmycli> "
         return (self.row(self.y) == prompt + typed + hint
                 and self.x == len(prompt + typed)
-                and (not hint or self.colors.get((self.y, self.x)) in ("90", "38;5;8")))
+                and (not hint or self.colors.get((self.y, self.x)) in colors))
 
 
 class Terminal:
-    def __init__(self, socket, *options):
+    def __init__(self, socket, *options, env=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
+        connection = ["-s", socket] if socket else []
+        config = [] if "--config" in options else ["--no-config"]
         self.process = subprocess.Popen(
-            [str(BINARY), "-s", socket, *options], stdin=slave, stdout=slave,
-            stderr=slave, env={**{k: v for k, v in os.environ.items() if k != "NO_COLOR"},
-                 "TERM": "xterm-256color"},
+            [str(BINARY), *connection, *config, *options], stdin=slave, stdout=slave,
+            stderr=slave, env={**{k: v for k, v in os.environ.items()
+                                 if k not in ("NO_COLOR", "REDIS_URL", "REDISCLI_AUTH")},
+                 "TERM": "xterm-256color", **(env or {})},
         )
         os.close(slave)
         self.data = b""
@@ -112,8 +117,51 @@ class Terminal:
         assert self.process.returncode == 0
 
 
+def config_terminal_output(path, *args, no_color=None):
+    """Run a local settings command with terminal stdout and capture its ANSI."""
+    master, slave = pty.openpty()
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("NO_COLOR", "REDISCLI_AUTH")}
+    env.update(TERM="xterm-256color", REDIS_URL="invalid-url-not-used-by-config")
+    if no_color is not None:
+        env["NO_COLOR"] = no_color
+    try:
+        result = subprocess.run(
+            [str(BINARY), "config", "--config", str(path), *args],
+            stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.PIPE,
+            env=env, timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+    finally:
+        os.close(slave)
+    data = b""
+    try:
+        while True:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(master)
+    return data
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="rmycli-terminal-") as directory:
+        settings_path = Path(directory) / "preview.toml"
+        preview = config_terminal_output(settings_path, "set", "theme.inline-hint", "#12abef")
+        assert b"#12abef  \x1b[38;2;18;171;239msample text\x1b[0m" in preview
+        preview = config_terminal_output(settings_path, "get", "theme.inline-hint")
+        assert b"\x1b[38;2;18;171;239msample text\x1b[0m" in preview
+        plain = config_terminal_output(settings_path, "get", "theme.inline-hint", no_color="1")
+        assert plain == b"#12abef\r\n"
+        plain = config_terminal_output(settings_path, "get", "theme.inline-hint", "--color", "never")
+        assert plain == b"#12abef\r\n"
         socket = str(Path(directory) / "redis.sock")
         server = subprocess.Popen(
             ["redis-server", "--port", "0", "--save", "", "--appendonly", "no",
@@ -128,8 +176,10 @@ def main():
             ))
 
         def cli(*args, stdin=None):
-            return subprocess.run([str(BINARY), "-s", socket, *args],
-                                  input=stdin, capture_output=True, timeout=5)
+            return subprocess.run([str(BINARY), "--no-config", "-s", socket, *args],
+                                  input=stdin, capture_output=True, timeout=5,
+                                  env={k: v for k, v in os.environ.items()
+                                       if k not in ("REDIS_URL", "REDISCLI_AUTH")})
 
         try:
             deadline = time.monotonic() + 5
@@ -141,6 +191,7 @@ def main():
             redis("SET", "list:not-a-list", "string")
 
             assert cli("PING").stdout == b"PONG\n"
+            assert b"maxmemory" in cli("CONFIG", "GET", "maxmemory").stdout
             assert cli("SET", "binary", "a b").returncode == 0
             assert cli("--raw", "GET", "binary").stdout == b"a b\n"
             assert cli("--reply-threshold", "1", "LRANGE", "list:a", "0", "-1").returncode == 1
@@ -219,6 +270,57 @@ def main():
             third.expect("at least 0 matches (partial scan)")
             third.send(b"\x1b\x15PING\r")
             third.expect("PONG")
+
+            # Enable TCP on this isolated server for a saved instance.
+            with sockets.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            redis("CONFIG", "SET", "port", str(port))
+            redis("ACL", "SETUSER", "qa", "on", ">qa-test-secret", "~*", "&*", "+@all")
+            config = Path(directory) / "rmycli.toml"
+            config.write_text(
+                '[theme]\ninline-hint = "cyan"\n'
+                '[theme.commands]\nlrange = "#12abef"\n'
+                'xgroup = "green"\n"XGROUP CREATE" = "red"\n'
+                '[instances.qa]\nhost = "127.0.0.1"\n'
+                f'port = {port}\nuser = "qa"\n'
+                'password-env = "RMYCLI_QA_AUTH"\n',
+            )
+            auth_env = {"RMYCLI_QA_AUTH": "qa-test-secret"}
+            configured = Terminal(None, "--config", str(config), "--instance", "qa",
+                                  env=auth_env)
+            terminals.append(configured)
+            configured.send(b"ACL WHOAMI\r")
+            configured.expect_frame(lambda f: any(f.row(y) == "qa" for y in range(f.y)),
+                                    "saved instance authenticated as qa")
+            configured.send(b"get")
+            configured.expect_frame(
+                lambda f: f.hint_is_inline("get", " key", ("96", "38;5;14")),
+                "configured default hint color",
+            )
+            configured.send(b"\x15lrange")
+            configured.expect_frame(
+                lambda f: f.hint_is_inline("lrange", " key start stop", ("38;2;18;171;239",)),
+                "configured command hint color",
+            )
+            configured.send(b"\x15xgroup create")
+            configured.expect_frame(
+                lambda f: f.row(f.y).startswith("rmycli> xgroup create key group")
+                and f.colors.get((f.y, f.x)) in ("91", "38;5;9"),
+                "subcommand color overrides parent command",
+            )
+            configured.send(b"\x15xgroup destroy")
+            configured.expect_frame(
+                lambda f: f.hint_is_inline("xgroup destroy", " key group", ("92", "38;5;10")),
+                "subcommand inherits parent color",
+            )
+            # Disabling the default account makes missing auxiliary auth fail.
+            redis("ACL", "SETUSER", "default", "off")
+            configured.send(b"\x15LRANGE list:a\t")
+            configured.expect("1 matches")
+            configured.send(b"\x15LRANGE list:a 0 -1\r")
+            configured.expect_frame(lambda f: any(f.row(y) == "1) a" for y in range(f.y)),
+                                    "authenticated execution and auxiliary requests")
             print("Terminal and CLI smoke tests passed")
         finally:
             for terminal in terminals:

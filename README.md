@@ -50,11 +50,139 @@ Formatted output escapes terminal control sequences; `--raw` writes bulk
 reply bytes verbatim in noninteractive mode. Redis errors exit noninteractive
 mode with a nonzero status.
 
+## Configuration and saved instances
+
+Settings are read once at startup from the first available file, in this order:
+
+1. `$XDG_CONFIG_HOME/rmycli.toml`, or `~/.config/rmycli.toml` when
+   `XDG_CONFIG_HOME` is unset, empty, or relative.
+2. `rmycli.toml` in each directory in `$XDG_CONFIG_DIRS`, in order (default:
+   `/etc/xdg`). Relative directory entries are ignored.
+
+Use `--config /path/to/settings.toml` to select a file explicitly, or
+`--no-config` to use built-in settings. Files are not merged. Missing discovered
+files are skipped; a missing explicit file, unreadable file, malformed TOML,
+unknown setting, or invalid value causes an error before connecting. No file is
+created during normal startup. `--help` and `--version` work without loading
+settings.
+
+For example, create `~/.config/rmycli.toml`:
+
+```toml
+[theme]
+inline-hint = "dark_grey"
+
+[theme.commands]
+GET = "cyan"
+LRANGE = "#89b4fa"
+XGROUP = "green"
+"XGROUP CREATE" = "yellow"
+
+[instances.qa]
+host = "redis.qa.example.com"
+port = 6379
+db = 0
+user = "alice"
+password-env = "QA_REDIS_PASSWORD"
+tls = false
+```
+
+Select an instance with `rmycli --instance qa` (also works with a command, such
+as `rmycli --instance qa PING`). Authentication happens automatically on connect,
+including background completion and reply-estimation connections. Instances
+are selected explicitly, not inferred from host/port. Instance names are case
+sensitive. An unknown instance is an error.
+
+All instance fields are optional: host and port default to `127.0.0.1:6379`,
+database to zero, and TLS to off. Omit `user` for Redis's default user or
+password-only authentication. Set `tls = true` for certificate-verified TLS.
+Use either `password = "..."` or `password-env = "ENVIRONMENT_VARIABLE"`;
+the latter reads the password from that variable when the instance is selected.
+A missing password variable is an error unless a higher-priority password is
+provided. Protect a file containing passwords with owner-only permissions.
+
+Explicit `-h`, `-p`, `-n`, `--user`, and `-a` override the selected instance's
+values. `REDISCLI_AUTH` overrides its password too; `-a` takes precedence over
+that environment variable. `--tls` can enable TLS on an instance. `--instance`
+cannot be combined with `-u`/`REDIS_URL` or `-s`; unset `REDIS_URL` before
+selecting an instance. Without `--instance`, connection behavior is unchanged.
+Connection timeouts and discovery/reply limits remain command-line options.
+
+The theme controls the foreground color of inline argument hints. Command
+names are case insensitive, with whitespace normalized; a subcommand's color
+overrides its parent's color, which overrides `inline-hint`. Matching uses the
+resolved metadata command, not key or argument text. Unknown command names
+are allowed so the same file can cover module commands on different servers.
+Duplicate names after normalization are errors. Popup colors are unchanged.
+
+Colors accept `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`,
+`white`, `grey`, `dark_grey`, and the `dark_` variants of red, green, yellow,
+blue, magenta, and cyan. Also supported: `reset` (terminal default),
+`"#RRGGBB"`, `"rgb_(R,G,B)"`, and `"ansi_(N)"` (components/index 0–255).
+Named colors follow the terminal palette; RGB rendering depends on terminal
+support. The built-in hint color remains `dark_grey`.
+
+### Read and edit settings from the command line
+
+Local configuration commands run without connecting to Redis:
+
+```sh
+rmycli config get theme.inline-hint
+rmycli config set theme.inline-hint cyan
+rmycli config set theme.commands.LRANGE '#89b4fa'
+rmycli config set 'theme.commands."XGROUP CREATE"' yellow
+rmycli config unset theme.commands.LRANGE
+rmycli config set instances.qa.host redis.qa.example.com
+rmycli config set instances.qa.port 6380
+rmycli config set instances.qa.password-env QA_REDIS_PASSWORD
+rmycli config get instances.qa.host
+```
+
+`get` prints the effective value, including built-in defaults and parent-command
+color inheritance. Missing optional settings and unknown instances return an
+error. It reads the file's settings, without applying connection flags or
+resolving password environment variables. `set` prints the saved value;
+password updates print `[redacted]`. An explicit `get` of a stored password
+prints it.
+
+For color settings, both `get` and `set` show the value followed by `sample text`
+rendered in that color when stdout is a terminal. Redirected output is just the
+value and a newline. A nonempty `NO_COLOR` disables automatic previews.
+Use `--color always` to force a preview (including when `NO_COLOR` is set), or
+`--color never` to suppress it:
+
+```sh
+rmycli config get theme.inline-hint --color always
+rmycli config get theme.inline-hint --color never
+```
+
+Keys use TOML dotted-key syntax; quote a component containing spaces or dots,
+as in `'theme.commands."XGROUP CREATE"'` or `'instances."qa.eu".host'`.
+String values are literal arguments, requiring only shell quoting. Ports and
+databases must be integers; TLS takes `true` or `false`. The complete updated
+file must pass validation before it is saved. `unset` removes an explicit value,
+restoring its default/inheritance, and fails if that value was not set.
+
+Edits preserve comments and unrelated settings and replace the file atomically.
+By default they write `$XDG_CONFIG_HOME/rmycli.toml` (normally
+`~/.config/rmycli.toml`), creating directories as needed. If only a system file
+exists, its contents are copied into the new user file before editing, so the
+other effective settings are retained. System files are not edited implicitly.
+`--config PATH`, before or after `config`, selects a specific file; `set` can
+create it. Existing symlinks are followed, existing file permissions are retained,
+and new files have owner-only permissions on Unix. Changes take effect in new
+shell sessions.
+
+Lowercase `rmycli config` is reserved for these local operations. Use uppercase
+`rmycli CONFIG GET ...` or `rmycli CONFIG SET ...` for the Redis command.
+Interactive Redis commands are unaffected. `rmycli config --help` lists the
+local commands; `rmycli --no-config config get ...` reads built-in defaults.
+
 ## Live help and editing
 
 On connection, `rmycli` loads [COMMAND][command] and, when available,
-[COMMAND DOCS][command-docs]. Remaining arguments appear in grey on the input
-line, like `redis-cli`: typing `lrange` displays `lrange key start stop`, with
+[COMMAND DOCS][command-docs]. Remaining arguments appear in grey by default on
+the input line, like `redis-cli`: typing `lrange` displays `lrange key start stop`, with
 only `key start stop` supplied by the program. Typing the key changes the hint
 to `start stop`. Hints never become part of the submitted command. They are
 hidden while editing inside the line and clipped at the terminal's right edge.
@@ -213,7 +341,11 @@ The code separates byte parsing, command metadata and argument grammar, type
 hints, scan discovery, estimation, session transport, workers, and the terminal.
 Dependencies are `redis` for RESP and transport, `rustls` for the TLS crypto
 provider, `crossterm` for terminal I/O, `clap` for options, `serde_json` for
-metadata, and `unicode-width` for cursor/layout calculations.
+metadata, and `unicode-width` for cursor/layout calculations. `toml` and
+`serde` parse typed configuration and reject unknown fields and invalid values;
+`xdg` resolves configuration directories. Crossterm's Serde support validates
+color values. `toml_edit` preserves comments during CLI edits, and `tempfile`
+provides temporary files for atomic replacement.
 
 Install `redis-server` for the isolated integration fixtures, which start their
 own Unix-socket servers with persistence disabled. Tests never use an existing

@@ -17,6 +17,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Local `config get`, `config set`, and `config unset` commands with effective
+  defaults, typed validation, comment-preserving edits, and atomic file updates.
+  Color settings include terminal previews with `--color` and `NO_COLOR` controls.
+- TOML configuration from XDG directories (normally `~/.config/rmycli.toml`),
+  explicit `--config` and `--no-config` switches, and startup validation.
+- Configurable inline-hint colors, including per-command and subcommand
+  overrides, named colors, RGB, and indexed terminal colors.
+- Named connection instances selected with `--instance`, including host, port,
+  database, TLS, ACL user, and passwords from the file or environment. Explicit
+  connection flags and `REDISCLI_AUTH` override instance settings.
 - Working Redis shell with TCP, Unix socket, authenticated and verified TLS
   connections; command-line and stdin execution; and binary-safe reply output.
 - Live syntax, summary, argument, version, group, and complexity help from

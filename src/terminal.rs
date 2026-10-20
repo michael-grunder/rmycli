@@ -18,6 +18,7 @@ use crossterm::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
+    config::Theme,
     estimate, hints, input,
     metadata::Catalog,
     scan::{Discovery, Limits},
@@ -246,6 +247,7 @@ pub struct Options {
     pub limits: Limits,
     pub reply_threshold: u64,
     pub yes: bool,
+    pub theme: Theme,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -824,12 +826,18 @@ impl App {
             .inline_hint(&self.editor.line, self.editor.cursor);
         let used = display_width(&line);
         let hint = fit(&safe(&hint), width.saturating_sub(used));
-        queue!(
-            out,
-            SetForegroundColor(Color::DarkGrey),
-            Print(hint),
-            ResetColor
-        )?;
+        let args = input::parse(&self.editor.line)
+            .words
+            .into_iter()
+            .map(|word| word.bytes)
+            .collect::<Vec<_>>();
+        let color = self
+            .catalog
+            .resolve(&args)
+            .map_or(self.options.theme.inline_hint, |(command, _)| {
+                self.options.theme.hint_color(&command.name)
+            });
+        queue!(out, SetForegroundColor(color), Print(hint), ResetColor)?;
         if let Some(popup) = &self.popup {
             let anchor = column.saturating_sub(display_width(&safe(
                 &self.editor.line[popup.span.start..self.editor.cursor],
@@ -1062,6 +1070,7 @@ mod tests {
                 limits: Limits::default(),
                 reply_threshold: 100,
                 yes: false,
+                theme: Theme::default(),
             },
         };
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
