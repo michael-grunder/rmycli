@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Show remaining command arguments as grey inline hints instead of a help
+  block below the input. Detailed documentation remains available with F1
+  and `HELP`.
+- Render completion choices in a bordered, highlighted popup anchored above
+  the current argument, with scrolling and terminal-edge clipping.
+- Omit the database suffix from the prompt and transcript for database zero.
+
 ### Added
 
 - Working Redis shell with TCP, Unix socket, authenticated and verified TLS

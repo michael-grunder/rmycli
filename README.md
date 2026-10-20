@@ -53,9 +53,13 @@ mode with a nonzero status.
 ## Live help and editing
 
 On connection, `rmycli` loads [COMMAND][command] and, when available,
-[COMMAND DOCS][command-docs]. The prompt shows command syntax, summary,
-expected argument names, version, command group, and complexity. Argument
-hints update as you type and move the cursor. Nested alternatives, optional
+[COMMAND DOCS][command-docs]. Remaining arguments appear in grey on the input
+line, like `redis-cli`: typing `lrange` displays `lrange key start stop`, with
+only `key start stop` supplied by the program. Typing the key changes the hint
+to `start stop`. Hints never become part of the submitted command. They are
+hidden while editing inside the line and clipped at the terminal's right edge.
+F1 or `HELP command` shows full syntax, summary, version, group, and complexity.
+Nested alternatives, optional
 clauses, repeated arguments, subcommands, and module documentation come from
 the server rather than a fixed set of handwritten command signatures.
 
@@ -82,8 +86,12 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | `HELP`, `\help` | Editor help |
 | `\reconnect` | Open a new connection and refresh metadata |
 
-Long help is clipped to the available screen area; F1 and transcript scrolling
-make the full text accessible. The shell uses an alternate terminal screen.
+Completion choices appear in a bordered floating window above the current
+argument, overlaying the transcript without moving the input line. The selected
+choice is highlighted; long menus scroll as you cycle through them. The window
+stays within the terminal bounds. F1 and transcript scrolling make full help
+accessible. The prompt is `rmycli>` for database zero and `rmycli[N]>` otherwise.
+The shell uses an alternate terminal screen.
 History is bounded to 500 commands and is not saved to disk. Pasting text never
 submits a command. The transcript retains the latest 2,000 output lines.
 
@@ -92,7 +100,7 @@ submits a command. The transcript retains the latest 2,000 output lines.
 For example:
 
 ```text
-rmycli[0]> LRANGE list:<Tab>
+rmycli> LRANGE list:<Tab>
 ```
 
 starts discovery on an independent connection with:

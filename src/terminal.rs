@@ -10,7 +10,7 @@ use crossterm::{
         KeyModifiers,
     },
     execute, queue,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
     },
@@ -127,6 +127,105 @@ impl Popup {
     fn accept(self, editor: &mut Editor) {
         editor.replace(self.span, &self.candidates[self.selected]);
     }
+
+    fn layout(
+        &self,
+        anchor: usize,
+        row: usize,
+        screen_width: usize,
+    ) -> PopupLayout {
+        let rows = self.candidates.len().min(8).min(row.saturating_sub(2));
+        let longest = self
+            .candidates
+            .iter()
+            .map(|s| display_width(&safe(s)))
+            .max()
+            .unwrap_or(0);
+        let width = (longest + 4).max(14).min(screen_width);
+        PopupLayout {
+            x: anchor.min(screen_width.saturating_sub(width)),
+            y: row.saturating_sub(rows + 2),
+            width,
+            rows,
+            first: self
+                .selected
+                .saturating_sub(rows / 2)
+                .min(self.candidates.len().saturating_sub(rows)),
+        }
+    }
+
+    fn draw(
+        &self,
+        out: &mut impl Write,
+        anchor: usize,
+        row: usize,
+        screen_width: usize,
+    ) -> io::Result<()> {
+        let area = self.layout(anchor, row, screen_width);
+        if area.rows == 0 || area.width < 4 {
+            return Ok(());
+        }
+        let title =
+            format!(" {}/{} ", self.selected + 1, self.candidates.len());
+        let title = fit(&title, area.width - 2);
+        let border = format!(
+            "┌{title}{}┐",
+            "─".repeat(area.width - 2 - display_width(&title))
+        );
+        popup_line(out, area.x, area.y, &border, false)?;
+        for offset in 0..area.rows {
+            let index = area.first + offset;
+            let label = fit(&safe(&self.candidates[index]), area.width - 4);
+            let padding = " ".repeat(area.width - 4 - display_width(&label));
+            popup_line(
+                out,
+                area.x,
+                area.y + offset + 1,
+                &format!("│ {label}{padding} │"),
+                index == self.selected,
+            )?;
+        }
+        popup_line(
+            out,
+            area.x,
+            area.y + area.rows + 1,
+            &format!("└{}┘", "─".repeat(area.width - 2)),
+            false,
+        )?;
+        queue!(out, ResetColor)
+    }
+}
+
+#[derive(Debug)]
+struct PopupLayout {
+    x: usize,
+    y: usize,
+    width: usize,
+    rows: usize,
+    first: usize,
+}
+
+fn popup_line(
+    out: &mut impl Write,
+    x: usize,
+    y: usize,
+    text: &str,
+    selected: bool,
+) -> io::Result<()> {
+    queue!(
+        out,
+        cursor::MoveTo(
+            u16::try_from(x).unwrap_or(0),
+            u16::try_from(y).unwrap_or(0)
+        ),
+        SetBackgroundColor(if selected {
+            Color::DarkCyan
+        } else {
+            Color::DarkGrey
+        }),
+        SetForegroundColor(Color::White),
+        Print(text)
+    )
 }
 
 #[derive(Default)]
@@ -647,8 +746,9 @@ impl App {
     fn execute(&mut self, args: Vec<Vec<u8>>) {
         self.editor.remember();
         self.log([format!(
-            "rmycli[{}]> {}",
-            self.config.info.redis.db, self.editor.line
+            "{}{}",
+            prompt(self.config.info.redis.db),
+            self.editor.line
         )]);
         self.editor.line.clear();
         self.editor.cursor = 0;
@@ -693,22 +793,7 @@ impl App {
         }
         let width = usize::from(width) - 1;
         let height = usize::from(height);
-        let ctx = input::context(&self.editor.line, self.editor.cursor);
-        let mut help = self.catalog.help(&ctx);
-        // Keep the changing argument hint visible even with a long signature.
-        if let Some(index) =
-            help.iter().position(|line| line.starts_with("Argument "))
-        {
-            let argument = help.remove(index);
-            help.insert(0, argument);
-        }
-        let help: Vec<_> = help.iter().flat_map(|s| wrap(s, width)).collect();
-        let help_count = help.len().min((height / 3).max(1));
-        let popup_count = self
-            .popup
-            .as_ref()
-            .map_or(0, |p| p.candidates.len().min(8).min(height / 3));
-        let output_count = height.saturating_sub(help_count + popup_count + 3);
+        let output_count = height.saturating_sub(3);
         let output: Vec<_> =
             self.output.iter().flat_map(|s| wrap(s, width)).collect();
         let end = output.len().saturating_sub(self.scroll);
@@ -726,7 +811,7 @@ impl App {
             row += 1;
         }
         row = output_count;
-        let prompt = format!("rmycli[{}]> ", self.config.info.redis.db);
+        let prompt = prompt(self.config.info.redis.db);
         let (line, column) = viewport(
             &format!("{prompt}{}", self.editor.line),
             prompt.len() + self.editor.cursor,
@@ -734,31 +819,24 @@ impl App {
         );
         draw_line(&mut out, row, &line, Color::White)?;
         let input_row = row;
-        row += 1;
-        for line in help.iter().take(help_count) {
-            draw_line(&mut out, row, line, Color::DarkCyan)?;
-            row += 1;
-        }
+        let hint = self
+            .catalog
+            .inline_hint(&self.editor.line, self.editor.cursor);
+        let used = display_width(&line);
+        let hint = fit(&safe(&hint), width.saturating_sub(used));
+        queue!(
+            out,
+            SetForegroundColor(Color::DarkGrey),
+            Print(hint),
+            ResetColor
+        )?;
         if let Some(popup) = &self.popup {
-            let first = popup
-                .selected
-                .saturating_sub(popup_count / 2)
-                .min(popup.candidates.len().saturating_sub(popup_count));
-            for index in first..first + popup_count {
-                let label = format!(
-                    "{} {}",
-                    if index == popup.selected { ">" } else { " " },
-                    popup.candidates[index]
-                );
-                draw_line(
-                    &mut out,
-                    row,
-                    &truncate(&label, width),
-                    Color::Yellow,
-                )?;
-                row += 1;
-            }
+            let anchor = column.saturating_sub(display_width(&safe(
+                &self.editor.line[popup.span.start..self.editor.cursor],
+            )));
+            popup.draw(&mut out, anchor, input_row, width)?;
         }
+        row += 1;
         let status = if self.popup.is_some() {
             format!(
                 "{} • Tab/Shift-Tab cycle • Enter accepts • Esc closes",
@@ -783,6 +861,29 @@ impl App {
         )?;
         out.flush()
     }
+}
+
+fn prompt(database: i64) -> String {
+    if database == 0 {
+        "rmycli> ".into()
+    } else {
+        format!("rmycli[{database}]> ")
+    }
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Clip without wrapping or splitting a Unicode character.
+fn fit(text: &str, width: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= width
+        })
+        .collect()
 }
 
 fn draw_line(
@@ -834,13 +935,12 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize) {
     let mut start = 0;
-    let mut column: usize =
-        line[..cursor].chars().map(|c| c.width().unwrap_or(0)).sum();
+    let mut column: usize = display_width(&safe(&line[..cursor]));
     for (index, c) in line[..cursor].char_indices() {
         if column < width {
             break;
         }
-        column = column.saturating_sub(c.width().unwrap_or(0));
+        column = column.saturating_sub(display_width(&safe(&c.to_string())));
         start = index + c.len_utf8();
     }
     (truncate(&line[start..], width), column)
@@ -849,6 +949,39 @@ fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_database_prompt_and_unicode_clipping() {
+        assert_eq!(prompt(0), "rmycli> ");
+        assert_eq!(prompt(12), "rmycli[12]> ");
+        assert_eq!(fit("你好abcdef", 5), "你好a");
+        assert_eq!(fit("key start stop", 0), "");
+    }
+
+    #[test]
+    fn popup_overlays_above_input_and_scrolls_with_selection() {
+        let popup = Popup {
+            candidates: (0..30).map(|n| format!("列表:{n}")).collect(),
+            selected: 29,
+            span: 0..0,
+        };
+        for (anchor, row, width) in [(12, 20, 80), (19, 5, 20), (2, 2, 4)] {
+            let area = popup.layout(anchor, row, width);
+            assert!(area.x + area.width <= width);
+            assert!(area.y + area.rows + 2 <= row);
+            if area.rows > 0 {
+                assert!(area.first <= popup.selected);
+                assert!(popup.selected < area.first + area.rows);
+            }
+        }
+        let area = popup.layout(12, 20, 80);
+        assert_eq!(area.x, 12);
+        assert_eq!(area.rows, 8);
+        let mut rendered = Vec::new();
+        popup.draw(&mut rendered, 12, 20, 80).unwrap();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(rendered.contains("┌ 30/30 "));
+        assert!(rendered.contains("列表:29"));
+    }
     #[test]
     fn accepting_popup_only_changes_input_and_preserves_suffix() {
         let mut editor = Editor {

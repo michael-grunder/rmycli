@@ -30,6 +30,7 @@ impl Atom {
 #[derive(Clone, Debug, Default)]
 struct Node {
     edges: Vec<(Option<Atom>, usize)>,
+    remaining: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -90,13 +91,21 @@ fn render(arg: &Value) -> String {
     text
 }
 
+fn join_hint(head: &str, tail: &str) -> String {
+    [head, tail]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Grammar {
     pub fn from_docs(args: &[Value]) -> Self {
         let mut grammar = Self {
             nodes: vec![Node::default(), Node::default()],
             syntax: args.iter().map(render).collect::<Vec<_>>().join(" "),
         };
-        grammar.sequence(args, 0, 1);
+        grammar.sequence(args, 0, 1, "");
         grammar
     }
 
@@ -110,17 +119,27 @@ impl Grammar {
         self.nodes[from].edges.push((atom, to));
     }
 
-    fn sequence(&mut self, args: &[Value], from: usize, to: usize) {
+    fn sequence(&mut self, args: &[Value], from: usize, to: usize, tail: &str) {
         let mut current = from;
-        for arg in args {
+        for (index, arg) in args.iter().enumerate() {
+            let suffix = join_hint(
+                &args[index + 1..]
+                    .iter()
+                    .map(render)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                tail,
+            );
+            self.nodes[current].remaining = join_hint(&render(arg), &suffix);
             let next = self.node();
-            self.argument(arg, current, next);
+            self.argument(arg, current, next, &suffix);
             current = next;
         }
+        self.nodes[current].remaining = tail.into();
         self.edge(current, to, None);
     }
 
-    fn argument(&mut self, arg: &Value, from: usize, to: usize) {
+    fn argument(&mut self, arg: &Value, from: usize, to: usize, tail: &str) {
         if flag(arg, "optional") {
             self.edge(from, to, None);
         }
@@ -153,13 +172,38 @@ impl Grammar {
                 }),
             );
         }
+        let mut once = arg.clone();
+        once["optional"] = Value::Bool(false);
+        once["multiple"] = Value::Bool(false);
+        once["flags"] = Value::Null;
+        if !flag(arg, "multiple-token") && kind != "pure-token" {
+            once["token"] = Value::Null;
+        }
+        let after = if flag(arg, "multiple") {
+            join_hint(&format!("[{} ...]", render(&once)), tail)
+        } else {
+            tail.into()
+        };
+        self.nodes[end].remaining.clone_from(&after);
+        self.nodes[body].remaining = match kind {
+            "pure-token" => after.clone(),
+            "oneof" => join_hint(
+                &children(arg)
+                    .iter()
+                    .map(render)
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                &after,
+            ),
+            _ => join_hint(&atom.label, &after),
+        };
         match kind {
             "oneof" => {
                 for child in children(arg) {
-                    self.argument(child, body, end);
+                    self.argument(child, body, end, &after);
                 }
             }
-            "block" => self.sequence(children(arg), body, end),
+            "block" => self.sequence(children(arg), body, end, &after),
             "pure-token" => self.edge(body, end, None),
             _ => self.edge(body, end, Some(atom)),
         }
@@ -188,6 +232,40 @@ impl Grammar {
             }
         }
         result
+    }
+
+    /// Remaining syntax for display only; never inserted into command input.
+    pub fn remaining(&self, consumed: &[Vec<u8>]) -> String {
+        if consumed.is_empty() {
+            return self.syntax.clone();
+        }
+        if self.nodes.is_empty() {
+            return String::new();
+        }
+        let mut states = BTreeSet::from([0]);
+        for bytes in consumed {
+            let mut next = BTreeSet::new();
+            let mut literal = BTreeSet::new();
+            for state in self.closure(&states) {
+                for (atom, target) in &self.nodes[state].edges {
+                    if let Some(atom) =
+                        atom.as_ref().filter(|a| a.accepts(bytes))
+                    {
+                        next.insert(*target);
+                        if atom.token.is_some() {
+                            literal.insert(*target);
+                        }
+                    }
+                }
+            }
+            states = if literal.is_empty() { next } else { literal };
+        }
+        states
+            .iter()
+            .map(|&state| &self.nodes[state].remaining)
+            .next()
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn expected(&self, consumed: &[Vec<u8>]) -> Vec<Atom> {
@@ -261,5 +339,30 @@ mod tests {
         assert_eq!(render(&get), "GET pattern [GET pattern ...]");
         let block = json!({"name":"fields", "type":"block", "token":"FIELDS", "arguments":[{"name":"count","type":"integer"}]});
         assert_eq!(render(&block), "FIELDS count");
+    }
+
+    #[test]
+    fn remaining_syntax_tracks_nested_choices_and_repeats() {
+        let args = json!([
+            {"name":"key", "type":"key"},
+            {"name":"condition", "type":"oneof", "optional":true,
+             "arguments":[{"name":"nx","type":"pure-token","token":"NX"},
+                          {"name":"xx","type":"pure-token","token":"XX"}]},
+            {"name":"pairs", "type":"block", "multiple":true,
+             "arguments":[{"name":"field","type":"string"}, {"name":"value","type":"string"}]}
+        ]);
+        let grammar = Grammar::from_docs(args.as_array().unwrap());
+        for (words, expected) in [
+            (vec!["k"], "[NX|XX] field value [field value ...]"),
+            (vec!["k", "NX"], "field value [field value ...]"),
+            (vec!["k", "NX", "f"], "value [field value ...]"),
+            (vec!["k", "NX", "f", "v"], "[field value ...]"),
+        ] {
+            let words = words
+                .into_iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(grammar.remaining(&words), expected);
+        }
     }
 }

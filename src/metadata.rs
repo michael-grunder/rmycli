@@ -295,6 +295,31 @@ impl Catalog {
         }
         help
     }
+
+    pub fn inline_hint(&self, line: &str, cursor: usize) -> String {
+        if cursor != line.len() {
+            return String::new();
+        }
+        let parsed = crate::input::parse(line);
+        if parsed.error.is_some() {
+            return String::new();
+        }
+        let args: Vec<_> =
+            parsed.words.into_iter().map(|word| word.bytes).collect();
+        let Some((command, words)) = self.resolve(&args) else {
+            return String::new();
+        };
+        let remaining = command.grammar.remaining(&args[words..]);
+        if remaining.is_empty() {
+            return remaining;
+        }
+        let separator = if line.ends_with(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
+        format!("{separator}{remaining}")
+    }
 }
 
 impl Command {
@@ -484,6 +509,34 @@ pub fn spec_position(
 mod tests {
     use super::*;
     use crate::input::context;
+
+    #[test]
+    fn inline_hints_follow_arguments_without_modifying_input() {
+        let catalog = Catalog::bundled();
+        for (line, expected) in [
+            ("lrange", " key start stop"),
+            ("lrange ", "key start stop"),
+            ("lrange list:a", " start stop"),
+            ("lrange \"list a\" ", "start stop"),
+            ("lrange list:a 0 ", "stop"),
+            ("lrange list:a 0 -1", ""),
+            ("lrange list:a invalid ", ""),
+            ("lrange \"unfinished", ""),
+            ("unknown ", ""),
+            ("lra", ""),
+        ] {
+            assert_eq!(
+                catalog.inline_hint(line, line.len()),
+                expected,
+                "{line}"
+            );
+        }
+        assert_eq!(catalog.inline_hint("lrange key 0 -1", 7), "");
+        let hint = catalog.inline_hint("SET k v EX ", 11);
+        assert!(hint.starts_with("seconds"), "{hint}");
+        let hint = catalog.inline_hint("XGROUP CREATE ", 14);
+        assert!(hint.starts_with("key group"), "{hint}");
+    }
 
     #[test]
     fn key_positions_from_bundled_specs_and_argument_trees() {

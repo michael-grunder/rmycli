@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -20,13 +21,53 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/debug/rmycli"
 
 
+class Frame:
+    """Read the cursor moves, clears, and colors emitted by our renderer."""
+    def __init__(self, data):
+        end = data.rfind(b"\x1b[?25h")
+        start = data.rfind(b"\x1b[2J", 0, end)
+        self.cells = {}
+        self.colors = {}
+        self.x = self.y = 0
+        color = ""
+        if start < 0:
+            return
+        text = data[start:end].decode("utf-8", errors="replace")
+        for part in re.split(r"(\x1b\[[0-?]*[ -/]*[@-~])", text):
+            if part.startswith("\x1b["):
+                if part.endswith("H"):
+                    row, column = (int(n) for n in part[2:-1].split(";"))
+                    self.y, self.x = row - 1, column - 1
+                elif part.endswith("m"):
+                    color = part[2:-1]
+                elif part == "\x1b[2J":
+                    self.cells.clear()
+                    self.colors.clear()
+            else:
+                for char in part:
+                    self.cells[self.y, self.x] = char
+                    self.colors[self.y, self.x] = color
+                    self.x += 1
+
+    def row(self, row):
+        width = max((x + 1 for y, x in self.cells if y == row), default=0)
+        return "".join(self.cells.get((row, x), " ") for x in range(width)).rstrip()
+
+    def hint_is_inline(self, typed, hint):
+        prompt = "rmycli> "
+        return (self.row(self.y) == prompt + typed + hint
+                and self.x == len(prompt + typed)
+                and (not hint or self.colors.get((self.y, self.x)) in ("90", "38;5;8")))
+
+
 class Terminal:
     def __init__(self, socket, *options):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         self.process = subprocess.Popen(
             [str(BINARY), "-s", socket, *options], stdin=slave, stdout=slave,
-            stderr=slave, env={**os.environ, "TERM": "xterm-256color"},
+            stderr=slave, env={**{k: v for k, v in os.environ.items() if k != "NO_COLOR"},
+                 "TERM": "xterm-256color"},
         )
         os.close(slave)
         self.data = b""
@@ -46,6 +87,18 @@ class Terminal:
             if ready:
                 self.data += os.read(self.master, 65536)
         return self.data
+
+    def expect_frame(self, predicate, description, timeout=5):
+        deadline = time.monotonic() + timeout
+        while True:
+            frame = Frame(self.data)
+            if predicate(frame):
+                return frame
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, f"Missing {description}: {self.data[-6000:]!r}"
+            ready, _, _ = select.select([self.master], [], [], remaining)
+            if ready:
+                self.data += os.read(self.master, 65536)
 
     def close(self):
         if self.process.poll() is None:
@@ -96,12 +149,17 @@ def main():
 
             terminal = Terminal(socket, "--reply-threshold", "1")
             terminals.append(terminal)
-            terminal.send(b"LRANGE ")
-            terminal.expect("LRANGE key start stop")
-            terminal.send(b"list:a ")
-            terminal.expect("Argument 2: start")
+            terminal.send(b"lrange")
+            frame = terminal.expect_frame(
+                lambda f: f.hint_is_inline("lrange", " key start stop"),
+                "grey inline argument hint with cursor before hint",
+            )
+            assert "[0]" not in frame.row(frame.y)
+            assert not frame.row(frame.y + 1), "help rendered below input"
+            terminal.send(b" list:a ")
+            terminal.expect_frame(lambda f: f.hint_is_inline("lrange list:a ", "start stop"), "remaining start and stop")
             terminal.send(b"0 ")
-            terminal.expect("Argument 3: stop")
+            terminal.expect_frame(lambda f: f.hint_is_inline("lrange list:a 0 ", "stop"), "remaining stop")
             terminal.send(b"-1\r")
             terminal.expect("Continue? [y/N]")
             terminal.send(b"n")
@@ -109,6 +167,12 @@ def main():
             terminal.send(b"\x15LPOP list:\t")
             terminal.expect("Tab/Shift-Tab cycle")
             assert b"list:not-a-list" not in terminal.data
+            frame = terminal.expect_frame(
+                lambda f: "┌ 1/2 " in f.row(f.y - 4), "bordered popup above input",
+            )
+            assert frame.row(frame.y - 4).index("┌") == len("rmycli> LPOP ")
+            assert "list:a" in frame.row(frame.y - 3)
+            assert "list:b" in frame.row(frame.y - 2)
             terminal.send(b"\t\r")
             terminal.expect("LPOP list:b")
             assert redis("LLEN", "list:b") == 3, "accepting completion executed LPOP"
