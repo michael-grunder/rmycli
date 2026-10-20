@@ -10,8 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Buffer terminal redraws and synchronize updates so submitting a command does
   not briefly show an intermediate frame with stale inline hints.
+- Stop flashing a grey `Executing…` status on a fresh prompt after every
+  command. The prompt now waits below the submitted command, and the busy
+  status appears only when a reply takes longer than 200 ms or you type.
 
 ### Changed
+
+- Bound command history with a ring buffer and avoid reparsing the input line
+  twice when computing completion context.
 
 - Use the normal terminal buffer, starting the prompt at the current cursor row
   and advancing with replies. Output remains in terminal scrollback after exit.

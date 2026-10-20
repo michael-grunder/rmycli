@@ -102,8 +102,8 @@ pub fn context(line: &str, cursor: usize) -> Context {
     let active = parsed.words.last().filter(|w| w.span.end == cursor);
     let index = parsed.words.len() - usize::from(active.is_some());
     let start = active.map_or(cursor, |w| w.span.start);
-    let end = parse(line)
-        .words
+    let words = parse(line).words;
+    let end = words
         .iter()
         .find(|w| w.span.start == start)
         .map_or(cursor, |w| w.span.end);
@@ -113,8 +113,7 @@ pub fn context(line: &str, cursor: usize) -> Context {
         args.push(Vec::new());
     }
     args.extend(
-        parse(line)
-            .words
+        words
             .into_iter()
             .filter(|word| word.span.start >= end && word.span.start >= cursor)
             .map(|word| word.bytes),

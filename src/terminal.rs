@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
@@ -25,6 +25,14 @@ use crate::{
     session::{Config, Session},
     worker::{Assistance, Event, Execution, Workers},
 };
+
+/// How long to wait for terminal input between worker-event checks.
+const POLL_INTERVAL: Duration = Duration::from_millis(40);
+/// Quick replies replace the submitted line directly. Only commands that
+/// outlast this delay get an intermediate prompt with a busy status.
+const BUSY_PROMPT_DELAY: Duration = Duration::from_millis(200);
+/// Number of submitted lines kept for Up/Down recall.
+const HISTORY_LIMIT: usize = 500;
 
 struct Screen {
     row: u16,
@@ -113,7 +121,7 @@ impl Drop for Screen {
 struct Editor {
     line: String,
     cursor: usize,
-    history: Vec<String>,
+    history: VecDeque<String>,
     history_index: Option<usize>,
     draft: String,
 }
@@ -140,11 +148,11 @@ impl Editor {
             .map_or(0, char::len_utf8);
     }
     fn remember(&mut self) {
-        if self.history.last() != Some(&self.line) {
-            self.history.push(self.line.clone());
+        if self.history.back() != Some(&self.line) {
+            self.history.push_back(self.line.clone());
         }
-        if self.history.len() > 500 {
-            self.history.remove(0);
+        if self.history.len() > HISTORY_LIMIT {
+            self.history.pop_front();
         }
         self.history_index = None;
     }
@@ -405,6 +413,8 @@ struct App {
     scan: Option<Discovery>,
     completion_span: Range<usize>,
     pending: Pending,
+    /// While set, the prompt stays hidden below the submitted command.
+    busy_until: Option<Instant>,
     options: Options,
 }
 
@@ -426,6 +436,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         scan: None,
         completion_span: 0..0,
         pending: Pending::default(),
+        busy_until: None,
         options,
     };
     let mut screen = Screen::enter()?;
@@ -438,11 +449,17 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
             app.on_worker(event);
             dirty = true;
         }
+        dirty |= app.tick(Instant::now());
         if dirty {
             app.draw(&mut screen, &mut io::stdout(), terminal::size()?)?;
             dirty = false;
         }
-        if event::poll(Duration::from_millis(40))? {
+        let timeout = app.busy_until.map_or(POLL_INTERVAL, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(POLL_INTERVAL)
+        });
+        if event::poll(timeout)? {
             match event::read()? {
                 TerminalEvent::Key(key)
                     if key.kind != KeyEventKind::Release =>
@@ -484,6 +501,16 @@ impl App {
         self.output.extend(lines);
     }
 
+    /// Reveal the busy prompt once a command outlasts its grace period.
+    /// Returns whether the screen needs a redraw.
+    fn tick(&mut self, now: Instant) -> bool {
+        if self.busy_until.is_some_and(|deadline| now >= deadline) {
+            self.busy_until = None;
+            return true;
+        }
+        false
+    }
+
     fn invalidate(&mut self) {
         self.workers.invalidate();
         self.popup = None;
@@ -517,8 +544,8 @@ impl App {
             } => {
                 self.log(lines);
                 self.config = config;
-
                 self.client_id = client_id;
+                self.busy_until = None;
                 self.mode = if !connected {
                     Mode::Disconnected
                 } else if streaming {
@@ -541,6 +568,7 @@ impl App {
             }
             Event::Output(lines) => self.log(lines),
             Event::Failed(message) => {
+                self.busy_until = None;
                 self.status = message;
                 self.mode = Mode::Disconnected;
             }
@@ -572,6 +600,8 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        // Typing ahead or cancelling should show the full prompt and status.
+        self.busy_until = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('d') => {
@@ -941,6 +971,7 @@ impl App {
         self.editor.cursor = 0;
         self.mode = Mode::Busy;
         self.status = "Executing… Ctrl-C closes this connection".into();
+        self.busy_until = Some(Instant::now() + BUSY_PROMPT_DELAY);
         let _ = self.workers.execution.send(Execution::Run(args));
     }
 
@@ -1023,6 +1054,16 @@ impl App {
             self.clear = false;
         }
         screen.write_output(out, self.output.drain(..), width, height)?;
+        if self.busy_until.is_some() {
+            // Like a shell, leave the cursor below the submitted command so a
+            // quick reply never follows a transient prompt and busy status.
+            return queue!(
+                out,
+                cursor::MoveTo(0, screen.row),
+                cursor::Show,
+                EndSynchronizedUpdate
+            );
+        }
         let prompt = prompt(self.config.info.redis.db);
         let inline_status = self.editor.line.is_empty()
             && self.popup.is_none()
@@ -1300,6 +1341,7 @@ mod tests {
                 args: Some(vec![b"GET".to_vec(), b"a".to_vec()]),
                 confirmation: None,
             },
+            busy_until: None,
             options: Options {
                 limits: Limits::default(),
                 reply_threshold: 100,
@@ -1382,11 +1424,12 @@ mod tests {
             app.draw(&mut screen, &mut out, (80, 24)).unwrap();
             let submitted = &out.frames[1];
             assert!(!submitted.contains(&hint));
-            assert!(
-                submitted.find("\x1b[J").unwrap()
-                    < submitted.find("rmycli> PING\r\n").unwrap()
-            );
-            assert!(submitted.contains("Executing"));
+            let echoed = submitted.find("rmycli> PING\r\n").unwrap();
+            assert!(submitted.find("\x1b[J").unwrap() < echoed);
+            // A quick reply must not follow a transient prompt or status.
+            assert!(!submitted[echoed + 1..].contains("rmycli> "));
+            assert!(!submitted.contains("Executing"));
+            assert!(!app.tick(Instant::now()));
 
             app.on_worker(Event::Executed {
                 lines: vec!["PONG".into()],
@@ -1405,9 +1448,44 @@ mod tests {
             assert!(!reply.contains(&hint));
             assert!(!reply.contains("Executing"));
             assert_eq!(screen.row, (row + 2).min(23));
+            assert!(!app.tick(Instant::now() + BUSY_PROMPT_DELAY));
             assert_eq!(out.frames.len(), 3);
             assert_eq!(out.flushes, 3);
         }
+    }
+
+    #[test]
+    fn slow_commands_show_the_busy_prompt_after_a_delay() {
+        let (mut app, _executed) = test_app();
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        let started = Instant::now();
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert!(!String::from_utf8(rendered).unwrap().contains("Executing"));
+
+        assert!(!app.tick(started));
+        assert!(app.tick(started + BUSY_PROMPT_DELAY + Duration::from_secs(1)));
+        assert!(
+            !app.tick(started + BUSY_PROMPT_DELAY + Duration::from_secs(1))
+        );
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("rmycli> "));
+        assert!(text.contains("Executing"));
+        assert!(app.mode == Mode::Busy);
+    }
+
+    #[test]
+    fn typing_while_busy_reveals_the_prompt_immediately() {
+        let (mut app, _executed) = test_app();
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert!(String::from_utf8(rendered).unwrap().contains("rmycli> x"));
     }
 
     #[test]
@@ -1498,7 +1576,7 @@ mod tests {
                 app.mode = mode;
                 app.editor.line = line.into();
                 app.editor.cursor = line.len();
-                app.editor.history.push("PING".into());
+                app.editor.history.push_back("PING".into());
                 app.output.push_back("PONG".into());
                 app.status = "Old status".into();
                 app.config.info.redis.db = 2;
