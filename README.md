@@ -191,7 +191,9 @@ the input line, like `redis-cli`: typing `lrange` displays `lrange key start sto
 only `key start stop` supplied by the program. Typing the key changes the hint
 to `start stop`. Hints never become part of the submitted command. They are
 hidden while editing inside the line and clipped at the terminal's right edge.
-F1 or `HELP command` shows full syntax, summary, version, group, and complexity.
+F1 opens a dismissible help panel with current command documentation, editor
+shortcuts, and connection status. `HELP command` prints full syntax, summary,
+version, group, and complexity to the terminal.
 Nested alternatives, optional
 clauses, repeated arguments, subcommands, and module documentation come from
 the server rather than a fixed set of handwritten command signatures.
@@ -210,23 +212,35 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Left / Right, Home / End, Ctrl-A / Ctrl-E | Move the cursor |
 | Backspace / Delete, Ctrl-U / Ctrl-K | Delete characters or text before/after the cursor |
 | Up / Down | Browse in-memory command history |
-| F1 | Add the full current command help to the transcript |
-| PageUp / PageDown | Scroll the transcript |
-| `CLEAR`, Ctrl-L | Clear the transcript locally without sending a Redis command |
+| F1 | Open or close command help, editor shortcuts, and connection details |
+| PageUp / PageDown, Up / Down with help open | Scroll the help panel |
+| Enter with help open | Close help without submitting input |
+| `CLEAR`, Ctrl-L | Clear the screen locally without sending a Redis command |
 | Ctrl-C | Clear input; if executing/streaming, close that connection |
 | Ctrl-D, `\quit`, `\q`, `QUIT`, `EXIT` | Exit |
 | `HELP command`, `HELP @group` | Full command help or commands in a group |
-| `HELP`, `\help` | Editor help |
+| `HELP`, `\help` | Open editor help and connection details |
 | `\reconnect` | Open a new connection and refresh metadata |
 
-Completion choices appear in a bordered floating window above the current
-argument, overlaying the transcript without moving the input line. The selected
-choice is highlighted; long menus scroll as you cycle through them. The window
-stays within the terminal bounds. F1 and transcript scrolling make full help
-accessible. The prompt is `rmycli>` for database zero and `rmycli[N]>` otherwise.
-The shell uses an alternate terminal screen.
+The prompt starts at the terminal's current cursor row and follows replies,
+like a conventional command-line shell. If existing output ends mid-line,
+the prompt starts on the next line. There is no startup banner or persistent
+connection footer. The shell uses the normal terminal buffer, so earlier shell
+output and command replies remain in your terminal's scrollback, including
+after exit. Use your terminal's scrollback controls to review output.
+
+Completion choices appear in a bordered window below the current argument.
+The selected choice is highlighted; long menus scroll as you cycle through
+them. Short status messages share the input line when it is empty. Help,
+completion, and longer messages reserve space below the prompt only when
+visible, scrolling as needed at the bottom of the terminal.
+Closing a panel removes it and preserves the input. Errors, discovery progress,
+and confirmations still appear when needed. The prompt is `rmycli>` for database
+zero and `rmycli[N]>` otherwise.
+
 History is bounded to 500 commands and is not saved to disk. Pasting text never
-submits a command. The transcript retains the latest 2,000 output lines.
+submits a command. Output retention is controlled by your terminal's scrollback
+settings; the application does not keep a separate transcript.
 
 ## Key completion
 
@@ -335,8 +349,9 @@ Closing the socket cannot undo a command the server has already executed.
 - Pub/Sub and MONITOR replies stream to the transcript. In interactive streaming
   mode, Ctrl-C ends the stream; reconnect before submitting further commands.
   Replication protocols and an interactive unsubscribe workflow are not provided.
-- History and the transcript are bounded, but command replies are decoded in
-  memory before display. The `LRANGE` estimate is not a general reply-memory cap.
+- History is bounded and displayed output is released by the application, but
+  command replies are decoded in memory before display. The `LRANGE` estimate
+  is not a general reply-memory cap.
 - No persistent history, SSH tunnels, custom TLS certificate flags, or full
   `redis-cli` option compatibility is claimed by this version.
 

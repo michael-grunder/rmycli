@@ -12,6 +12,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import signal
 import socket as sockets
 import struct
 import subprocess
@@ -25,16 +26,14 @@ BINARY = ROOT / "target/debug/rmycli"
 
 class Frame:
     """Read the cursor moves, clears, and colors emitted by our renderer."""
-    def __init__(self, data):
+    def __init__(self, data, height=35, start_row=7):
         end = data.rfind(b"\x1b[?25h")
-        start = data.rfind(b"\x1b[2J", 0, end)
-        self.cells = {}
+        self.cells = {(start_row - 1, x): c for x, c in enumerate("previous shell output")}
         self.colors = {}
-        self.x = self.y = 0
+        self.x, self.y = 0, start_row
+        self.scrolled = []
         color = ""
-        if start < 0:
-            return
-        text = data[start:end].decode("utf-8", errors="replace")
+        text = data[:end + 6 if end >= 0 else len(data)].decode("utf-8", errors="replace")
         for part in re.split(r"(\x1b\[[0-?]*[ -/]*[@-~])", text):
             if part.startswith("\x1b["):
                 if part.endswith("H"):
@@ -42,14 +41,26 @@ class Frame:
                     self.y, self.x = row - 1, column - 1
                 elif part.endswith("m"):
                     color = part[2:-1]
-                elif part == "\x1b[2J":
-                    self.cells.clear()
-                    self.colors.clear()
+                elif part in ("\x1b[2J", "\x1b[J", "\x1b[0J"):
+                    for cell in list(self.cells):
+                        if part == "\x1b[2J" or cell >= (self.y, self.x):
+                            self.cells.pop(cell, None)
+                            self.colors.pop(cell, None)
             else:
                 for char in part:
-                    self.cells[self.y, self.x] = char
-                    self.colors[self.y, self.x] = color
-                    self.x += 1
+                    if char == "\r":
+                        self.x = 0
+                    elif char == "\n":
+                        if self.y >= height - 1:
+                            self.scrolled.append(self.row(0))
+                            self.cells = {(y - 1, x): c for (y, x), c in self.cells.items() if y > 0}
+                            self.colors = {(y - 1, x): c for (y, x), c in self.colors.items() if y > 0}
+                        else:
+                            self.y += 1
+                    else:
+                        self.cells[self.y, self.x] = char
+                        self.colors[self.y, self.x] = color
+                        self.x += 1
 
     def row(self, row):
         width = max((x + 1 for y, x in self.cells if y == row), default=0)
@@ -63,7 +74,7 @@ class Frame:
 
 
 class Terminal:
-    def __init__(self, socket, *options, env=None):
+    def __init__(self, socket, *options, env=None, start_row=7):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         connection = ["-s", socket] if socket else []
@@ -76,7 +87,33 @@ class Terminal:
         )
         os.close(slave)
         self.data = b""
-        self.expect("Connected")
+        self.screen_data = b""
+        self.height = 35
+        self.start_row = start_row
+        self.expect_frame(lambda f: f.row(f.y) == "rmycli>"
+                          and not f.row(f.y + 1), "quiet connected prompt")
+        assert b"\x1b[?1049h" not in self.screen_data
+        assert b"Connected" not in self.screen_data
+        assert b"Tab: complete" not in self.screen_data
+        frame = Frame(self.screen_data, self.height, self.start_row)
+        assert frame.y == start_row
+        assert frame.row(start_row - 1) == "previous shell output"
+
+    def read(self):
+        chunk = os.read(self.master, 65536)
+        queries = self.screen_data.count(b"\x1b[6n")
+        self.data += chunk
+        self.screen_data += chunk
+        if self.screen_data.count(b"\x1b[6n") > queries:
+            frame = Frame(self.screen_data, self.height, self.start_row)
+            row = min(frame.y, self.height - 1)
+            os.write(self.master, f"\x1b[{row + 1};{frame.x + 1}R".encode())
+
+    def resize(self, height, width):
+        self.data = b""
+        self.height = height
+        fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        os.kill(self.process.pid, signal.SIGWINCH)
 
     def send(self, data):
         self.data = b""
@@ -90,20 +127,20 @@ class Terminal:
             assert remaining > 0, f"Missing {text!r}: {self.data[-6000:]!r}"
             ready, _, _ = select.select([self.master], [], [], remaining)
             if ready:
-                self.data += os.read(self.master, 65536)
+                self.read()
         return self.data
 
     def expect_frame(self, predicate, description, timeout=5):
         deadline = time.monotonic() + timeout
         while True:
-            frame = Frame(self.data)
-            if predicate(frame):
+            frame = Frame(self.screen_data, self.height, self.start_row)
+            if b"\x1b[?25h" in self.data and predicate(frame):
                 return frame
             remaining = deadline - time.monotonic()
             assert remaining > 0, f"Missing {description}: {self.data[-6000:]!r}"
             ready, _, _ = select.select([self.master], [], [], remaining)
             if ready:
-                self.data += os.read(self.master, 65536)
+                self.read()
 
     def close(self):
         if self.process.poll() is None:
@@ -113,6 +150,13 @@ class Terminal:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        while select.select([self.master], [], [], 0)[0]:
+            try:
+                self.read()
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
         os.close(self.master)
         assert self.process.returncode == 0
 
@@ -198,10 +242,64 @@ def main():
             assert cli("--yes", "--reply-threshold", "1", "LRANGE", "list:a", "0", "-1").returncode == 0
             assert b"PONG" in cli(stdin=b"MULTI\nPING\nEXEC\n").stdout
 
+            bottom = Terminal(socket, start_row=34)
+            terminals.append(bottom)
+            bottom.send(b"\x1bOP")  # F1 at the bottom of the terminal.
+            frame = bottom.expect_frame(
+                lambda f: "┌ Help" in f.row(f.y + 1),
+                "on-demand editor help below the prompt",
+            )
+            assert frame.y < 34
+            assert any(frame.row(y) == "previous shell output" for y in range(frame.y))
+            assert any("Connected" in frame.row(y) for y in range(frame.y + 1, 35))
+            bottom.send(b"\x1b")
+            bottom.expect_frame(
+                lambda f: f.row(f.y) == "rmycli>"
+                and all(not f.row(y) for y in range(f.y + 1, 35)),
+                "Escape removes help without leaving panel fragments",
+            )
+            for _ in range(20):
+                bottom.send(b"PING\r")
+                bottom.expect_frame(
+                    lambda f: f.row(f.y) == "rmycli>" and f.row(f.y - 1) == "PONG"
+                    and not f.row(f.y + 1),
+                    "output scrolls naturally and keeps the prompt after the reply",
+                )
+            frame = Frame(bottom.screen_data, bottom.height, bottom.start_row)
+            assert "previous shell output" in frame.scrolled
+            assert "PONG" in frame.scrolled
+            bottom.send(b"lrange\x1bOP")
+            bottom.expect_frame(lambda f: "┌ Help" in f.row(f.y + 1), "current command help")
+            bottom.send(b"\x1b[6~")
+            bottom.expect_frame(lambda f: "Connected" in "".join(f.row(y) for y in range(35)),
+                                "scrolling command help reaches connection details")
+            bottom.send(b"\x1b")
+            bottom.expect_frame(lambda f: f.hint_is_inline("lrange", " key start stop"),
+                                "help dismissal preserves the draft and inline hint")
+            bottom.resize(10, 45)
+            bottom.expect_frame(lambda f: f.y < 10 and f.hint_is_inline("lrange", " key start stop"),
+                                "resizing preserves input within the new terminal bounds")
+            bottom.send(b"\x15")
+            bottom.expect_frame(lambda f: f.row(f.y) == "rmycli>", "clear the draft")
+            bottom.send(b"\x1bOP")
+            bottom.expect_frame(lambda f: "┌ Help" in f.row(f.y + 1),
+                                "help before exiting")
+            bottom.close()
+            terminals.remove(bottom)
+            frame = Frame(bottom.screen_data, bottom.height, bottom.start_row)
+            assert not any("┌" in frame.row(y) for y in range(10)), "exit left a help panel"
+            assert "PONG" in frame.scrolled, "exit lost terminal scrollback"
+            assert frame.x == 0 and not frame.row(frame.y), "shell cursor was not restored"
+
             terminal = Terminal(socket, "--reply-threshold", "1")
             terminals.append(terminal)
             terminal.send(b"PING\r")
-            terminal.expect("PONG")
+            frame = terminal.expect_frame(
+                lambda f: f.row(f.y - 1) == "PONG" and f.row(f.y) == "rmycli>",
+                "reply followed immediately by the next prompt",
+            )
+            assert frame.y == 9
+            assert frame.row(6) == "previous shell output"
             terminal.send(b"clear\r")
             terminal.expect_frame(
                 lambda f: f.row(f.y) == "rmycli>"
@@ -226,14 +324,14 @@ def main():
             terminal.send(b"n")
             terminal.expect("Not executed")
             terminal.send(b"\x15LPOP list:\t")
-            terminal.expect("Tab/Shift-Tab cycle")
+            terminal.expect("┌ 1/2 ")
             assert b"list:not-a-list" not in terminal.data
             frame = terminal.expect_frame(
-                lambda f: "┌ 1/2 " in f.row(f.y - 4), "bordered popup above input",
+                lambda f: "┌ 1/2 " in f.row(f.y + 2), "bordered popup below input",
             )
-            assert frame.row(frame.y - 4).index("┌") == len("rmycli> LPOP ")
-            assert "list:a" in frame.row(frame.y - 3)
-            assert "list:b" in frame.row(frame.y - 2)
+            assert frame.row(frame.y + 2).index("┌") == len("rmycli> LPOP ")
+            assert "list:a" in frame.row(frame.y + 3)
+            assert "list:b" in frame.row(frame.y + 4)
             terminal.send(b"\t\r")
             terminal.expect("LPOP list:b")
             assert redis("LLEN", "list:b") == 3, "accepting completion executed LPOP"
@@ -254,7 +352,7 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("Connection lost")
             terminal.send(b"\\reconnect\r")
-            terminal.expect("Connected")
+            terminal.expect_frame(lambda f: f.row(f.y) == "rmycli[1]>" and not f.row(f.y + 1), "reconnected prompt")
             terminal.send(b"SUBSCRIBE channel\r")
             terminal.expect("subscribe")
             time.sleep(0.3)  # A quiet stream must not skip the next message.
@@ -263,14 +361,14 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("Stream ended")
             terminal.send(b"\\reconnect\r")
-            terminal.expect("Connected")
+            terminal.expect_frame(lambda f: f.row(f.y) == "rmycli[1]>" and not f.row(f.y + 1), "reconnected prompt")
 
             second = Terminal(socket, "--completion-threshold", "1")
             terminals.append(second)
             second.send(b"LRANGE list:\t")
             second.expect("Show candidates? [y/N]")
             second.send(b"y")
-            second.expect("Tab/Shift-Tab cycle")
+            second.expect("┌ 1/2 ")
             second.send(b"\x1b\x15PING\r")
             second.expect("PONG")
 

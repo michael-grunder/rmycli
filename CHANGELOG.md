@@ -8,16 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Use the normal terminal buffer, starting the prompt at the current cursor row
+  and advancing with replies. Output remains in terminal scrollback after exit.
+- Remove the startup shortcut banner and persistent connection footer.
+  F1 opens a dismissible, scrollable panel with current command help, shortcuts,
+  and connection details; `HELP` opens editor help. PageUp/PageDown scroll help,
+  while earlier output is accessible through terminal scrollback.
 - Show remaining command arguments as grey inline hints instead of a help
   block below the input. Detailed documentation remains available with F1
   and `HELP`.
-- Render completion choices in a bordered, highlighted popup anchored above
-  the current argument, with scrolling and terminal-edge clipping.
+- Render completion choices in a bordered, highlighted popup below the current
+  argument, reserving space as needed, with scrolling and terminal-edge clipping.
 - Omit the database suffix from the prompt and transcript for database zero.
 
 ### Added
 
-- Interactive `CLEAR` command (case insensitive) to clear the transcript
+- Interactive `CLEAR` command (case insensitive) to clear the screen
   locally, like Ctrl-L, without changing the Redis session.
 - Commented `rmycli.dist.toml` configuration reference covering all supported
   settings, defaults, color formats, and named-instance authentication.

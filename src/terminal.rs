@@ -11,9 +11,7 @@ use crossterm::{
     },
     execute, queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
-    terminal::{
-        self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-    },
+    terminal::{self, Clear, ClearType},
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -26,17 +24,73 @@ use crate::{
     worker::{Assistance, Event, Execution, Workers},
 };
 
-struct Screen;
+struct Screen {
+    row: u16,
+}
 impl Screen {
     fn enter() -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        let screen = Self;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            event::EnableBracketedPaste
-        )?;
+        let (column, row) = match cursor::position() {
+            Ok(position) => position,
+            Err(error) => {
+                let _ = terminal::disable_raw_mode();
+                return Err(error);
+            }
+        };
+        let mut screen = Self { row };
+        // Preserve any unterminated shell output before starting our prompt.
+        if column != 0 {
+            execute!(io::stdout(), Print("\r\n"))?;
+            screen.row = (row + 1).min(terminal::size()?.1.saturating_sub(1));
+        }
+        execute!(io::stdout(), event::EnableBracketedPaste)?;
         Ok(screen)
+    }
+
+    fn clear_input(&self, out: &mut impl Write) -> io::Result<()> {
+        queue!(
+            out,
+            ResetColor,
+            cursor::MoveTo(0, self.row),
+            Clear(ClearType::FromCursorDown)
+        )
+    }
+
+    fn write_output(
+        &mut self,
+        out: &mut impl Write,
+        lines: impl IntoIterator<Item = String>,
+        width: usize,
+        height: u16,
+    ) -> io::Result<()> {
+        self.clear_input(out)?;
+        for text in lines {
+            for line in wrap(&text, width) {
+                queue!(out, Print(fit(&line, width)), Print("\r\n"))?;
+                self.row = (self.row + 1).min(height.saturating_sub(1));
+            }
+        }
+        Ok(())
+    }
+
+    /// Make room below the prompt only when assistance is visible. Newlines
+    /// scroll real output into terminal scrollback without overwriting it.
+    fn reserve(
+        &mut self,
+        out: &mut impl Write,
+        rows: usize,
+        height: u16,
+    ) -> io::Result<()> {
+        let rows = u16::try_from(rows).unwrap_or(height).min(height);
+        let scroll = (self.row + rows).saturating_sub(height);
+        if scroll > 0 {
+            queue!(out, cursor::MoveTo(0, height.saturating_sub(1)))?;
+            for _ in 0..scroll {
+                queue!(out, Print("\r\n"))?;
+            }
+            self.row -= scroll;
+        }
+        Ok(())
     }
 }
 impl Drop for Screen {
@@ -44,9 +98,10 @@ impl Drop for Screen {
         let _ = execute!(
             io::stdout(),
             ResetColor,
+            cursor::MoveTo(0, self.row),
+            Clear(ClearType::FromCursorDown),
             cursor::Show,
-            event::DisableBracketedPaste,
-            LeaveAlternateScreen
+            event::DisableBracketedPaste
         );
         let _ = terminal::disable_raw_mode();
     }
@@ -134,8 +189,13 @@ impl Popup {
         anchor: usize,
         row: usize,
         screen_width: usize,
+        available: usize,
     ) -> PopupLayout {
-        let rows = self.candidates.len().min(8).min(row.saturating_sub(2));
+        let rows = self
+            .candidates
+            .len()
+            .min(8)
+            .min(available.saturating_sub(2));
         let longest = self
             .candidates
             .iter()
@@ -145,7 +205,7 @@ impl Popup {
         let width = (longest + 4).max(14).min(screen_width);
         PopupLayout {
             x: anchor.min(screen_width.saturating_sub(width)),
-            y: row.saturating_sub(rows + 2),
+            y: row,
             width,
             rows,
             first: self
@@ -161,8 +221,9 @@ impl Popup {
         anchor: usize,
         row: usize,
         screen_width: usize,
+        available: usize,
     ) -> io::Result<()> {
-        let area = self.layout(anchor, row, screen_width);
+        let area = self.layout(anchor, row, screen_width, available);
         if area.rows == 0 || area.width < 4 {
             return Ok(());
         }
@@ -204,6 +265,74 @@ struct PopupLayout {
     width: usize,
     rows: usize,
     first: usize,
+}
+
+struct Help {
+    lines: Vec<String>,
+    offset: usize,
+}
+
+impl Help {
+    fn lines(&self, width: usize) -> Vec<String> {
+        self.lines
+            .iter()
+            .flat_map(|line| wrap(line, width))
+            .collect()
+    }
+
+    fn draw(
+        &self,
+        out: &mut impl Write,
+        row: usize,
+        width: usize,
+        available: usize,
+    ) -> io::Result<()> {
+        if width < 4 || available < 3 {
+            return Ok(());
+        }
+        let lines = self.lines(width - 4);
+        let rows = lines.len().min(12).min(available - 2);
+        let first = self.offset.min(lines.len().saturating_sub(rows));
+        let title = fit(
+            &format!(
+                " Help {}/{} • F1/Esc close • PgUp/PgDn ",
+                first + 1,
+                lines.len()
+            ),
+            width - 2,
+        );
+        popup_line(
+            out,
+            0,
+            row,
+            &format!(
+                "┌{title}{}┐",
+                "─".repeat(width - 2 - display_width(&title))
+            ),
+            false,
+        )?;
+        for (index, line) in lines[first..first + rows].iter().enumerate() {
+            let line = fit(line, width - 4);
+            popup_line(
+                out,
+                0,
+                row + index + 1,
+                &format!(
+                    "│ {line}{} │",
+                    " ".repeat(width - 4 - display_width(&line))
+                ),
+                false,
+            )?;
+        }
+        popup_line(
+            out,
+            0,
+            row + rows + 1,
+            &format!("└{}┘", "─".repeat(width - 2)),
+            false,
+        )?;
+        queue!(out, ResetColor)
+    }
 }
 
 fn popup_line(
@@ -267,9 +396,10 @@ struct App {
     client_id: Option<i64>,
     mode: Mode,
     output: VecDeque<String>,
-    scroll: usize,
+    clear: bool,
     status: String,
     popup: Option<Popup>,
+    help: Option<Help>,
     scan: Option<Discovery>,
     completion_span: Range<usize>,
     pending: Pending,
@@ -280,13 +410,23 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
     let config = session.config.clone();
     let workers = Workers::start(session);
     let mut app = App {
-        editor: Editor::default(), catalog: Catalog::bundled(), workers, config,
-        client_id: None, mode: Mode::Busy,
-        output: VecDeque::from(["rmycli — Tab: complete • F1: full help • Ctrl-D: exit • \\reconnect: reconnect".into()]),
-        scroll: 0, status: "Loading server command metadata…".into(), popup: None,
-        scan: None, completion_span: 0..0, pending: Pending::default(), options,
+        editor: Editor::default(),
+        catalog: Catalog::bundled(),
+        workers,
+        config,
+        client_id: None,
+        mode: Mode::Busy,
+        output: VecDeque::new(),
+        clear: false,
+        status: "Loading server command metadata…".into(),
+        popup: None,
+        help: None,
+        scan: None,
+        completion_span: 0..0,
+        pending: Pending::default(),
+        options,
     };
-    let _screen = Screen::enter()?;
+    let mut screen = Screen::enter()?;
     let mut dirty = true;
     loop {
         for _ in 0..64 {
@@ -297,7 +437,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
             dirty = true;
         }
         if dirty {
-            app.draw()?;
+            app.draw(&mut screen, &mut io::stdout(), terminal::size()?)?;
             dirty = false;
         }
         if event::poll(Duration::from_millis(40))? {
@@ -306,6 +446,17 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                     if key.kind != KeyEventKind::Release =>
                 {
                     if app.on_key(key) {
+                        let (width, height) = terminal::size()?;
+                        screen.write_output(
+                            &mut io::stdout(),
+                            [format!(
+                                "{}{}",
+                                prompt(app.config.info.redis.db),
+                                app.editor.line
+                            )],
+                            usize::from(width.saturating_sub(1).max(1)),
+                            height,
+                        )?;
                         return Ok(());
                     }
                 }
@@ -313,6 +464,11 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                     app.invalidate();
                     // Pasting never submits commands, including embedded newlines.
                     app.editor.insert(&text.replace(['\r', '\n'], " "));
+                }
+                TerminalEvent::Resize(_, height) => {
+                    // The terminal can reflow existing output on resize.
+                    screen.row =
+                        cursor::position()?.1.min(height.saturating_sub(1));
                 }
                 _ => {}
             }
@@ -324,15 +480,12 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
 impl App {
     fn log(&mut self, lines: impl IntoIterator<Item = String>) {
         self.output.extend(lines);
-        while self.output.len() > 2000 {
-            self.output.pop_front();
-        }
-        self.scroll = 0;
     }
 
     fn invalidate(&mut self) {
         self.workers.invalidate();
         self.popup = None;
+        self.help = None;
         self.scan = None;
         self.pending = Pending::default();
         self.status.clear();
@@ -346,11 +499,7 @@ impl App {
                 client_id,
             } => {
                 self.log(catalog.notices.clone());
-                self.status = format!(
-                    "Connected • {} commands • database {}",
-                    catalog.commands.len(),
-                    config.info.redis.db
-                );
+                self.status.clear();
                 self.catalog = *catalog;
                 self.config = config;
                 self.client_id = client_id;
@@ -471,12 +620,15 @@ impl App {
                 }
                 KeyCode::Char('l') => {
                     self.output.clear();
+                    self.help = None;
+                    self.popup = None;
+                    self.clear = true;
                     return false;
                 }
                 _ => return false,
             }
         }
-        if self.confirm_key(key.code) {
+        if self.confirm_key(key.code) || self.help_key(key.code) {
             return false;
         }
         match key.code {
@@ -494,18 +646,40 @@ impl App {
             KeyCode::Esc => self.invalidate(),
             KeyCode::F(1) => {
                 let ctx = input::context(&self.editor.line, self.editor.cursor);
-                self.log(self.catalog.help(&ctx));
+                let mut lines = self.editor_help();
+                if !self.editor.line.trim().is_empty() {
+                    let mut command = self.catalog.help(&ctx);
+                    command.push(String::new());
+                    command.extend(lines);
+                    lines = command;
+                }
+                self.popup = None;
+                self.help = Some(Help { lines, offset: 0 });
             }
-            KeyCode::PageUp => {
-                self.scroll = (self.scroll + 10).min(self.output.len());
-            }
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
             code => {
                 self.invalidate();
                 self.edit(code);
             }
         }
         false
+    }
+
+    fn help_key(&mut self, code: KeyCode) -> bool {
+        let Some(help) = &mut self.help else {
+            return false;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => self.help = None,
+            KeyCode::PageUp => help.offset = help.offset.saturating_sub(10),
+            KeyCode::Up => help.offset = help.offset.saturating_sub(1),
+            KeyCode::PageDown => help.offset = help.offset.saturating_add(10),
+            KeyCode::Down => help.offset = help.offset.saturating_add(1),
+            _ => {
+                self.help = None;
+                return false;
+            }
+        }
+        true
     }
 
     fn edit(&mut self, code: KeyCode) {
@@ -709,7 +883,7 @@ impl App {
             self.editor.line.clear();
             self.editor.cursor = 0;
             self.output.clear();
-            self.scroll = 0;
+            self.clear = true;
             return false;
         }
         if self.mode == Mode::Streaming {
@@ -770,12 +944,10 @@ impl App {
 
     fn local_help(&mut self, args: &[Vec<u8>]) {
         if args.len() == 1 {
-            self.log(["HELP command: full command help; HELP @group: command list".into(),
-                "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
-                "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
-                "F1: full current help; PageUp/PageDown: scroll; Ctrl-D or \\quit: exit".into(),
-                "CLEAR or Ctrl-L: clear the transcript".into(),
-                "\\reconnect: new connection and refreshed metadata; Ctrl-C: cancel input or close active connection".into()]);
+            self.help = Some(Help {
+                lines: self.editor_help(),
+                offset: 0,
+            });
         } else if args[1].starts_with(b"@") {
             let group = String::from_utf8_lossy(&args[1][1..]);
             let lines = self
@@ -798,42 +970,85 @@ impl App {
         self.editor.cursor = 0;
     }
 
-    fn draw(&self) -> io::Result<()> {
-        let (width, height) = terminal::size()?;
-        if width < 4 || height < 4 {
+    fn editor_help(&self) -> Vec<String> {
+        let state = match self.mode {
+            Mode::Ready | Mode::Stateful => "Connected",
+            Mode::Busy => "Busy",
+            Mode::Streaming => "Streaming",
+            Mode::Disconnected => "Disconnected",
+        };
+        vec![
+            format!("{state} • {} commands • database {}",
+                self.catalog.commands.len(), self.config.info.redis.db),
+            "HELP command: full command help; HELP @group: command list".into(),
+            "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
+            "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
+            "F1: command and editor help; PgUp/PgDn: scroll help; Ctrl-D or \\quit: exit".into(),
+            "CLEAR or Ctrl-L: clear the screen; terminal scrollback retains output".into(),
+            "\\reconnect: new connection and refreshed metadata; Ctrl-C: cancel input or close active connection".into(),
+        ]
+    }
+
+    fn draw(
+        &mut self,
+        screen: &mut Screen,
+        out: &mut impl Write,
+        (width, height): (u16, u16),
+    ) -> io::Result<()> {
+        if width == 0 || height == 0 {
             return Ok(());
         }
-        let width = usize::from(width) - 1;
-        let height = usize::from(height);
-        let output_count = height.saturating_sub(3);
-        let output: Vec<_> =
-            self.output.iter().flat_map(|s| wrap(s, width)).collect();
-        let end = output.len().saturating_sub(self.scroll);
-        let start = end.saturating_sub(output_count);
-        let mut out = io::stdout();
-        queue!(
-            out,
-            cursor::Hide,
-            cursor::MoveTo(0, 0),
-            Clear(ClearType::All)
-        )?;
-        let mut row = 0;
-        for line in &output[start..end] {
-            draw_line(&mut out, row, line, Color::White)?;
-            row += 1;
+        let width = usize::from(width.saturating_sub(1).max(1));
+        screen.row = screen.row.min(height - 1);
+        queue!(out, cursor::Hide)?;
+        if self.clear {
+            queue!(out, ResetColor, Clear(ClearType::All))?;
+            screen.row = 0;
+            self.clear = false;
         }
-        row = output_count;
+        screen.write_output(out, self.output.drain(..), width, height)?;
         let prompt = prompt(self.config.info.redis.db);
+        let inline_status = self.editor.line.is_empty()
+            && self.popup.is_none()
+            && self.help.is_none()
+            && display_width(&safe(&self.status))
+                <= width.saturating_sub(prompt.len());
+        let available = usize::from(height - 1);
+        let status = if self.status.is_empty() || inline_status {
+            Vec::new()
+        } else {
+            wrap(&self.status, width)
+                .into_iter()
+                .take(available)
+                .collect()
+        };
+        let panel_available = available.saturating_sub(status.len());
+        let panel_rows = if width < 4 || panel_available < 3 {
+            0
+        } else if let Some(help) = &mut self.help {
+            let count = help.lines(width - 4).len();
+            let rows = count.min(12).min(panel_available - 2);
+            help.offset = help.offset.min(count.saturating_sub(rows));
+            rows + 2
+        } else {
+            self.popup.as_ref().map_or(0, |popup| {
+                popup.candidates.len().min(8).min(panel_available - 2) + 2
+            })
+        };
+        screen.reserve(out, 1 + status.len() + panel_rows, height)?;
+        let input_row = usize::from(screen.row);
         let (line, column) = viewport(
             &format!("{prompt}{}", self.editor.line),
             prompt.len() + self.editor.cursor,
             width,
         );
-        draw_line(&mut out, row, &line, Color::White)?;
-        let input_row = row;
-        let hint = self
-            .catalog
-            .inline_hint(&self.editor.line, self.editor.cursor);
+        draw_line(out, input_row, &line, Color::White)?;
+        let hint = if inline_status {
+            self.status.clone()
+        } else {
+            self.catalog
+                .inline_hint(&self.editor.line, self.editor.cursor)
+        };
         let used = display_width(&line);
         let hint = fit(&safe(&hint), width.saturating_sub(used));
         let args = input::parse(&self.editor.line)
@@ -848,25 +1063,17 @@ impl App {
                 self.options.theme.hint_color(&command.name)
             });
         queue!(out, SetForegroundColor(color), Print(hint), ResetColor)?;
-        if let Some(popup) = &self.popup {
+        let panel_row = input_row + 1 + status.len();
+        if let Some(help) = &self.help {
+            help.draw(out, panel_row, width, panel_rows)?;
+        } else if let Some(popup) = &self.popup {
             let anchor = column.saturating_sub(display_width(&safe(
                 &self.editor.line[popup.span.start..self.editor.cursor],
             )));
-            popup.draw(&mut out, anchor, input_row, width)?;
+            popup.draw(out, anchor, panel_row, width, panel_rows)?;
         }
-        row += 1;
-        let status = if self.popup.is_some() {
-            format!(
-                "{} • Tab/Shift-Tab cycle • Enter accepts • Esc closes",
-                self.status
-            )
-        } else {
-            self.status.clone()
-        };
-        for line in wrap(&status, width).iter().take(height.saturating_sub(row))
-        {
-            draw_line(&mut out, row, line, Color::Green)?;
-            row += 1;
+        for (offset, line) in status.iter().enumerate() {
+            draw_line(out, input_row + 1 + offset, line, Color::Green)?;
         }
         queue!(
             out,
@@ -976,26 +1183,27 @@ mod tests {
     }
 
     #[test]
-    fn popup_overlays_above_input_and_scrolls_with_selection() {
+    fn popup_fits_below_input_and_scrolls_with_selection() {
         let popup = Popup {
             candidates: (0..30).map(|n| format!("列表:{n}")).collect(),
             selected: 29,
             span: 0..0,
         };
         for (anchor, row, width) in [(12, 20, 80), (19, 5, 20), (2, 2, 4)] {
-            let area = popup.layout(anchor, row, width);
+            let area = popup.layout(anchor, row, width, 10);
             assert!(area.x + area.width <= width);
-            assert!(area.y + area.rows + 2 <= row);
+            assert_eq!(area.y, row);
+            assert!(area.rows + 2 <= 10);
             if area.rows > 0 {
                 assert!(area.first <= popup.selected);
                 assert!(popup.selected < area.first + area.rows);
             }
         }
-        let area = popup.layout(12, 20, 80);
+        let area = popup.layout(12, 20, 80, 10);
         assert_eq!(area.x, 12);
         assert_eq!(area.rows, 8);
         let mut rendered = Vec::new();
-        popup.draw(&mut rendered, 12, 20, 80).unwrap();
+        popup.draw(&mut rendered, 12, 20, 80, 10).unwrap();
         let rendered = String::from_utf8(rendered).unwrap();
         assert!(rendered.contains("┌ 30/30 "));
         assert!(rendered.contains("列表:29"));
@@ -1066,9 +1274,10 @@ mod tests {
             client_id: None,
             mode: Mode::Ready,
             output: VecDeque::new(),
-            scroll: 0,
+            clear: false,
             status: String::new(),
             popup: None,
+            help: None,
             scan: None,
             completion_span: 4..5,
             pending: Pending {
@@ -1086,6 +1295,108 @@ mod tests {
     }
 
     #[test]
+    fn inline_prompt_starts_at_cursor_and_output_is_written_once() {
+        let (mut app, _) = test_app();
+        // No terminal mode was entered, so this fixture needs no cleanup.
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert_eq!(screen.row, 7);
+        assert!(text.contains("\x1b[8;1H"));
+        assert!(!text.contains("\x1b[2J"));
+        assert!(!text.contains("\x1b[?1049h"));
+        assert!(!text.contains("Connected"));
+        assert!(!text.contains("F1"));
+
+        app.log(["rmycli> PING".into(), "PONG".into()]);
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert_eq!(screen.row, 9);
+        assert!(String::from_utf8(rendered).unwrap().contains("PONG\r\n"));
+        assert!(app.output.is_empty());
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert_eq!(screen.row, 9);
+        assert!(!String::from_utf8(rendered).unwrap().contains("PONG"));
+    }
+
+    #[test]
+    fn short_status_on_empty_input_does_not_scroll_the_prompt() {
+        let (mut app, _) = test_app();
+        app.editor.line.clear();
+        app.editor.cursor = 0;
+        app.status = "Loading server command metadata…".into();
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 23 });
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert_eq!(screen.row, 23);
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("Loading server command metadata"));
+        assert!(!text.contains("\r\n"));
+    }
+
+    #[test]
+    fn assistance_scrolls_only_as_needed_and_clears_when_dismissed() {
+        let (mut app, executed) = test_app();
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 23 });
+        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(app.help.is_some());
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert!(screen.row < 23);
+        let row = screen.row;
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("┌ Help"));
+        assert!(!text.contains("\x1b[2J"));
+        assert!(text.contains("\r\n"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert_eq!(screen.row, row);
+        assert!(text.contains("\x1b[J"));
+        assert!(!text.contains("┌"));
+        assert!(!text.contains("\r\n"));
+        assert_eq!(app.editor.line, "GET a");
+        assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
+    fn help_is_on_demand_scrollable_and_never_executes_input() {
+        let (mut app, executed) = test_app();
+        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        let help = app.help.as_ref().unwrap();
+        assert!(help.lines.iter().any(|line| line.contains("Connected")));
+        assert!(help.lines.iter().any(|line| line.contains("Ctrl-D")));
+        assert!(app.output.is_empty());
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(app.help.as_ref().unwrap().offset, 10);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.help.is_none());
+        assert_eq!(app.editor.line, "GET a");
+        assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
+    fn small_and_resized_terminals_keep_the_prompt_in_bounds() {
+        let (mut app, _) = test_app();
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 23 });
+        app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        app.status = "Continue? [y/N] May return many elements".into();
+        for size in [(20, 6), (4, 2), (1, 1), (80, 24)] {
+            let mut rendered = Vec::new();
+            app.draw(&mut screen, &mut rendered, size).unwrap();
+            assert!(screen.row < size.1);
+            assert!(String::from_utf8(rendered).unwrap().contains("\x1b[?25h"));
+        }
+        app.status.clear();
+        for size in [(5, 10), (6, 10)] {
+            app.draw(&mut screen, &mut Vec::new(), size).unwrap();
+        }
+    }
+
+    #[test]
     fn clear_is_local_and_preserves_session_and_history() {
         for mode in [
             Mode::Ready,
@@ -1100,7 +1411,6 @@ mod tests {
                 app.editor.cursor = line.len();
                 app.editor.history.push("PING".into());
                 app.output.push_back("PONG".into());
-                app.scroll = 1;
                 app.status = "Old status".into();
                 app.config.info.redis.db = 2;
 
@@ -1112,7 +1422,7 @@ mod tests {
                 );
 
                 assert!(app.output.is_empty());
-                assert_eq!(app.scroll, 0);
+                assert!(app.clear);
                 assert_eq!(app.editor.line, "");
                 assert_eq!(app.editor.cursor, 0);
                 assert_eq!(app.editor.history, ["PING", line]);
