@@ -212,7 +212,7 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Up / Down | Browse in-memory command history |
 | F1 | Add the full current command help to the transcript |
 | PageUp / PageDown | Scroll the transcript |
-| Ctrl-L | Clear the transcript |
+| `CLEAR`, Ctrl-L | Clear the transcript locally without sending a Redis command |
 | Ctrl-C | Clear input; if executing/streaming, close that connection |
 | Ctrl-D, `\quit`, `\q`, `QUIT`, `EXIT` | Exit |
 | `HELP command`, `HELP @group` | Full command help or commands in a group |

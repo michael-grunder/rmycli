@@ -703,6 +703,15 @@ impl App {
         {
             return true;
         }
+        if args.len() == 1 && args[0].eq_ignore_ascii_case(b"CLEAR") {
+            self.invalidate();
+            self.editor.remember();
+            self.editor.line.clear();
+            self.editor.cursor = 0;
+            self.output.clear();
+            self.scroll = 0;
+            return false;
+        }
         if self.mode == Mode::Streaming {
             self.status =
                 "Ctrl-C closes the stream; then use \\reconnect".into();
@@ -765,6 +774,7 @@ impl App {
                 "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
                 "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
                 "F1: full current help; PageUp/PageDown: scroll; Ctrl-D or \\quit: exit".into(),
+                "CLEAR or Ctrl-L: clear the transcript".into(),
                 "\\reconnect: new connection and refreshed metadata; Ctrl-C: cancel input or close active connection".into()]);
         } else if args[1].starts_with(b"@") {
             let group = String::from_utf8_lossy(&args[1][1..]);
@@ -1030,14 +1040,13 @@ mod tests {
         assert!(!safe("a\x1b[2J").contains('\x1b'));
     }
 
-    #[test]
-    fn editing_invalidates_scan_results_and_pending_execution() {
+    fn test_app() -> (App, std::sync::mpsc::Receiver<Execution>) {
         use redis::IntoConnectionInfo;
         use std::sync::{Arc, atomic::AtomicU64, mpsc};
         let (execution, executed) = mpsc::channel();
         let (assistance, _assisted) = mpsc::channel();
         let (_events, events) = mpsc::channel();
-        let mut app = App {
+        let app = App {
             editor: Editor {
                 line: "GET a".into(),
                 cursor: 5,
@@ -1073,6 +1082,68 @@ mod tests {
                 theme: Theme::default(),
             },
         };
+        (app, executed)
+    }
+
+    #[test]
+    fn clear_is_local_and_preserves_session_and_history() {
+        for mode in [
+            Mode::Ready,
+            Mode::Stateful,
+            Mode::Disconnected,
+            Mode::Streaming,
+        ] {
+            for line in ["clear", "CLEAR", "  ClEaR  ", "\"clear\""] {
+                let (mut app, executed) = test_app();
+                app.mode = mode;
+                app.editor.line = line.into();
+                app.editor.cursor = line.len();
+                app.editor.history.push("PING".into());
+                app.output.push_back("PONG".into());
+                app.scroll = 1;
+                app.status = "Old status".into();
+                app.config.info.redis.db = 2;
+
+                assert!(
+                    !app.on_key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE
+                    ))
+                );
+
+                assert!(app.output.is_empty());
+                assert_eq!(app.scroll, 0);
+                assert_eq!(app.editor.line, "");
+                assert_eq!(app.editor.cursor, 0);
+                assert_eq!(app.editor.history, ["PING", line]);
+                assert_eq!(app.status, "");
+                assert!(app.pending.args.is_none());
+                assert!(app.mode == mode);
+                assert_eq!(app.config.info.redis.db, 2);
+                assert!(executed.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn clear_with_arguments_is_sent_to_redis() {
+        let (mut app, executed) = test_app();
+        app.editor.line = "clear key".into();
+        app.editor.cursor = app.editor.line.len();
+        app.output.push_back("PONG".into());
+
+        assert!(!app.submit());
+
+        assert_eq!(app.output.front().unwrap(), "PONG");
+        let Execution::Run(args) = executed.try_recv().unwrap() else {
+            panic!("expected a Redis command");
+        };
+        assert_eq!(args, [b"clear".to_vec(), b"key".to_vec()]);
+    }
+
+    #[test]
+    fn editing_invalidates_scan_results_and_pending_execution() {
+        let (mut app, executed) = test_app();
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         app.on_worker(Event::Scanned {
             generation: 0,

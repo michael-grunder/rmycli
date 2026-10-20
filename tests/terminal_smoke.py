@@ -200,6 +200,16 @@ def main():
 
             terminal = Terminal(socket, "--reply-threshold", "1")
             terminals.append(terminal)
+            terminal.send(b"PING\r")
+            terminal.expect("PONG")
+            terminal.send(b"clear\r")
+            terminal.expect_frame(
+                lambda f: f.row(f.y) == "rmycli>"
+                and all(not f.row(y) for y in range(f.y)),
+                "clear leaves an empty transcript and prompt",
+            )
+            terminal.send(b"PING\r")
+            terminal.expect("PONG")
             terminal.send(b"lrange")
             frame = terminal.expect_frame(
                 lambda f: f.hint_is_inline("lrange", " key start stop"),

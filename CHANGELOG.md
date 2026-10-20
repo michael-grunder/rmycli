@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Interactive `CLEAR` command (case insensitive) to clear the transcript
+  locally, like Ctrl-L, without changing the Redis session.
 - Commented `rmycli.dist.toml` configuration reference covering all supported
   settings, defaults, color formats, and named-instance authentication.
 - Local `config get`, `config set`, and `config unset` commands with effective
