@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Buffer terminal redraws and synchronize updates so submitting a command does
+  not briefly show an intermediate frame with stale inline hints.
+
 ### Changed
 
 - Use the normal terminal buffer, starting the prompt at the current cursor row

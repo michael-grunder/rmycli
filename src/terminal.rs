@@ -11,7 +11,9 @@ use crossterm::{
     },
     execute, queue,
     style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
+    terminal::{
+        self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
+    },
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -998,9 +1000,23 @@ impl App {
         if width == 0 || height == 0 {
             return Ok(());
         }
+        // Stdout is line buffered: writing replies directly can flush a
+        // redraw halfway through. Build the complete frame before emitting it.
+        let mut frame = Vec::new();
+        self.draw_frame(screen, &mut frame, (width, height))?;
+        out.write_all(&frame)?;
+        out.flush()
+    }
+
+    fn draw_frame(
+        &mut self,
+        screen: &mut Screen,
+        out: &mut impl Write,
+        (width, height): (u16, u16),
+    ) -> io::Result<()> {
         let width = usize::from(width.saturating_sub(1).max(1));
         screen.row = screen.row.min(height - 1);
-        queue!(out, cursor::Hide)?;
+        queue!(out, BeginSynchronizedUpdate, cursor::Hide)?;
         if self.clear {
             queue!(out, ResetColor, Clear(ClearType::All))?;
             screen.row = 0;
@@ -1082,9 +1098,9 @@ impl App {
                 u16::try_from(column).unwrap_or(0),
                 u16::try_from(input_row).unwrap_or(0)
             ),
-            cursor::Show
-        )?;
-        out.flush()
+            cursor::Show,
+            EndSynchronizedUpdate
+        )
     }
 }
 
@@ -1319,6 +1335,79 @@ mod tests {
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         assert_eq!(screen.row, 9);
         assert!(!String::from_utf8(rendered).unwrap().contains("PONG"));
+    }
+
+    #[test]
+    fn submission_and_reply_emit_complete_frames_without_old_hints() {
+        #[derive(Default)]
+        struct FrameWriter {
+            frames: Vec<String>,
+            flushes: usize,
+        }
+        impl Write for FrameWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let frame = String::from_utf8(bytes.to_vec()).unwrap();
+                // Each write must keep clearing, scrolling, and repainting
+                // inside one synchronized update, even across newlines.
+                assert!(frame.starts_with("\x1b[?2026h"));
+                assert!(frame.ends_with("\x1b[?25h\x1b[?2026l"));
+                self.frames.push(frame);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        for row in [7, 23] {
+            let (mut app, executed) = test_app();
+            let mut screen = std::mem::ManuallyDrop::new(Screen { row });
+            let mut out = FrameWriter::default();
+            app.editor.line = "PING".into();
+            app.editor.cursor = 4;
+            let hint = app.catalog.inline_hint("PING", 4);
+            assert_ne!(hint, "");
+            app.draw(&mut screen, &mut out, (80, 24)).unwrap();
+            assert!(out.frames[0].contains(&hint));
+
+            assert!(
+                !app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            );
+            let Execution::Run(args) = executed.try_recv().unwrap() else {
+                panic!("expected command execution");
+            };
+            assert_eq!(args, [b"PING".to_vec()]);
+            app.draw(&mut screen, &mut out, (80, 24)).unwrap();
+            let submitted = &out.frames[1];
+            assert!(!submitted.contains(&hint));
+            assert!(
+                submitted.find("\x1b[J").unwrap()
+                    < submitted.find("rmycli> PING\r\n").unwrap()
+            );
+            assert!(submitted.contains("Executing"));
+
+            app.on_worker(Event::Executed {
+                lines: vec!["PONG".into()],
+                config: app.config.clone(),
+                allowed: true,
+                streaming: false,
+                client_id: None,
+                connected: true,
+            });
+            app.draw(&mut screen, &mut out, (80, 24)).unwrap();
+            let reply = &out.frames[2];
+            assert!(
+                reply.find("PONG\r\n").unwrap()
+                    < reply.find("rmycli> ").unwrap()
+            );
+            assert!(!reply.contains(&hint));
+            assert!(!reply.contains("Executing"));
+            assert_eq!(screen.row, (row + 2).min(23));
+            assert_eq!(out.frames.len(), 3);
+            assert_eq!(out.flushes, 3);
+        }
     }
 
     #[test]

@@ -191,6 +191,8 @@ the input line, like `redis-cli`: typing `lrange` displays `lrange key start sto
 only `key start stop` supplied by the program. Typing the key changes the hint
 to `start stop`. Hints never become part of the submitted command. They are
 hidden while editing inside the line and clipped at the terminal's right edge.
+Redraws are buffered and use synchronized terminal updates where supported,
+so clearing hints, printing output, and drawing the next prompt appear together.
 F1 opens a dismissible help panel with current command documentation, editor
 shortcuts, and connection status. `HELP command` prints full syntax, summary,
 version, group, and complexity to the terminal.
