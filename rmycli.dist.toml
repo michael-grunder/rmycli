@@ -1,0 +1,103 @@
+# rmycli configuration reference
+#
+# Copy this file to ~/.config/rmycli.toml, or to
+# $XDG_CONFIG_HOME/rmycli.toml if you use a custom XDG config directory.
+# This .dist.toml file is not loaded automatically. To use it explicitly:
+#   rmycli --config ./rmycli.dist.toml
+#
+# The first available config file wins; files are not merged. User config
+# takes precedence over rmycli.toml in $XDG_CONFIG_DIRS (default: /etc/xdg).
+# --config PATH selects one file; --no-config uses built-in defaults.
+# Settings are read at startup. Restart an open shell after editing.
+#
+# All settings are optional. Unknown fields and invalid values are errors.
+# Uncomment examples as needed; do not define the same setting twice.
+# Only theme and named-instance settings are currently supported here.
+# Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
+# command-line options. See README.md and rmycli --help.
+#
+# Read or edit settings without connecting to Redis:
+#   rmycli config get theme.inline-hint
+#   rmycli config set theme.inline-hint cyan
+#   rmycli config unset theme.inline-hint
+# Color reads and updates include a colored sample in terminals.
+# --color always forces previews; --color never suppresses them.
+# Automatic previews respect NO_COLOR and are omitted from piped output.
+
+[theme]
+# Foreground color of inline argument hints. Default: "dark_grey".
+# This does not change typed input, command output, or completion popup colors.
+inline-hint = "dark_grey"
+
+# Supported color strings:
+#   "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+#   "grey", "dark_grey", "dark_red", "dark_green", "dark_yellow", "dark_blue",
+#   "dark_magenta", "dark_cyan"
+#   "reset"           -- terminal's default foreground color
+#   "#89b4fa"         -- RGB hex, exactly six hexadecimal digits
+#   "rgb_(137,180,250)" -- RGB decimal components, each 0 through 255
+#   "ansi_(117)"      -- terminal palette index, 0 through 255
+# Named colors follow your terminal palette. RGB needs terminal support.
+
+[theme.commands]
+# Optional per-command inline-hint colors; no overrides are built in.
+# Names are case insensitive, and whitespace is normalized. Quote command
+# names containing spaces or dots. Duplicate normalized names are errors.
+# Specific subcommand > parent command > theme.inline-hint.
+# Module command names are allowed even when the current server lacks them.
+#
+# GET = "cyan"
+# LRANGE = "#89b4fa"
+# XGROUP = "green"
+# "XGROUP CREATE" = "yellow"
+# "JSON.GET" = "ansi_(117)"
+#
+# CLI equivalent (outer quotes are shell quoting):
+#   rmycli config set 'theme.commands."XGROUP CREATE"' yellow
+
+[instances.local]
+# Named instances are opt-in: rmycli --instance local
+# You can also run a command: rmycli --instance local PING
+# Names are case sensitive. Host/port alone never select an instance.
+# All fields below are optional; these four values show built-in defaults.
+host = "127.0.0.1" # Nonempty hostname or IP address.
+port = 6379        # Integer from 1 through 65535.
+db = 0             # Nonnegative database number.
+tls = false        # true enables TLS with certificate verification.
+
+# Redis ACL username. Omit for the default user/password-only authentication.
+# user = "alice"
+
+# Choose at most ONE password source. Neither is configured by default.
+# password-env names an environment variable, read when selecting the instance.
+# A missing variable is an error unless an overriding password is supplied.
+# password-env = "LOCAL_REDIS_PASSWORD"
+#
+# Alternatively, store a literal password. It is not interpolated.
+# Protect config files containing passwords with owner-only permissions.
+# password = "replace-with-your-password"
+#
+# Authentication applies to command and background assistance connections.
+# Explicit -h, -p, -n, --user, and -a override instance fields.
+# Password precedence: -a > REDISCLI_AUTH > instance password/password-env.
+# --tls can enable TLS for an instance. --instance cannot be combined with
+# -u/REDIS_URL or -s; unset REDIS_URL before selecting a named instance.
+#
+# CLI examples:
+#   rmycli config set instances.local.password-env LOCAL_REDIS_PASSWORD
+#   rmycli config get instances.local.host
+# Password updates print [redacted]; an explicit get of a stored password
+# prints the password. Reading password-env prints the variable's name.
+
+# A second instance, with TLS and authentication (customize before enabling).
+# Set QA_REDIS_PASSWORD in your environment, then use rmycli --instance qa.
+# [instances.qa]
+# host = "redis.qa.example.com"
+# port = 6380
+# db = 2
+# tls = true
+# user = "alice"
+# password-env = "QA_REDIS_PASSWORD"
+#
+# Quote instance names containing dots: [instances."qa.eu"]
+# CLI equivalent: rmycli config set 'instances."qa.eu".host' qa.example.com

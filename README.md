@@ -66,7 +66,12 @@ unknown setting, or invalid value causes an error before connecting. No file is
 created during normal startup. `--help` and `--version` work without loading
 settings.
 
-For example, create `~/.config/rmycli.toml`:
+See [rmycli.dist.toml](rmycli.dist.toml) for a commented reference covering every
+supported setting, defaults, color formats, and authentication examples. Copy
+it to `~/.config/rmycli.toml` (or `$XDG_CONFIG_HOME/rmycli.toml`); the distribution
+file is not loaded automatically.
+
+For a shorter example, create `~/.config/rmycli.toml`:
 
 ```toml
 [theme]
