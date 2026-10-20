@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.6", features = ["derive", "env"] }
+crossterm = "0.29"
+redis = { version = "0.32", features = ["tls-rustls"] }
+# redis-rs leaves the TLS crypto provider to the application.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0"
+unicode-width = "0.2"
