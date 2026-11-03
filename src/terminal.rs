@@ -10,7 +10,10 @@ use crossterm::{
         KeyModifiers,
     },
     execute, queue,
-    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor,
+        SetForegroundColor,
+    },
     terminal::{
         self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
     },
@@ -69,15 +72,21 @@ impl Screen {
     fn write_output(
         &mut self,
         out: &mut impl Write,
-        lines: impl IntoIterator<Item = String>,
+        lines: impl IntoIterator<Item = (String, bool)>,
         width: usize,
         height: u16,
     ) -> io::Result<()> {
         self.clear_input(out)?;
-        for text in lines {
+        for (text, bold) in lines {
+            if bold {
+                queue!(out, SetAttribute(Attribute::Bold))?;
+            }
             for line in wrap(&text, width) {
                 queue!(out, Print(fit(&line, width)), Print("\r\n"))?;
                 self.row = (self.row + 1).min(height.saturating_sub(1));
+            }
+            if bold {
+                queue!(out, SetAttribute(Attribute::NormalIntensity))?;
             }
         }
         Ok(())
@@ -405,7 +414,7 @@ struct App {
     config: Config,
     client_id: Option<i64>,
     mode: Mode,
-    output: VecDeque<String>,
+    output: VecDeque<(String, bool)>,
     clear: bool,
     status: String,
     popup: Option<Popup>,
@@ -468,10 +477,13 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                         let (width, height) = terminal::size()?;
                         screen.write_output(
                             &mut io::stdout(),
-                            [format!(
-                                "{}{}",
-                                prompt(app.config.info.redis.db),
-                                app.editor.line
+                            [(
+                                format!(
+                                    "{}{}",
+                                    prompt(app.config.info.redis.db),
+                                    app.editor.line
+                                ),
+                                false,
                             )],
                             usize::from(width.saturating_sub(1).max(1)),
                             height,
@@ -498,7 +510,8 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
 
 impl App {
     fn log(&mut self, lines: impl IntoIterator<Item = String>) {
-        self.output.extend(lines);
+        self.output
+            .extend(lines.into_iter().map(|line| (line, false)));
     }
 
     /// Reveal the busy prompt once a command outlasts its grace period.
@@ -567,6 +580,10 @@ impl App {
                 };
             }
             Event::Output(lines) => self.log(lines),
+            Event::Push(lines) => {
+                self.output
+                    .extend(lines.into_iter().map(|line| (line, true)));
+            }
             Event::Failed(message) => {
                 self.busy_until = None;
                 self.status = message;
@@ -1385,6 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn push_output_is_bold_and_preserves_the_draft_and_cursor() {
+        let (mut app, executed) = test_app();
+        app.editor = Editor::default();
+        app.editor.insert("GET draft");
+        app.editor.left();
+        let cursor = app.editor.cursor;
+        app.on_worker(Event::Push(vec!["invalidate".into(), "key".into()]));
+        app.log(["PONG".into()]);
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("\x1b[1minvalidate\r\n\x1b[22m"));
+        assert!(text.contains("\x1b[1mkey\r\n\x1b[22mPONG\r\n"));
+        assert!(text.contains("GET draft"));
+        assert_eq!(app.editor.line, "GET draft");
+        assert_eq!(app.editor.cursor, cursor);
+        assert_eq!(screen.row, 10);
+        assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
     fn submission_and_reply_emit_complete_frames_without_old_hints() {
         #[derive(Default)]
         struct FrameWriter {
@@ -1582,7 +1621,7 @@ mod tests {
                 app.editor.line = line.into();
                 app.editor.cursor = line.len();
                 app.editor.history.push_back("PING".into());
-                app.output.push_back("PONG".into());
+                app.log(["PONG".into()]);
                 app.status = "Old status".into();
                 app.config.info.redis.db = 2;
 
@@ -1612,11 +1651,11 @@ mod tests {
         let (mut app, executed) = test_app();
         app.editor.line = "clear key".into();
         app.editor.cursor = app.editor.line.len();
-        app.output.push_back("PONG".into());
+        app.log(["PONG".into()]);
 
         assert!(!app.submit());
 
-        assert_eq!(app.output.front().unwrap(), "PONG");
+        assert_eq!(app.output.front().unwrap().0, "PONG");
         let Execution::Run(args) = executed.try_recv().unwrap() else {
             panic!("expected a Redis command");
         };

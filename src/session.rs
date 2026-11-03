@@ -81,6 +81,19 @@ impl Session {
         !self.transaction && !self.watched && !self.streaming
     }
 
+    /// Read idle traffic without changing Redis state or losing partial frames.
+    pub fn poll_message(&mut self) -> RedisResult<Option<Value>> {
+        self.connection
+            .set_read_timeout(Some(Duration::from_millis(100)))?;
+        let result = self.connection.recv_message();
+        self.connection.set_read_timeout(None)?;
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.is_timeout() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     #[cfg(test)]
     pub fn execute(&mut self, args: &[Vec<u8>]) -> RedisResult<Value> {
         self.execute_with_push(args, |_| {})
@@ -466,6 +479,79 @@ mod tests {
         assert_eq!(output, b"invalidate\nkey\n");
         drop(session);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn idle_timeouts_preserve_fragmented_pushes_and_later_replies() {
+        for finish_while_idle in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (release, fragment) = std::sync::mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut parser = redis::Parser::new();
+                let mut pings = 0;
+                while let Ok(value) = parser.parse_value(&mut stream) {
+                    let args: Vec<String> =
+                        redis::from_redis_value(&value).unwrap();
+                    if args[0] == "PING" {
+                        pings += 1;
+                        if pings == 1 {
+                            stream.write_all(b"+PONG\r\n>2\r\n+invalidate\r\n*1\r\n$3\r\nk").unwrap();
+                            fragment
+                                .recv_timeout(Duration::from_secs(3))
+                                .unwrap();
+                            stream.write_all(b"ey\r\n").unwrap();
+                        } else {
+                            stream.write_all(b"+SECOND\r\n").unwrap();
+                        }
+                    } else {
+                        stream.write_all(b"+OK\r\n").unwrap();
+                    }
+                }
+            });
+            let mut session = Session::open(config(port)).unwrap();
+            // Empty polls must not discard the next command's reply.
+            assert_eq!(session.poll_message().unwrap(), None);
+            assert_eq!(session.poll_message().unwrap(), None);
+            let args = [b"PING".to_vec()];
+            assert_eq!(
+                session.execute(&args).unwrap(),
+                Value::SimpleString("PONG".into())
+            );
+            assert_eq!(session.poll_message().unwrap(), None);
+            release.send(()).unwrap();
+            let mut pushes = Vec::new();
+            if finish_while_idle {
+                for _ in 0..10 {
+                    if let Some(value) = session.poll_message().unwrap() {
+                        pushes.push(value);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                session
+                    .execute_with_push(&args, |value| pushes
+                        .push(value.clone()))
+                    .unwrap(),
+                Value::SimpleString("SECOND".into())
+            );
+            assert_eq!(
+                pushes,
+                vec![Value::Push {
+                    kind: redis::PushKind::Invalidate,
+                    data: vec![Value::Array(vec![Value::BulkString(
+                        b"key".to_vec()
+                    )])],
+                }]
+            );
+            drop(session);
+            server.join().unwrap();
+        }
     }
 
     #[test]

@@ -84,6 +84,97 @@ impl Drop for RedisFixture {
     }
 }
 
+fn worker_command(
+    workers: &crate::worker::Workers,
+    command: &str,
+) -> Vec<String> {
+    workers
+        .execution
+        .send(crate::worker::Execution::Run(
+            input::parse(command)
+                .words
+                .into_iter()
+                .map(|word| word.bytes)
+                .collect(),
+        ))
+        .unwrap();
+    match workers.events.recv_timeout(Duration::from_secs(3)).unwrap() {
+        crate::worker::Event::Executed { lines, .. } => lines,
+        _ => panic!("expected command reply"),
+    }
+}
+
+#[test]
+fn worker_displays_idle_invalidations_and_preserves_session_state() {
+    use crate::worker::{Event, Execution, Workers};
+
+    let fixture = RedisFixture::new();
+    let mut writer = fixture.connection();
+    for show_pushes in [true, false] {
+        let mut config = fixture.config.clone();
+        config.show_pushes = show_pushes;
+        let workers = Workers::start(Session::open(config).unwrap());
+        let Event::Connected { client_id, .. } =
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected connected event");
+        };
+        // Exercise a protocol change on the existing connection too.
+        worker_command(&workers, "HELLO 3");
+        worker_command(&workers, "SET foo bar");
+        worker_command(&workers, "CLIENT TRACKING ON");
+        worker_command(&workers, "GET foo");
+        worker_command(&workers, "WATCH unrelated");
+        redis::cmd("SET")
+            .arg("foo")
+            .arg("updated")
+            .query::<()>(&mut writer)
+            .unwrap();
+        if show_pushes {
+            let Event::Push(lines) =
+                workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+            else {
+                panic!("expected invalidation without submitting a command");
+            };
+            assert_eq!(lines, ["1) invalidate", "2) 1) foo"]);
+        } else {
+            assert!(
+                workers
+                    .events
+                    .recv_timeout(Duration::from_millis(350))
+                    .is_err()
+            );
+        }
+        assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+        worker_command(&workers, "MULTI");
+        assert!(
+            workers
+                .events
+                .recv_timeout(Duration::from_millis(350))
+                .is_err()
+        );
+        assert_eq!(worker_command(&workers, "PING"), ["QUEUED"]);
+        assert_eq!(worker_command(&workers, "EXEC"), ["1) PONG"]);
+        // Disconnection is noticed while idle, and reconnect restores polling.
+        redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(client_id.unwrap())
+            .query::<i64>(&mut writer)
+            .unwrap();
+        assert!(matches!(
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Failed(_)
+        ));
+        workers.execution.send(Execution::Reconnect).unwrap();
+        assert!(matches!(
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Connected { .. }
+        ));
+        assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+    }
+}
+
 #[test]
 fn live_metadata_typed_scan_binary_keys_and_estimates() {
     let fixture = RedisFixture::new();

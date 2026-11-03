@@ -118,9 +118,13 @@ rmycli --scan --pattern 'user:*' --count 100
   become objects so output remains valid JSON. CSV uses redis-cli's escaped
   strings, rather than RFC 4180 quoting. The live editor always escapes
   terminal control bytes, even with `--raw`; JSON and CSV work in the editor.
-- `--show-pushes` controls unsolicited RESP3 messages received during command
-  reads (default: on for terminal stdout). It does not hide Pub/Sub messages.
-  The editor does not poll the connection for pushes while idle.
+- `--show-pushes` controls unsolicited RESP3 messages (default: on for terminal
+  stdout). The interactive worker reads the socket while idle, with a 100 ms
+  timeout between checks for submitted commands. Invalidations appear without
+  another command, in bold, while preserving the input and cursor. Polling sends
+  no Redis commands and also runs during WATCH and MULTI. Hidden pushes are
+  still drained; Pub/Sub messages remain visible. Polling frequency and push
+  styling are currently fixed. Noninteractive reads remain command driven.
 - `--scan` streams one SCAN batch at a time until cursor zero without retaining
   the whole keyspace. Ctrl-C interrupts it; `-i` throttles requests. `--count`
   is a Redis work hint, not a result limit. Like redis-cli, this explicit listing
@@ -149,6 +153,11 @@ transport does not expose those controls. TLS uses the connection hostname for
 SNI and rustls cipher defaults. Unsupported switches before the command fail
 with a usage error; they are never accepted as no-ops. Full option parity is
 not claimed.
+
+The synchronous Redis dependency is pinned to a local copy with a small
+[timeout-safe message-read patch](vendor/README.md). Its ordinary reply reader
+discards a later reply after a timeout, making it unsuitable for idle polling.
+The patch reuses the existing parser and TCP/TLS/Unix transports.
 
 ## Configuration and saved instances
 

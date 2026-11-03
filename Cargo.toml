@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["serde"] }
-redis = { version = "0.32", features = ["tls-rustls", "tls-rustls-insecure"] }
+redis = { version = "=0.32.7", features = [
+    "tls-rustls", "tls-rustls-insecure", "safe_iterators",
+] }
 # redis-rs leaves the TLS crypto provider to the application.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0"
@@ -16,3 +18,7 @@ toml_edit = "0.25"
 tempfile = "3.27"
 unicode-width = "0.2"
 xdg = "3.0"
+
+# Timeout-safe idle reads are not exposed by redis-rs 0.32.7.
+[patch.crates-io]
+redis = { path = "vendor/redis" }

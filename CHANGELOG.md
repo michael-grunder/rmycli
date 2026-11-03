@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Display RESP3 invalidations while the interactive prompt is idle, without
+  needing another command. The worker polls with a 100 ms read timeout, keeps
+  partial messages across timeouts, and respects `--show-pushes` and session
+  state. Push output is bold and preserves the current input and cursor.
+- Vendor redis-rs 0.32.7 with a timeout-safe message-read API for idle polling;
+  ordinary command reads and existing transports retain their behavior.
 - Buffer terminal redraws and synchronize updates so submitting a command does
   not briefly show an intermediate frame with stale inline hints.
 - Stop flashing a grey `Executing…` status on a fresh prompt after every

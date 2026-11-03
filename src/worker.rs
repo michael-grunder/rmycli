@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread;
+
+use redis::Value;
 
 use crate::estimate;
 use crate::metadata::Catalog;
@@ -49,6 +51,7 @@ pub enum Event {
         client_id: Option<i64>,
     },
     Output(Vec<String>),
+    Push(Vec<String>),
     Scanned {
         generation: u64,
         state: Discovery,
@@ -210,13 +213,51 @@ fn announce(session: &mut Session, events: &SyncSender<Event>) -> Option<i64> {
     id
 }
 
+fn read_idle(session: &mut Session, events: &SyncSender<Event>) -> bool {
+    match session.poll_message() {
+        Ok(Some(reply)) => {
+            let push = matches!(reply, Value::Push { .. });
+            if !push || session.config.show_pushes {
+                let lines = session.config.output.lines(&reply);
+                let event = if push {
+                    Event::Push(lines)
+                } else {
+                    Event::Output(lines)
+                };
+                return events.send(event).is_ok();
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = events.send(Event::Failed(format!(
+                "Connection lost: {error}. Use \\reconnect."
+            )));
+            return false;
+        }
+    }
+    true
+}
+
 fn execution_loop(
     mut session: Session,
     requests: &Receiver<Execution>,
     events: &SyncSender<Event>,
 ) {
     let mut id = announce(&mut session, events);
-    while let Ok(request) = requests.recv() {
+    let mut listening = true;
+    loop {
+        let request = match requests.try_recv() {
+            Ok(request) => request,
+            Err(TryRecvError::Disconnected) => return,
+            Err(TryRecvError::Empty) if listening => {
+                listening = read_idle(&mut session, events);
+                continue;
+            }
+            Err(TryRecvError::Empty) => match requests.recv() {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+        };
         match request {
             Execution::Run(args) => {
                 let previous_addr = session.config.info.addr.clone();
@@ -224,7 +265,7 @@ fn execution_loop(
                 let show_pushes = session.config.show_pushes;
                 let result = session.execute_with_push(&args, |reply| {
                     if show_pushes {
-                        let _ = events.send(Event::Output(output.lines(reply)));
+                        let _ = events.send(Event::Push(output.lines(reply)));
                     }
                 });
                 if previous_addr != session.config.info.addr {
@@ -234,6 +275,7 @@ fn execution_loop(
                     .as_ref()
                     .err()
                     .is_none_or(|error| !error.is_io_error());
+                listening = connected;
                 let lines = result.map_or_else(
                     |error| vec![format!("(error) {error}")],
                     |reply| output.lines(&reply),
@@ -257,15 +299,19 @@ fn execution_loop(
                 while session.streaming {
                     match session.connection.recv_response() {
                         Ok(reply) => {
-                            if events
-                                .send(Event::Output(output.lines(&reply)))
-                                .is_err()
-                            {
+                            let lines = output.lines(&reply);
+                            let event = if matches!(reply, Value::Push { .. }) {
+                                Event::Push(lines)
+                            } else {
+                                Event::Output(lines)
+                            };
+                            if events.send(event).is_err() {
                                 return;
                             }
                         }
                         Err(error) => {
                             session.streaming = false;
+                            listening = false;
                             let _ = events.send(Event::Failed(format!(
                                 "Stream ended: {error}. Use \\reconnect."
                             )));
@@ -277,6 +323,7 @@ fn execution_loop(
             {
                 Ok(fresh) => {
                     session = fresh;
+                    listening = true;
                     id = announce(&mut session, events);
                 }
                 Err(error) => {

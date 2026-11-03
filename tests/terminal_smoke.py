@@ -284,6 +284,30 @@ def main():
             password_prompt(socket)
             password_prompt(socket, cancel=True)
 
+            tracking = Terminal(socket, "-3")
+            terminals.append(tracking)
+            for command, reply in [(b"SET tracked original\r", "OK"),
+                                   (b"CLIENT TRACKING ON\r", "OK"),
+                                   (b"GET tracked\r", "original")]:
+                tracking.send(command)
+                tracking.expect(reply)
+            tracking.send(b"GET draft\x1b[D")
+            tracking.expect_frame(
+                lambda f: f.row(f.y) == "rmycli> GET draft"
+                and f.x == len("rmycli> GET draf"), "draft before invalidation",
+            )
+            tracking.data = b""
+            redis("SET", "tracked", "changed")
+            frame = tracking.expect_frame(
+                lambda f: any(f.row(y) == "1) invalidate" for y in range(f.y))
+                and f.row(f.y) == "rmycli> GET draft"
+                and f.x == len("rmycli> GET draf"), "idle push preserves input",
+            )
+            row = next(y for y in range(frame.y) if frame.row(y) == "1) invalidate")
+            assert frame.colors[row, 0] == "1", "push was not bold"
+            tracking.send(b"\x05\x15PING\r")
+            tracking.expect("PONG")
+
             bottom = Terminal(socket, "-3", start_row=34)
             terminals.append(bottom)
             bottom.send(b"\x1bOP")  # F1 at the bottom of the terminal.
