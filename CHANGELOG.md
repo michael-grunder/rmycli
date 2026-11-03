@@ -24,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Show server error messages directly, such as `(error) syntax error`, without
+  the Redis library's preamble; retain context for client and connection errors.
 - Render interactive invalidation pushes as bold `-> invalidate: 'key'` lines,
   one per key, or `-> invalidate: (nil)` for cache-wide invalidation.
 - Match redis-cli's raw-output default when stdout is redirected; `--no-raw`

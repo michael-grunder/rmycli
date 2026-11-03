@@ -105,6 +105,29 @@ fn worker_command(
 }
 
 #[test]
+fn worker_shows_server_errors_without_library_context() {
+    use crate::worker::{Event, Workers};
+
+    let fixture = RedisFixture::new();
+    for protocol in
+        [redis::ProtocolVersion::RESP2, redis::ProtocolVersion::RESP3]
+    {
+        let mut config = fixture.config.clone();
+        config.info.redis.protocol = protocol;
+        let workers = Workers::start(Session::open(config).unwrap());
+        assert!(matches!(
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Connected { .. }
+        ));
+        assert_eq!(
+            worker_command(&workers, "SET d sd d d d d"),
+            ["(error) syntax error"]
+        );
+        assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+    }
+}
+
+#[test]
 fn worker_displays_idle_invalidations_and_preserves_session_state() {
     use crate::worker::{Event, Execution, Workers};
 

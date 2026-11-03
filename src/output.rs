@@ -3,6 +3,34 @@ use std::io::{self, IsTerminal, Write};
 
 use redis::Value;
 
+pub fn error_message(error: &redis::RedisError) -> String {
+    let display = error.to_string();
+    let extension = error.kind() == redis::ErrorKind::ExtensionError;
+    // redis-rs exposes no server-origin flag; local errors can share its kinds.
+    if !extension
+        && !display.starts_with("An error was signalled by the server")
+    {
+        return display;
+    }
+    let code = error.code().or_else(|| {
+        (error.kind() == redis::ErrorKind::NoSub).then_some("NOSUB")
+    });
+    let detail = error.detail().filter(|detail| {
+        // redis-rs synthesizes this detail for code-only extension errors.
+        !extension || *detail != "Unknown extension error encountered"
+    });
+    code.map_or(display, |code| {
+        server_error_message(code, detail).to_owned()
+    })
+}
+
+pub fn server_error_message<'a>(
+    code: &'a str,
+    detail: Option<&'a str>,
+) -> &'a str {
+    detail.filter(|detail| !detail.is_empty()).unwrap_or(code)
+}
+
 #[derive(Clone, Debug, Default, clap::Args)]
 #[group(id = "OutputOptions", multiple = true)]
 // Clap models independent command-line switches as booleans.
@@ -164,9 +192,9 @@ fn raw_reply(
             Ok(())
         }
         Value::Attribute { data, .. } => raw_reply(out, data, delimiter),
-        Value::ServerError(error) => {
-            write!(out, "{}", redis::RedisError::from(error.clone()))
-        }
+        Value::ServerError(error) => out.write_all(
+            server_error_message(error.code(), error.details()).as_bytes(),
+        ),
     }
 }
 
@@ -215,9 +243,7 @@ fn csv_reply(out: &mut impl Write, value: &Value) -> io::Result<()> {
             out,
             "ERROR,{}",
             quoted(
-                redis::RedisError::from(error.clone())
-                    .to_string()
-                    .as_bytes()
+                server_error_message(error.code(), error.details()).as_bytes()
             )
         ),
         _ => raw_reply(out, value, ","),
@@ -297,9 +323,7 @@ fn json_reply(
             out.write_all(b"{\"error\":")?;
             json_string(
                 out,
-                redis::RedisError::from(error.clone())
-                    .to_string()
-                    .as_bytes(),
+                server_error_message(error.code(), error.details()).as_bytes(),
                 ascii,
             )?;
             out.write_all(b"}")
@@ -311,6 +335,84 @@ fn json_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_errors_show_messages_or_codes_in_every_format() {
+        for (wire, message) in [
+            ("-ERR syntax error\r\n", "syntax error"),
+            ("-WRONGTYPE wrong kind of value\r\n", "wrong kind of value"),
+            ("-ERR\r\n", "ERR"),
+            ("-CUSTOM\r\n", "CUSTOM"),
+        ] {
+            let value = redis::parse_redis_value(wire.as_bytes()).unwrap();
+            let Value::ServerError(error) = &value else {
+                panic!("expected server error");
+            };
+            assert_eq!(
+                error_message(&redis::RedisError::from(error.clone())),
+                message
+            );
+            assert_eq!(
+                Options::default().lines(&Value::Array(vec![value.clone()])),
+                [format!("1) (error) {message}")]
+            );
+            for options in [
+                Options {
+                    raw: true,
+                    ..Options::default()
+                },
+                Options {
+                    csv: true,
+                    ..Options::default()
+                },
+                Options {
+                    json: true,
+                    ..Options::default()
+                },
+                Options {
+                    quoted_json: true,
+                    ..Options::default()
+                },
+            ] {
+                let mut bytes = Vec::new();
+                options.write(&mut bytes, &value, false).unwrap();
+                let expected = if options.csv {
+                    format!("ERROR,\"{message}\"\n")
+                } else if options.json || options.quoted_json {
+                    format!("{{\"error\":\"{message}\"}}\n")
+                } else {
+                    format!("{message}\n")
+                };
+                assert_eq!(bytes, expected.as_bytes());
+            }
+        }
+        let value = redis::parse_redis_value(b"-ERR bad\x1b[31m\r\n").unwrap();
+        assert_eq!(
+            Options::default().lines(&value),
+            [r"(error) bad\u{1b}[31m"]
+        );
+    }
+
+    #[test]
+    fn client_and_connection_errors_keep_their_context() {
+        for error in [
+            redis::RedisError::from((
+                redis::ErrorKind::TypeError,
+                "unexpected reply",
+                "expected an integer".to_owned(),
+            )),
+            redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "invalid cluster redirect address",
+            )),
+            redis::RedisError::from(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "connection reset by peer",
+            )),
+        ] {
+            assert_eq!(error_message(&error), error.to_string());
+        }
+    }
 
     #[test]
     fn invalidations_show_each_key_or_nil() {

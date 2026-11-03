@@ -57,6 +57,9 @@ Formatted output escapes terminal control sequences. Redirected stdout now
 uses raw output by default, like `redis-cli`; `--no-raw` restores formatted
 output. `--raw` writes reply bytes verbatim in noninteractive mode. Redis errors
 exit noninteractive mode with a nonzero status, with or without `-e`.
+Server errors show the server's message without the Redis library's preamble
+(for example, `(error) syntax error` in the editor). Errors without a message
+show their server error code. Client and connection errors retain their context.
 
 ## Familiar redis-cli options
 

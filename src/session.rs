@@ -350,7 +350,16 @@ pub fn format_reply(value: &Value) -> Vec<String> {
         Value::BigNumber(n) => vec![format!("(big number) {n}")],
         Value::ServerError(error) => vec![format!(
             "(error) {}",
-            quote(format!("{error:?}").as_bytes())
+            crate::output::server_error_message(error.code(), error.details())
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_default().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<String>()
         )],
     }
 }

@@ -90,6 +90,16 @@ fn base() -> Command {
 }
 
 #[test]
+fn server_errors_are_concise_and_still_fail() {
+    let fixture = Fixture::new();
+    for protocol in ["-2", "-3"] {
+        let result = fixture.run(&[protocol, "SET", "d", "sd", "d"], b"");
+        assert!(!result.status.success());
+        assert_eq!(result.stderr, b"rmycli: syntax error\n");
+    }
+}
+
+#[test]
 fn help_examples_version_and_invalid_switches_need_no_server() {
     let output = base()
         .arg("--help")

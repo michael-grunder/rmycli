@@ -277,7 +277,12 @@ fn execution_loop(
                     .is_none_or(|error| !error.is_io_error());
                 listening = connected;
                 let lines = result.map_or_else(
-                    |error| vec![format!("(error) {error}")],
+                    |error| {
+                        vec![format!(
+                            "(error) {}",
+                            crate::output::error_message(&error)
+                        )]
+                    },
                     |reply| output.lines(&reply),
                 );
                 if events

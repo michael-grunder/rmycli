@@ -34,7 +34,10 @@ fn main() {
         || matches.value_source("uri") == Some(ValueSource::CommandLine)
             && options.uri.as_ref().is_some_and(|uri| uri.contains('@'));
     if let Err(error) = run(&options, explicit_credentials) {
-        eprintln!("rmycli: {error}");
+        let message = error
+            .downcast_ref::<redis::RedisError>()
+            .map_or_else(|| error.to_string(), output::error_message);
+        eprintln!("rmycli: {message}");
         std::process::exit(1);
     }
 }
