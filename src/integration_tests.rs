@@ -106,6 +106,178 @@ fn worker_command(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn alternate_keys_scans_selected_database_and_empty_batches() {
+    use crate::worker::{Event, Execution, Workers};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let fixture = RedisFixture::new();
+    let mut connection = fixture.connection();
+    redis::cmd("SET")
+        .arg("wrong-db")
+        .arg("x")
+        .query::<()>(&mut connection)
+        .unwrap();
+    redis::cmd("SELECT")
+        .arg(2)
+        .query::<()>(&mut connection)
+        .unwrap();
+    let mut expected = Vec::new();
+    let mut pipeline = redis::pipe();
+    for n in 0..1000 {
+        let key = format!("foo:{n}").into_bytes();
+        expected.extend(
+            fixture.config.output.lines(&Value::BulkString(key.clone())),
+        );
+        pipeline.cmd("SET").arg(key).arg("x").ignore();
+    }
+    let binary = b"foo:\0\xff\x1b";
+    expected.extend(
+        fixture
+            .config
+            .output
+            .lines(&Value::BulkString(binary.to_vec())),
+    );
+    pipeline.cmd("SET").arg(binary.as_slice()).arg("x").ignore();
+    pipeline.query::<()>(&mut connection).unwrap();
+    expected.sort();
+
+    let workers =
+        Workers::start(Session::open(fixture.config.clone()).await.unwrap());
+    assert!(matches!(
+        workers.events.recv().unwrap(),
+        Event::Connected { .. }
+    ));
+    worker_command(&workers, "SELECT 2");
+    for pattern in [b"foo:*".as_slice(), b"missing:*", b"foo:\0\xff*"] {
+        workers
+            .execution
+            .send(Execution::Scan {
+                pattern: pattern.to_vec(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })
+            .unwrap();
+        let mut lines = Vec::new();
+        let mut batches = 0;
+        loop {
+            match workers.events.recv_timeout(Duration::from_secs(3)).unwrap() {
+                Event::Output(batch) => {
+                    batches += 1;
+                    lines.extend(batch);
+                }
+                Event::Executed {
+                    lines,
+                    connected,
+                    allowed,
+                    ..
+                } => {
+                    assert_eq!(lines, Vec::<String>::new());
+                    assert!(connected && allowed);
+                    break;
+                }
+                _ => panic!("unexpected scan event"),
+            }
+        }
+        assert!(batches > 1);
+        lines.sort();
+        lines.dedup();
+        match pattern {
+            b"foo:*" => assert_eq!(lines, expected),
+            b"missing:*" => assert_eq!(lines, Vec::<String>::new()),
+            _ => assert_eq!(
+                lines,
+                fixture
+                    .config
+                    .output
+                    .lines(&Value::BulkString(binary.to_vec()))
+            ),
+        }
+    }
+    assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn alternate_keys_cancellation_and_state_guards_preserve_connection() {
+    use crate::worker::{Event, Execution, Workers};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let fixture = RedisFixture::new();
+    let mut pipeline = redis::pipe();
+    for n in 0..20_000 {
+        pipeline
+            .cmd("SET")
+            .arg(format!("key:{n}"))
+            .arg("x")
+            .ignore();
+    }
+    pipeline.query::<()>(&mut fixture.connection()).unwrap();
+    let workers =
+        Workers::start(Session::open(fixture.config.clone()).await.unwrap());
+    let Event::Connected { client_id, .. } = workers.events.recv().unwrap()
+    else {
+        panic!("expected connection");
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    workers
+        .execution
+        .send(Execution::Scan {
+            pattern: b"*".to_vec(),
+            cancelled: Arc::clone(&cancelled),
+        })
+        .unwrap();
+    let mut keys = 0;
+    loop {
+        match workers.events.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Event::Output(lines) => {
+                keys += lines.len();
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            Event::Executed {
+                lines,
+                client_id: after,
+                connected,
+                allowed,
+                ..
+            } => {
+                assert_eq!(lines, Vec::<String>::new());
+                assert!(connected && allowed);
+                assert_eq!(after, client_id);
+                break;
+            }
+            _ => panic!("unexpected scan event"),
+        }
+    }
+    assert!(keys > 0 && keys < 20_000);
+    assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+    assert_eq!(
+        worker_command(&workers, "CLIENT ID"),
+        [format!("(integer) {}", client_id.unwrap())]
+    );
+
+    for (start, stop) in [("MULTI", "DISCARD"), ("WATCH key:0", "UNWATCH")] {
+        worker_command(&workers, start);
+        workers
+            .execution
+            .send(Execution::Scan {
+                pattern: b"*".to_vec(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })
+            .unwrap();
+        let Event::Executed {
+            lines,
+            connected,
+            allowed,
+            ..
+        } = workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected scan rejection");
+        };
+        assert!(connected && !allowed);
+        assert!(lines[0].contains("unavailable"));
+        assert_eq!(worker_command(&workers, stop), ["OK"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn worker_shows_server_errors_without_library_context() {
     use crate::worker::{Event, Workers};
 

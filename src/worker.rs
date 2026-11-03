@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
 
@@ -12,6 +12,10 @@ use crate::session::{Config, Session, command};
 
 pub enum Execution {
     Run(Vec<Vec<u8>>),
+    Scan {
+        pattern: Vec<u8>,
+        cancelled: Arc<AtomicBool>,
+    },
     Reconnect,
 }
 
@@ -284,18 +288,31 @@ async fn execution_loop(
             }
         };
         match request {
-            Execution::Run(args) => {
+            request @ (Execution::Run(_) | Execution::Scan { .. }) => {
                 let previous_addr = session.config.info.addr().clone();
                 let output = session.config.output.clone();
                 let show_pushes = session.config.show_pushes;
-                let result = session
-                    .execute_with_push(&args, |reply| {
-                        if show_pushes {
-                            let _ =
-                                events.send(Event::Push(output.lines(reply)));
-                        }
-                    })
-                    .await;
+                let push = |reply: &Value| {
+                    if show_pushes {
+                        let _ = events.send(Event::Push(output.lines(reply)));
+                    }
+                };
+                let result = match request {
+                    Execution::Run(args) => session
+                        .execute_with_push(&args, push)
+                        .await
+                        .map(|reply| output.lines(&reply)),
+                    Execution::Scan { pattern, cancelled } => scan_keys(
+                        &mut session,
+                        &pattern,
+                        &cancelled,
+                        events,
+                        push,
+                    )
+                    .await
+                    .map(|()| Vec::new()),
+                    Execution::Reconnect => unreachable!(),
+                };
                 if previous_addr != *session.config.info.addr() {
                     id = client_id(&mut session).await;
                 }
@@ -304,15 +321,12 @@ async fn execution_loop(
                     .err()
                     .is_none_or(|error| !error.is_io_error());
                 listening = connected;
-                let lines = result.map_or_else(
-                    |error| {
-                        vec![format!(
-                            "(error) {}",
-                            crate::output::error_message(&error)
-                        )]
-                    },
-                    |reply| output.lines(&reply),
-                );
+                let lines = result.unwrap_or_else(|error| {
+                    vec![format!(
+                        "(error) {}",
+                        crate::output::error_message(&error)
+                    )]
+                });
                 if events
                     .send(Event::Executed {
                         lines,
@@ -343,4 +357,49 @@ async fn execution_loop(
             }
         }
     }
+}
+
+async fn scan_keys(
+    session: &mut Session,
+    pattern: &[u8],
+    cancelled: &AtomicBool,
+    events: &SyncSender<Event>,
+    mut push: impl FnMut(&Value),
+) -> redis::RedisResult<()> {
+    if !session.assistance_allowed() {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::Client,
+            "Alternate KEYS is unavailable during MULTI, WATCH, or streaming",
+        )));
+    }
+    let mut cursor = 0_u64;
+    while !cancelled.load(Ordering::Relaxed) {
+        let args = [
+            b"SCAN".to_vec(),
+            cursor.to_string().into_bytes(),
+            b"MATCH".to_vec(),
+            pattern.to_vec(),
+            b"COUNT".to_vec(),
+            b"128".to_vec(),
+        ];
+        let reply = session.execute_with_push(&args, &mut push).await?;
+        let (next, keys): (u64, Vec<Vec<u8>>) = redis::from_redis_value(reply)?;
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let lines = keys
+            .into_iter()
+            .flat_map(|key| {
+                session.config.output.lines(&Value::BulkString(key))
+            })
+            .collect();
+        if events.send(Event::Output(lines)).is_err() {
+            break;
+        }
+        cursor = next;
+        if cursor == 0 {
+            return Ok(());
+        }
+    }
+    Ok(())
 }

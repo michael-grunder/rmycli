@@ -334,6 +334,8 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Tab / Shift-Tab | Start completion / cycle through popup candidates |
 | Enter with popup open | Accept the candidate; does **not** execute |
 | Enter without popup | Submit the command |
+| Ctrl+Enter on `KEYS <pattern>` | Stream matching keys with `SCAN` |
+| Hold Ctrl (with modifier-event support) | Show `[Ctrl]` in the prompt |
 | Escape | Close the popup or cancel discovery/confirmation |
 | Left / Right, Home / End, Ctrl-A / Ctrl-E | Move the cursor |
 | Backspace / Delete, Ctrl-U / Ctrl-K | Delete characters or text before/after the cursor |
@@ -342,11 +344,49 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | PageUp / PageDown, Up / Down with help open | Scroll the help panel |
 | Enter with help open | Close help without submitting input |
 | `CLEAR`, Ctrl-L | Clear the screen locally without sending a Redis command |
-| Ctrl-C | Clear input; if executing/streaming, close that connection |
+| Ctrl-C | Stop alternate `KEYS` scanning; otherwise clear input or close an executing/streaming connection |
 | Ctrl-D, `\quit`, `\q`, `QUIT`, `EXIT` | Exit |
 | `HELP command`, `HELP @group` | Full command help or commands in a group |
 | `HELP`, `\help` | Open editor help and connection details |
 | `\reconnect` | Open a new connection and refresh metadata |
+
+Experiment with `KEYS *` or `KEYS foo:*` followed by **Ctrl+Enter** to stream
+keys using `SCAN` until cursor zero. The pattern is passed through unchanged:
+`KEYS foo:*` uses `SCAN ... MATCH foo:* COUNT 128`. Empty batches do not stop
+iteration. Output is streamed with bounded buffering; duplicates are possible
+and the listing is not a snapshot. It covers the current database on the
+connected node, without completion budgets or a unique-key-count claim.
+
+**Ctrl-C stops further iterations without exiting or disconnecting.** Any
+in-flight request finishes first; buffered keys are discarded, and the output
+is labeled partial. You can then run another command on the same connection.
+Alternate `KEYS` is unavailable during MULTI, WATCH, or streaming sessions.
+Normal Enter still sends `KEYS` directly; there is no default-remapping setting
+yet. With a completion popup open, either Enter only accepts the candidate.
+
+Ctrl+Enter requires a terminal that distinguishes it from Enter. The editor
+requests the Kitty keyboard protocol, including modifier presses and releases.
+On supporting terminals, holding either Ctrl key changes `rmycli>` to
+`rmycli[Ctrl]>`; releasing it restores the prompt. Modifier events leave the
+input, completion popup, and confirmation unchanged. Shift remains available
+for typing case-sensitive keys. Ctrl+Enter with a popup open only accepts the
+candidate; release events never submit commands.
+
+Terminals or multiplexers without this support may send plain Enter for both,
+which executes ordinary `KEYS`. They may also omit standalone Ctrl presses and
+releases, so the held-key indicator cannot work there. An ordinary Ctrl chord
+alone does not turn on the indicator, since its release may never be reported.
+
+If modified Enter acts like Enter, check the whole terminal path, including
+tmux or screen. For example, tmux with `extended-keys off` cannot forward the
+distinction. Changing the application shortcut alone cannot fix that. Try a
+terminal supporting the Kitty keyboard protocol directly, outside tmux, to
+test the held-key indicator. See the [keyboard protocol][keyboard-protocol]
+and [tmux modifier-key troubleshooting][tmux-modifiers]. The application does
+not modify terminal or tmux configuration.
+
+[keyboard-protocol]: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+[tmux-modifiers]: https://github.com/tmux/tmux/wiki/Modifier-Keys
 
 The prompt starts at the terminal's current cursor row and follows replies,
 like a conventional command-line shell. If existing output ends mid-line,

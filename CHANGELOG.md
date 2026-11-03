@@ -22,6 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Use Ctrl+Enter instead of Shift+Enter for alternate KEYS scanning. Request
+  modifier press/release events and show `[Ctrl]` in the prompt while either
+  Ctrl key is held on terminals that support the Kitty keyboard protocol.
 - Upgrade redis-rs to 1.8.1 and replace synchronous session polling with async
   TCP/Unix/TLS reads, retaining the same connection for streaming and stateful
   commands. Remove the vendored Redis crate and its idle-read patch.
@@ -52,6 +55,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Experimental Ctrl+Enter on `KEYS <pattern>` streams matching keys through
+  SCAN. Ctrl-C stops iterations without exiting or disconnecting; normal Enter
+  retains ordinary KEYS behavior. Requires a terminal that reports Ctrl+Enter.
 - Redis-cli-compatible RESP2/RESP3 selection, password aliases and hidden
   password prompting, connection timeout in seconds, client names, and bounded
   MOVED/ASK redirect following outside transactions and WATCH.

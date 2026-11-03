@@ -1,13 +1,15 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::ops::Range;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
     event::{
         self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        KeyModifiers, ModifierKeyCode,
     },
     execute, queue,
     style::{
@@ -56,7 +58,16 @@ impl Screen {
             execute!(io::stdout(), Print("\r\n"))?;
             screen.row = (row + 1).min(terminal::size()?.1.saturating_sub(1));
         }
-        execute!(io::stdout(), event::EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            event::EnableBracketedPaste,
+            event::EnableFocusChange,
+            event::PushKeyboardEnhancementFlags(
+                event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        )?;
         Ok(screen)
     }
 
@@ -120,6 +131,8 @@ impl Drop for Screen {
             cursor::MoveTo(0, self.row),
             Clear(ClearType::FromCursorDown),
             cursor::Show,
+            event::PopKeyboardEnhancementFlags,
+            event::DisableFocusChange,
             event::DisableBracketedPaste
         );
         let _ = terminal::disable_raw_mode();
@@ -420,6 +433,8 @@ struct App {
     popup: Option<Popup>,
     help: Option<Help>,
     scan: Option<Discovery>,
+    listing: Option<Arc<AtomicBool>>,
+    control_keys: [bool; 2],
     completion_span: Range<usize>,
     pending: Pending,
     /// While set, hide the prompt during startup or below a submitted command.
@@ -443,6 +458,8 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         popup: None,
         help: None,
         scan: None,
+        listing: None,
+        control_keys: [false; 2],
         completion_span: 0..0,
         pending: Pending::default(),
         busy_until: Some(Instant::now() + BUSY_PROMPT_DELAY),
@@ -455,8 +472,18 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
             let Ok(event) = app.workers.events.try_recv() else {
                 break;
             };
+            let batch = matches!(event, Event::Output(_));
             app.on_worker(event);
             dirty = true;
+            // Give terminal input a turn between batches of streamed keys.
+            if batch
+                && app
+                    .listing
+                    .as_ref()
+                    .is_some_and(|cancelled| !cancelled.load(Ordering::Relaxed))
+            {
+                break;
+            }
         }
         dirty |= app.tick(Instant::now());
         if dirty {
@@ -470,9 +497,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         });
         if event::poll(timeout)? {
             match event::read()? {
-                TerminalEvent::Key(key)
-                    if key.kind != KeyEventKind::Release =>
-                {
+                TerminalEvent::Key(key) => {
                     if app.on_key(key) {
                         let (width, height) = terminal::size()?;
                         screen.write_output(
@@ -493,6 +518,9 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                         return Ok(());
                     }
                 }
+                TerminalEvent::FocusLost | TerminalEvent::FocusGained => {
+                    app.control_keys = [false; 2];
+                }
                 TerminalEvent::Paste(text) => {
                     app.invalidate();
                     // Pasting never submits commands, including embedded newlines.
@@ -503,7 +531,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                     screen.row =
                         cursor::position()?.1.min(height.saturating_sub(1));
                 }
-                _ => {}
+                TerminalEvent::Mouse(_) => {}
             }
             dirty = true;
         }
@@ -558,7 +586,17 @@ impl App {
                 client_id,
                 connected,
             } => {
+                let summary = self.listing.take().map(|cancelled| {
+                    if cancelled.load(Ordering::Relaxed) || !lines.is_empty() {
+                        "(scan stopped; partial results)"
+                    } else {
+                        "(scan complete)"
+                    }
+                });
                 self.log(lines);
+                if let Some(summary) = summary {
+                    self.log([summary.into()]);
+                }
                 self.config = config;
                 self.client_id = client_id;
                 self.busy_until = None;
@@ -582,7 +620,15 @@ impl App {
                         .into()
                 };
             }
-            Event::Output(lines) => self.log(lines),
+            Event::Output(lines) => {
+                if !self
+                    .listing
+                    .as_ref()
+                    .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+                {
+                    self.log(lines);
+                }
+            }
             Event::Push(lines) => {
                 self.output
                     .extend(lines.into_iter().map(|line| (line, true)));
@@ -620,33 +666,27 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        self.update_control(key);
+        if key.kind == KeyEventKind::Release
+            || matches!(key.code, KeyCode::Modifier(_))
+        {
+            return false;
+        }
         // Typing ahead or cancelling should show the full prompt and status.
         self.busy_until = None;
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code != KeyCode::Enter
+        {
             match key.code {
                 KeyCode::Char('d') => {
+                    if let Some(cancelled) = &self.listing {
+                        cancelled.store(true, Ordering::Relaxed);
+                    }
                     self.workers.invalidate();
                     return true;
                 }
                 KeyCode::Char('c') => {
-                    self.invalidate();
-                    if matches!(self.mode, Mode::Busy | Mode::Streaming) {
-                        if let Some(client_id) = self.client_id {
-                            let _ = self.workers.assistance.send(
-                                Assistance::Cancel {
-                                    config: self.config.clone(),
-                                    client_id,
-                                },
-                            );
-                            self.status = "Closing the active connection; use \\reconnect afterward".into();
-                        } else {
-                            self.status =
-                                "CLIENT ID unavailable; Ctrl-D exits".into();
-                        }
-                    } else {
-                        self.editor.line.clear();
-                        self.editor.cursor = 0;
-                    }
+                    self.cancel();
                     return false;
                 }
                 KeyCode::Char('a') => {
@@ -692,7 +732,8 @@ impl App {
                     popup.accept(&mut self.editor);
                     self.invalidate();
                 } else if self.mode != Mode::Busy {
-                    return self.submit();
+                    return self
+                        .submit(key.modifiers.contains(KeyModifiers::CONTROL));
                 }
             }
             KeyCode::Esc => self.invalidate(),
@@ -714,6 +755,44 @@ impl App {
             }
         }
         false
+    }
+
+    fn update_control(&mut self, key: KeyEvent) {
+        let index = match key.code {
+            KeyCode::Modifier(ModifierKeyCode::LeftControl) => Some(0),
+            KeyCode::Modifier(ModifierKeyCode::RightControl) => Some(1),
+            _ => None,
+        };
+        if let Some(index) = index {
+            self.control_keys[index] = key.kind != KeyEventKind::Release;
+            self.busy_until = None;
+        } else if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Recover if a release was lost while the terminal lacked focus.
+            self.control_keys = [false; 2];
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.invalidate();
+        if let Some(cancelled) = &self.listing {
+            cancelled.store(true, Ordering::Relaxed);
+            self.status = "Stopping SCAN after the current request…".into();
+        } else if matches!(self.mode, Mode::Busy | Mode::Streaming) {
+            if let Some(client_id) = self.client_id {
+                let _ = self.workers.assistance.send(Assistance::Cancel {
+                    config: self.config.clone(),
+                    client_id,
+                });
+                self.status =
+                    "Closing the active connection; use \\reconnect afterward"
+                        .into();
+            } else {
+                self.status = "CLIENT ID unavailable; Ctrl-D exits".into();
+            }
+        } else {
+            self.editor.line.clear();
+            self.editor.cursor = 0;
+        }
     }
 
     fn help_key(&mut self, code: KeyCode) -> bool {
@@ -901,7 +980,7 @@ impl App {
         }
     }
 
-    fn submit(&mut self) -> bool {
+    fn submit(&mut self, alternate: bool) -> bool {
         let parsed = input::parse(&self.editor.line);
         if let Some(error) = parsed.error {
             self.status = error;
@@ -962,6 +1041,27 @@ impl App {
                     .into();
             return false;
         }
+        if alternate && args[0].eq_ignore_ascii_case(b"KEYS") {
+            if args.len() != 2 {
+                self.status =
+                    "Usage: KEYS <pattern> (Ctrl+Enter to scan)".into();
+                return false;
+            }
+            if self.mode != Mode::Ready {
+                self.status =
+                    "Alternate KEYS is unavailable during MULTI or WATCH"
+                        .into();
+                return false;
+            }
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.listing = Some(Arc::clone(&cancelled));
+            self.start_execution(Execution::Scan {
+                pattern: args.remove(1),
+                cancelled,
+            });
+            self.status = "Scanning keys… Ctrl-C stops the scan".into();
+            return false;
+        }
         self.pending.args = Some(args.clone());
         if self.mode == Mode::Ready
             && !self.options.yes
@@ -981,6 +1081,10 @@ impl App {
     }
 
     fn execute(&mut self, args: Vec<Vec<u8>>) {
+        self.start_execution(Execution::Run(args));
+    }
+
+    fn start_execution(&mut self, request: Execution) {
         self.editor.remember();
         self.log([format!(
             "{}{}",
@@ -992,7 +1096,7 @@ impl App {
         self.mode = Mode::Busy;
         self.status = "Executing… Ctrl-C closes this connection".into();
         self.busy_until = Some(Instant::now() + BUSY_PROMPT_DELAY);
-        let _ = self.workers.execution.send(Execution::Run(args));
+        let _ = self.workers.execution.send(request);
     }
 
     fn local_help(&mut self, args: &[Vec<u8>]) {
@@ -1035,6 +1139,7 @@ impl App {
                 self.catalog.commands.len(), self.config.info.redis_settings().db()),
             "HELP command: full command help; HELP @group: command list".into(),
             "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
+            "Ctrl+Enter on KEYS <pattern>: stream SCAN batches; Ctrl-C stops without disconnecting".into(),
             "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
             "F1: command and editor help; PgUp/PgDn: scroll help; Ctrl-D or \\quit: exit".into(),
             "CLEAR or Ctrl-L: clear the screen; terminal scrollback retains output".into(),
@@ -1084,7 +1189,10 @@ impl App {
                 EndSynchronizedUpdate
             );
         }
-        let prompt = prompt(self.config.info.redis_settings().db());
+        let mut prompt = prompt(self.config.info.redis_settings().db());
+        if self.control_keys.contains(&true) {
+            prompt.insert_str(prompt.len() - 2, "[Ctrl]");
+        }
         let inline_status = self.editor.line.is_empty()
             && self.popup.is_none()
             && self.help.is_none()
@@ -1362,6 +1470,8 @@ mod tests {
             popup: None,
             help: None,
             scan: None,
+            listing: None,
+            control_keys: [false; 2],
             completion_span: 4..5,
             pending: Pending {
                 args: Some(vec![b"GET".to_vec(), b"a".to_vec()]),
@@ -1376,6 +1486,212 @@ mod tests {
             },
         };
         (app, executed)
+    }
+
+    #[test]
+    fn ctrl_enter_scans_keys_and_preserves_pattern_bytes() {
+        for (line, pattern) in [
+            ("keys *", b"*".as_slice()),
+            ("KeYs foo:*", b"foo:*"),
+            (r#"KEYS "a b\x00\xff*""#, b"a b\0\xff*"),
+            (r#"KEYS """#, b""),
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.editor.line = line.into();
+            app.editor.cursor = line.len();
+            assert!(
+                !app.on_key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::CONTROL,
+                ))
+            );
+            let Execution::Scan {
+                pattern: actual,
+                cancelled,
+            } = executed.try_recv().unwrap()
+            else {
+                panic!("expected alternate KEYS");
+            };
+            assert_eq!(actual, pattern);
+            assert!(!cancelled.load(Ordering::Relaxed));
+            assert!(app.mode == Mode::Busy);
+            assert_eq!(app.editor.line, "");
+            assert_eq!(app.editor.history.back().unwrap(), line);
+        }
+        for (line, modifiers) in [
+            ("KEYS *", KeyModifiers::NONE),
+            ("KEYS MixedCase:*", KeyModifiers::SHIFT),
+            ("GET key", KeyModifiers::CONTROL),
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.editor.line = line.into();
+            app.on_key(KeyEvent::new(KeyCode::Enter, modifiers));
+            assert!(matches!(executed.try_recv(), Ok(Execution::Run(_))));
+        }
+    }
+
+    #[test]
+    fn control_press_and_release_change_only_the_prompt() {
+        for control in
+            [ModifierKeyCode::LeftControl, ModifierKeyCode::RightControl]
+        {
+            let (mut app, mut executed) = test_app();
+            app.editor.line = "KEYS MixedCase:*".into();
+            app.editor.cursor = 5;
+            app.popup = Some(Popup {
+                candidates: vec!["MixedCase:1".into()],
+                selected: 0,
+                span: 5..16,
+            });
+            let generation = app.workers.current();
+            let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+            for kind in [
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Release,
+            ] {
+                assert!(!app.on_key(KeyEvent::new_with_kind(
+                    KeyCode::Modifier(control),
+                    KeyModifiers::CONTROL,
+                    kind,
+                )));
+                let mut rendered = Vec::new();
+                app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+                let text = String::from_utf8(rendered).unwrap();
+                let expected = if kind == KeyEventKind::Release {
+                    "rmycli> KEYS MixedCase:*"
+                } else {
+                    "rmycli[Ctrl]> KEYS MixedCase:*"
+                };
+                assert!(text.contains(expected), "{text:?}");
+                assert_eq!(app.editor.cursor, 5);
+                assert!(app.popup.is_some());
+                assert_eq!(app.workers.current(), generation);
+                assert!(executed.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn both_controls_and_lost_releases_do_not_leave_the_indicator_stuck() {
+        let (mut app, _) = test_app();
+        for control in
+            [ModifierKeyCode::LeftControl, ModifierKeyCode::RightControl]
+        {
+            app.on_key(KeyEvent::new(
+                KeyCode::Modifier(control),
+                KeyModifiers::CONTROL,
+            ));
+        }
+        app.on_key(KeyEvent::new_with_kind(
+            KeyCode::Modifier(ModifierKeyCode::LeftControl),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(app.control_keys, [false, true]);
+        app.on_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(app.control_keys, [false, false]);
+        assert_eq!(app.editor.line, "GET aX");
+    }
+
+    #[test]
+    fn key_releases_never_edit_submit_confirm_or_exit() {
+        let (mut app, mut executed) = test_app();
+        for code in [KeyCode::Enter, KeyCode::Char('d'), KeyCode::Char('c')] {
+            assert!(!app.on_key(KeyEvent::new_with_kind(
+                code,
+                KeyModifiers::CONTROL,
+                KeyEventKind::Release,
+            )));
+        }
+        app.on_key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert_eq!(app.editor.line, "GET a");
+        assert!(executed.try_recv().is_err());
+        assert!(app.pending.args.is_some());
+        // Legacy terminals report chords without modifier key-up events.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.control_keys, [false; 2]);
+        assert_eq!(app.editor.cursor, 0);
+    }
+
+    #[test]
+    fn alternate_keys_rejects_bad_arguments_and_stateful_sessions() {
+        for (line, mode) in [
+            ("KEYS", Mode::Ready),
+            ("KEYS a b", Mode::Ready),
+            ("KEYS \"unfinished", Mode::Ready),
+            ("KEYS *", Mode::Stateful),
+            ("KEYS *", Mode::Streaming),
+            ("KEYS *", Mode::Disconnected),
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.editor.line = line.into();
+            app.mode = mode;
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+            assert!(executed.try_recv().is_err());
+            assert!(app.listing.is_none());
+            assert_ne!(app.status, "");
+        }
+    }
+
+    #[test]
+    fn ctrl_enter_accepts_completion_without_executing() {
+        let (mut app, mut executed) = test_app();
+        app.editor.line = "KEYS foo".into();
+        app.popup = Some(Popup {
+            candidates: vec!["foo:*".into()],
+            selected: 0,
+            span: 5..8,
+        });
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert_eq!(app.editor.line, "KEYS foo:*");
+        assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
+    fn ctrl_c_stops_scan_output_and_keeps_the_prompt_connected() {
+        let (mut app, mut executed) = test_app();
+        app.editor.line = "KEYS *".into();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        let Execution::Scan { cancelled, .. } = executed.try_recv().unwrap()
+        else {
+            panic!("expected alternate KEYS");
+        };
+        // Editing the next command must not cancel a running listing.
+        app.on_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
+        assert!(!cancelled.load(Ordering::Relaxed));
+        assert!(
+            !app.on_key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ))
+        );
+        assert!(cancelled.load(Ordering::Relaxed));
+        let count = app.output.len();
+        app.on_worker(Event::Output(vec!["discard buffered key".into()]));
+        assert_eq!(app.output.len(), count);
+        app.on_worker(Event::Executed {
+            lines: vec![],
+            config: app.config.clone(),
+            allowed: true,
+            streaming: false,
+            client_id: Some(42),
+            connected: true,
+        });
+        assert!(app.mode == Mode::Ready);
+        assert!(app.listing.is_none());
+        assert!(app.output.back().unwrap().0.contains("partial results"));
+        assert_eq!(app.editor.line, "P");
+        app.editor.insert("ING");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Execution::Run(args) = executed.try_recv().unwrap() else {
+            panic!("expected next command");
+        };
+        assert_eq!(args, [b"PING"]);
     }
 
     #[test]
@@ -1705,7 +2021,7 @@ mod tests {
         app.editor.cursor = app.editor.line.len();
         app.log(["PONG".into()]);
 
-        assert!(!app.submit());
+        assert!(!app.submit(false));
 
         assert_eq!(app.output.front().unwrap().0, "PONG");
         let Execution::Run(args) = executed.try_recv().unwrap() else {
