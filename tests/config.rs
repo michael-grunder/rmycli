@@ -380,6 +380,25 @@ fn explicit_new_files_quoted_names_and_literal_passwords() {
 }
 
 #[test]
+fn hex_colors_from_toml_render_as_truecolor() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "user/rmycli.toml",
+        "[theme]\ninline-hint = '#ffffff'\n\
+         [theme.commands]\nGET = '#12abEF'\nSET = 'cyan'\n",
+    );
+    for (key, color) in [
+        ("theme.inline-hint", "38;2;255;255;255"),
+        ("theme.commands.GET", "38;2;18;171;239"),
+        ("theme.commands.SET", "38;5;14"),
+    ] {
+        let preview =
+            success(&mut fixture.config(&["get", key, "--color", "always"]));
+        assert!(preview.contains(&format!("\x1b[{color}msample text\x1b[0m")));
+    }
+}
+
+#[test]
 fn color_previews_are_optional_and_reset_terminal_style() {
     let fixture = Fixture::new();
     success(&mut fixture.config(&["set", "theme.inline-hint", "#12abef"]));

@@ -40,6 +40,14 @@ impl Options {
 
     pub fn lines(&self, reply: &Value) -> Vec<String> {
         if let Value::Push { kind, data } = reply {
+            if !self.csv
+                && !self.json
+                && !self.quoted_json
+                && *kind == redis::PushKind::Invalidate
+                && let Some(lines) = invalidation_lines(data)
+            {
+                return lines;
+            }
             return self.lines(&push_array(kind, data));
         }
         if self.csv || self.json || self.quoted_json {
@@ -84,6 +92,27 @@ impl Options {
             return Ok(());
         }
         writeln!(out)
+    }
+}
+
+fn invalidation_lines(data: &[Value]) -> Option<Vec<String>> {
+    match data {
+        [Value::Nil] => Some(vec!["-> invalidate: (nil)".into()]),
+        [Value::Array(keys)] => keys
+            .iter()
+            .map(|key| {
+                let bytes = match key {
+                    Value::BulkString(bytes) => bytes.as_slice(),
+                    Value::SimpleString(text) => text.as_bytes(),
+                    _ => return None,
+                };
+                Some(format!(
+                    "-> invalidate: {}",
+                    crate::input::quote_like(bytes, "'")
+                ))
+            })
+            .collect(),
+        _ => None,
     }
 }
 
@@ -282,6 +311,99 @@ fn json_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidations_show_each_key_or_nil() {
+        let options = Options::default();
+        for (keys, expected) in [
+            (Value::Nil, vec!["-> invalidate: (nil)"]),
+            (Value::Array(vec![]), vec![]),
+            (
+                Value::Array(vec![Value::BulkString(b"foo".to_vec())]),
+                vec!["-> invalidate: 'foo'"],
+            ),
+            (
+                Value::Array(vec![
+                    Value::BulkString(b"foo".to_vec()),
+                    Value::BulkString(b"a'b\\c".to_vec()),
+                    Value::BulkString(vec![]),
+                    Value::BulkString(b"\x1b\n\xff".to_vec()),
+                ]),
+                vec![
+                    "-> invalidate: 'foo'",
+                    "-> invalidate: 'a\\'b\\\\c'",
+                    "-> invalidate: ''",
+                    "-> invalidate: \"\\x1b\\n\\xff\"",
+                ],
+            ),
+        ] {
+            let push = Value::Push {
+                kind: redis::PushKind::Invalidate,
+                data: vec![keys],
+            };
+            assert_eq!(options.lines(&push), expected);
+        }
+    }
+
+    #[test]
+    fn other_pushes_and_unexpected_invalidations_keep_generic_formatting() {
+        for (kind, data) in [
+            (redis::PushKind::Invalidate, vec![Value::Int(1)]),
+            (
+                redis::PushKind::Invalidate,
+                vec![Value::Array(vec![
+                    Value::BulkString(b"foo".to_vec()),
+                    Value::Int(1),
+                ])],
+            ),
+            (
+                redis::PushKind::Message,
+                vec![Value::SimpleString("hello".into())],
+            ),
+        ] {
+            let expected = Options::default().lines(&push_array(&kind, &data));
+            assert_eq!(
+                Options::default().lines(&Value::Push { kind, data }),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn invalidation_structured_and_noninteractive_output_is_unchanged() {
+        let push = Value::Push {
+            kind: redis::PushKind::Invalidate,
+            data: vec![Value::Array(vec![Value::BulkString(b"foo".to_vec())])],
+        };
+        for (options, expected) in [
+            (
+                Options {
+                    json: true,
+                    ..Options::default()
+                },
+                "[\"invalidate\",[\"foo\"]]",
+            ),
+            (
+                Options {
+                    quoted_json: true,
+                    ..Options::default()
+                },
+                "[\"invalidate\",[\"foo\"]]",
+            ),
+            (
+                Options {
+                    csv: true,
+                    ..Options::default()
+                },
+                "\"invalidate\",\"foo\"",
+            ),
+        ] {
+            assert_eq!(options.lines(&push), vec![expected]);
+        }
+        let mut bytes = Vec::new();
+        Options::default().write(&mut bytes, &push, false).unwrap();
+        assert_eq!(bytes, b"invalidate\nfoo\n");
+    }
 
     #[test]
     fn raw_delimiters_preserve_bytes_and_empty_values() {

@@ -299,11 +299,11 @@ def main():
             tracking.data = b""
             redis("SET", "tracked", "changed")
             frame = tracking.expect_frame(
-                lambda f: any(f.row(y) == "1) invalidate" for y in range(f.y))
+                lambda f: any(f.row(y) == "-> invalidate: 'tracked'" for y in range(f.y))
                 and f.row(f.y) == "rmycli> GET draft"
                 and f.x == len("rmycli> GET draf"), "idle push preserves input",
             )
-            row = next(y for y in range(frame.y) if frame.row(y) == "1) invalidate")
+            row = next(y for y in range(frame.y) if frame.row(y) == "-> invalidate: 'tracked'")
             assert frame.colors[row, 0] == "1", "push was not bold"
             tracking.send(b"\x05\x15PING\r")
             tracking.expect("PONG")

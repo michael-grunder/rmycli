@@ -136,7 +136,7 @@ fn worker_displays_idle_invalidations_and_preserves_session_state() {
             else {
                 panic!("expected invalidation without submitting a command");
             };
-            assert_eq!(lines, ["1) invalidate", "2) 1) foo"]);
+            assert_eq!(lines, ["-> invalidate: 'foo'"]);
         } else {
             assert!(
                 workers
@@ -155,6 +155,15 @@ fn worker_displays_idle_invalidations_and_preserves_session_state() {
         );
         assert_eq!(worker_command(&workers, "PING"), ["QUEUED"]);
         assert_eq!(worker_command(&workers, "EXEC"), ["1) PONG"]);
+        if show_pushes {
+            redis::cmd("FLUSHDB").query::<()>(&mut writer).unwrap();
+            let Event::Push(lines) =
+                workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+            else {
+                panic!("expected cache-wide invalidation");
+            };
+            assert_eq!(lines, ["-> invalidate: (nil)"]);
+        }
         // Disconnection is noticed while idle, and reconnect restores polling.
         redis::cmd("CLIENT")
             .arg("KILL")

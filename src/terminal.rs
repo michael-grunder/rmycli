@@ -1408,14 +1408,19 @@ mod tests {
         app.editor.insert("GET draft");
         app.editor.left();
         let cursor = app.editor.cursor;
-        app.on_worker(Event::Push(vec!["invalidate".into(), "key".into()]));
+        app.on_worker(Event::Push(vec![
+            "-> invalidate: 'key'".into(),
+            "-> invalidate: (nil)".into(),
+        ]));
         app.log(["PONG".into()]);
         let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(text.contains("\x1b[1minvalidate\r\n\x1b[22m"));
-        assert!(text.contains("\x1b[1mkey\r\n\x1b[22mPONG\r\n"));
+        assert!(text.contains("\x1b[1m-> invalidate: 'key'\r\n\x1b[22m"));
+        assert!(
+            text.contains("\x1b[1m-> invalidate: (nil)\r\n\x1b[22mPONG\r\n")
+        );
         assert!(text.contains("GET draft"));
         assert_eq!(app.editor.line, "GET draft");
         assert_eq!(app.editor.cursor, cursor);

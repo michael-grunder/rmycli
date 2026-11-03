@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Render interactive invalidation pushes as bold `-> invalidate: 'key'` lines,
+  one per key, or `-> invalidate: (nil)` for cache-wide invalidation.
 - Match redis-cli's raw-output default when stdout is redirected; `--no-raw`
   retains human-readable output. Raw integers, maps, nils, and delimiters now
   work consistently for scripting.

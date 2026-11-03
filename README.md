@@ -121,7 +121,11 @@ rmycli --scan --pattern 'user:*' --count 100
 - `--show-pushes` controls unsolicited RESP3 messages (default: on for terminal
   stdout). The interactive worker reads the socket while idle, with a 100 ms
   timeout between checks for submitted commands. Invalidations appear without
-  another command, in bold, while preserving the input and cursor. Polling sends
+  another command, in bold, while preserving the input and cursor. The default
+  interactive format is `-> invalidate: 'key'`, with one line per key, or
+  `-> invalidate: (nil)` for a cache-wide invalidation. Keys are escaped safely;
+  binary keys use double quotes and byte escapes. JSON, CSV, and noninteractive
+  output retain their existing formats. Polling sends
   no Redis commands and also runs during WATCH and MULTI. Hidden pushes are
   still drained; Pub/Sub messages remain visible. Polling frequency and push
   styling are currently fixed. Noninteractive reads remain command driven.
@@ -233,6 +237,8 @@ Colors accept `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`,
 `white`, `grey`, `dark_grey`, and the `dark_` variants of red, green, yellow,
 blue, magenta, and cyan. Also supported: `reset` (terminal default),
 `"#RRGGBB"`, `"rgb_(R,G,B)"`, and `"ansi_(N)"` (components/index 0–255).
+For example, `inline-hint = "#ffffff"` selects white; hex digits accept either
+case. Keep the quotes because an unquoted `#` starts a TOML comment.
 Named colors follow the terminal palette; RGB rendering depends on terminal
 support. The built-in hint color remains `dark_grey`.
 
