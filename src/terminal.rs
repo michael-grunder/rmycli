@@ -422,7 +422,7 @@ struct App {
     scan: Option<Discovery>,
     completion_span: Range<usize>,
     pending: Pending,
-    /// While set, the prompt stays hidden below the submitted command.
+    /// While set, hide the prompt during startup or below a submitted command.
     busy_until: Option<Instant>,
     options: Options,
 }
@@ -445,7 +445,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         scan: None,
         completion_span: 0..0,
         pending: Pending::default(),
-        busy_until: None,
+        busy_until: Some(Instant::now() + BUSY_PROMPT_DELAY),
         options,
     };
     let mut screen = Screen::enter()?;
@@ -542,6 +542,7 @@ impl App {
             } => {
                 self.log(catalog.notices.clone());
                 self.status.clear();
+                self.busy_until = None;
                 self.catalog = *catalog;
                 self.config = config;
                 self.client_id = client_id;
@@ -1535,6 +1536,47 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         assert!(String::from_utf8(rendered).unwrap().contains("rmycli> x"));
+    }
+
+    #[test]
+    fn startup_hides_loading_status_until_ready_or_delay_expires() {
+        let (mut app, _) = test_app();
+        app.editor = Editor::default();
+        app.mode = Mode::Busy;
+        app.status = "Loading server command metadata…".into();
+        let deadline = Instant::now() + BUSY_PROMPT_DELAY;
+        app.busy_until = Some(deadline);
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(!text.contains("rmycli>"));
+        assert!(!text.contains("Loading"));
+
+        app.on_worker(Event::Connected {
+            catalog: Box::new(Catalog::bundled()),
+            config: app.config.clone(),
+            client_id: None,
+        });
+        assert!(app.busy_until.is_none());
+        assert!(!app.tick(deadline));
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("rmycli>"));
+        assert!(!text.contains("Loading"));
+
+        app.mode = Mode::Busy;
+        app.status = "Loading server command metadata…".into();
+        app.busy_until = Some(deadline);
+        assert!(
+            !app.tick(deadline.checked_sub(Duration::from_millis(1)).unwrap())
+        );
+        assert!(app.tick(deadline));
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("Loading server command metadata"));
     }
 
     #[test]

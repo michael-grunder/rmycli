@@ -342,8 +342,10 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 The prompt starts at the terminal's current cursor row and follows replies,
 like a conventional command-line shell. If existing output ends mid-line,
 the prompt starts on the next line. There is no startup banner or persistent
-connection footer. The shell uses the normal terminal buffer, so earlier shell
-output and command replies remain in your terminal's scrollback, including
+connection footer. Startup shows a metadata-loading status only after 200 ms
+or when you type, avoiding a flash on fast connections.
+The shell uses the normal terminal buffer, so earlier shell output and command
+replies remain in your terminal's scrollback, including
 after exit. Use your terminal's scrollback controls to review output.
 
 Completion choices appear in a bordered window below the current argument.

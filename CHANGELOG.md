@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Avoid flashing the startup metadata-loading message on fast connections;
+  show it only after 200 ms or when you type.
 - Display RESP3 invalidations while the interactive prompt is idle, without
   needing another command. The worker polls with a 100 ms read timeout, keeps
   partial messages across timeouts, and respects `--show-pushes` and session

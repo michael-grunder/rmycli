@@ -90,6 +90,10 @@ class Terminal:
         self.screen_data = b""
         self.height = 35
         self.start_row = start_row
+        started = time.monotonic()
+        self.expect("rmycli>")
+        if b"Loading server command metadata" in self.screen_data:
+            assert time.monotonic() - started >= 0.2, "startup status flashed"
         self.expect_frame(lambda f: f.row(f.y) == "rmycli>"
                           and not f.row(f.y + 1), "quiet connected prompt")
         assert b"\x1b[?1049h" not in self.screen_data
