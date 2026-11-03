@@ -11,11 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Avoid flashing the startup metadata-loading message on fast connections;
   show it only after 200 ms or when you type.
 - Display RESP3 invalidations while the interactive prompt is idle, without
-  needing another command. The worker polls with a 100 ms read timeout, keeps
-  partial messages across timeouts, and respects `--show-pushes` and session
-  state. Push output is bold and preserves the current input and cursor.
-- Vendor redis-rs 0.32.7 with a timeout-safe message-read API for idle polling;
-  ordinary command reads and existing transports retain their behavior.
+  needing another command. Async reads preserve partial messages and respect
+  `--show-pushes` and session state. Push output is bold and preserves the
+  current input and cursor.
 - Buffer terminal redraws and synchronize updates so submitting a command does
   not briefly show an intermediate frame with stale inline hints.
 - Stop flashing a grey `Executing…` status on a fresh prompt after every
@@ -23,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   status appears only when a reply takes longer than 200 ms or you type.
 
 ### Changed
+
+- Upgrade redis-rs to 1.8.1 and replace synchronous session polling with async
+  TCP/Unix/TLS reads, retaining the same connection for streaming and stateful
+  commands. Remove the vendored Redis crate and its idle-read patch.
 
 - Show server error messages directly, such as `(error) syntax error`, without
   the Redis library's preamble; retain context for client and connection errors.

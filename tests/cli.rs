@@ -100,6 +100,22 @@ fn server_errors_are_concise_and_still_fail() {
 }
 
 #[test]
+fn piped_commands_preserve_line_boundaries_and_escape_errors() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.success(&[], b"SET piped value\r\nGET piped\nPING"),
+        b"OK\nvalue\nPONG\n"
+    );
+    for ending in [b"\n".as_slice(), b"\r\n", b""] {
+        let input = [b"SET unfinished \\".as_slice(), ending].concat();
+        let result = fixture.run(&[], &input);
+        assert!(!result.status.success());
+        assert_eq!(result.stderr, b"rmycli: unfinished escape\n");
+    }
+    assert_eq!(fixture.success(&["EXISTS", "unfinished"], b""), b"0\n");
+}
+
+#[test]
 fn help_examples_version_and_invalid_switches_need_no_server() {
     let output = base()
         .arg("--help")
@@ -378,7 +394,7 @@ fn tls_server(
         let mut reader = BufReader::new(tls);
         let mut parser = redis::Parser::new();
         while let Ok(value) = parser.parse_value(&mut reader) {
-            let args: Vec<String> = redis::from_redis_value(&value).unwrap();
+            let args: Vec<String> = redis::from_redis_value(value).unwrap();
             let reply = if args[0] == "PING" {
                 b"+PONG\r\n".as_slice()
             } else {

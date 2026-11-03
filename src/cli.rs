@@ -175,48 +175,51 @@ impl Options {
             (host, port).into_connection_info()?
         };
         if let Some(socket) = &self.socket {
-            info.addr = ConnectionAddr::Unix(socket.clone());
+            info = info.set_addr(ConnectionAddr::Unix(socket.clone()));
         }
         if self.tls || instance.tls {
-            if let ConnectionAddr::Tcp(host, port) = info.addr {
-                info.addr = ConnectionAddr::TcpTls {
+            if let ConnectionAddr::Tcp(host, port) = info.addr().clone() {
+                info = info.set_addr(ConnectionAddr::TcpTls {
                     host,
                     port,
                     insecure: false,
                     tls_params: None,
-                };
-            } else if matches!(info.addr, ConnectionAddr::Unix(_)) {
+                });
+            } else if matches!(info.addr(), ConnectionAddr::Unix(_)) {
                 return Err("TLS cannot be used with a Unix socket".into());
             }
         }
-        self.certificates.apply(&mut info)?;
+        let tls = self.certificates.apply(&mut info)?;
+        let mut redis = info.redis_settings().clone();
         if self.resp2 {
-            info.redis.protocol = redis::ProtocolVersion::RESP2;
+            redis = redis.set_protocol(redis::ProtocolVersion::RESP2);
         } else if self.resp3 || self.output.json || self.output.quoted_json {
-            info.redis.protocol = redis::ProtocolVersion::RESP3;
+            redis = redis.set_protocol(redis::ProtocolVersion::RESP3);
         }
         if let Some(db) = self.db.or(instance.db) {
             if db < 0 {
                 return Err("database must be nonnegative".into());
             }
-            info.redis.db = db;
+            redis = redis.set_db(db);
         }
         if let Some(user) = self.user.as_ref().or(instance.user.as_ref()) {
-            info.redis.username = Some(user.clone());
+            redis = redis.set_username(user);
         }
         let password = match &self.password {
             Some(password) => Some(password.clone()),
             None if self.askpass => None,
             None => instance.password(|name| std::env::var(name).ok())?,
         };
-        if password.is_some() {
-            info.redis.password = password;
+        if let Some(password) = password {
+            redis = redis.set_password(password);
         }
         if self.askpass {
-            info.redis.password = Some(read_password()?);
+            redis = redis.set_password(read_password()?);
         }
+        info = info.set_redis_settings(redis);
         Ok(Config {
             info,
+            tls,
             timeout: Duration::from_millis(self.timeout_ms),
             connect_timeout: self
                 .connect_timeout
@@ -260,10 +263,13 @@ mod tests {
         .config(&config::Settings::default())
         .unwrap();
         assert!(
-            matches!(config.info.addr, ConnectionAddr::TcpTls { ref host, port: 6380, insecure: false, .. } if host == "example.test")
+            matches!(config.info.addr(), ConnectionAddr::TcpTls { host, port: 6380, insecure: false, .. } if host == "example.test")
         );
-        assert_eq!(config.info.redis.db, 2);
-        assert_eq!(config.info.redis.protocol, redis::ProtocolVersion::RESP3);
+        assert_eq!(config.info.redis_settings().db(), 2);
+        assert_eq!(
+            config.info.redis_settings().protocol(),
+            redis::ProtocolVersion::RESP3
+        );
         assert_eq!(config.connect_timeout, Some(Duration::from_millis(125)));
         let config = options(&[
             "rmycli",
@@ -278,7 +284,7 @@ mod tests {
         ])
         .config(&config::Settings::default())
         .unwrap();
-        assert!(matches!(config.info.addr, ConnectionAddr::Unix(_)));
+        assert!(matches!(config.info.addr(), ConnectionAddr::Unix(_)));
         assert_eq!(config.connect_timeout, None);
         assert_eq!(config.timeout, Duration::from_secs(1));
         assert!(
@@ -301,12 +307,12 @@ mod tests {
         let config = options(&["rmycli", "--instance", "qa"])
             .config(&settings())
             .unwrap();
-        assert!(matches!(config.info.addr,
-            ConnectionAddr::TcpTls { ref host, port: 6380, insecure: false, .. }
+        assert!(matches!(config.info.addr(),
+            ConnectionAddr::TcpTls { host, port: 6380, insecure: false, .. }
                 if host == "qa.example"));
-        assert_eq!(config.info.redis.db, 2);
-        assert_eq!(config.info.redis.username.as_deref(), Some("alice"));
-        assert_eq!(config.info.redis.password.as_deref(), Some("qa-secret"));
+        assert_eq!(config.info.redis_settings().db(), 2);
+        assert_eq!(config.info.redis_settings().username(), Some("alice"));
+        assert_eq!(config.info.redis_settings().password(), Some("qa-secret"));
     }
 
     #[test]
@@ -332,22 +338,22 @@ mod tests {
         ])
         .config(&settings)
         .unwrap();
-        assert!(matches!(config.info.addr,
-            ConnectionAddr::TcpTls { ref host, port: 6381, .. }
+        assert!(matches!(config.info.addr(),
+            ConnectionAddr::TcpTls { host, port: 6381, .. }
                 if host == "override.example"));
-        assert_eq!(config.info.redis.db, 3);
-        assert_eq!(config.info.redis.username.as_deref(), Some("bob"));
-        assert_eq!(config.info.redis.password.as_deref(), Some("override"));
+        assert_eq!(config.info.redis_settings().db(), 3);
+        assert_eq!(config.info.redis_settings().username(), Some("bob"));
+        assert_eq!(config.info.redis_settings().password(), Some("override"));
     }
 
     #[test]
     fn unselected_instances_do_not_change_defaults_or_url_credentials() {
         let config = options(&["rmycli"]).config(&settings()).unwrap();
-        assert!(matches!(config.info.addr,
-            ConnectionAddr::Tcp(ref host, 6379) if host == "127.0.0.1"));
-        assert_eq!(config.info.redis.db, 0);
-        assert!(config.info.redis.username.is_none());
-        assert!(config.info.redis.password.is_none());
+        assert!(matches!(config.info.addr(),
+            ConnectionAddr::Tcp(host, 6379) if host == "127.0.0.1"));
+        assert_eq!(config.info.redis_settings().db(), 0);
+        assert!(config.info.redis_settings().username().is_none());
+        assert!(config.info.redis_settings().password().is_none());
         let config = options(&[
             "rmycli",
             "-u",
@@ -355,9 +361,9 @@ mod tests {
         ])
         .config(&settings())
         .unwrap();
-        assert_eq!(config.info.redis.db, 4);
-        assert_eq!(config.info.redis.username.as_deref(), Some("url-user"));
-        assert_eq!(config.info.redis.password.as_deref(), Some("url-secret"));
+        assert_eq!(config.info.redis_settings().db(), 4);
+        assert_eq!(config.info.redis_settings().username(), Some("url-user"));
+        assert_eq!(config.info.redis_settings().password(), Some("url-secret"));
     }
 }
 
@@ -385,20 +391,33 @@ impl TlsOptions {
     fn apply(
         &self,
         info: &mut redis::ConnectionInfo,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<
+        Option<std::sync::Arc<rustls::ClientConfig>>,
+        Box<dyn std::error::Error>,
+    > {
         let custom = self.cacert.is_some()
             || self.cacertdir.is_some()
             || self.cert.is_some();
-        if !custom && !self.insecure {
-            return Ok(());
+        if !custom
+            && !self.insecure
+            && !matches!(info.addr(), ConnectionAddr::TcpTls { .. })
+        {
+            return Ok(None);
         }
-        let ConnectionAddr::TcpTls { insecure, .. } = &mut info.addr else {
+        let mut addr = info.addr().clone();
+        let ConnectionAddr::TcpTls { insecure, .. } = &mut addr else {
             return Err(
                 "TLS options require --tls, a rediss:// URI, or a TLS instance"
                     .into(),
             );
         };
         *insecure |= self.insecure;
+        let insecure = *insecure;
+        *info = info.clone().set_addr(addr);
+        let mut certificates = redis::TlsCertificates {
+            client_tls: None,
+            root_cert: None,
+        };
         if custom {
             let mut root_cert =
                 self.cacert.as_ref().map(std::fs::read).transpose()?;
@@ -423,16 +442,17 @@ impl TlsOptions {
                     })
                 })
                 .transpose()?;
+            certificates = redis::TlsCertificates {
+                client_tls,
+                root_cert,
+            };
             let client = redis::Client::build_with_tls(
                 info.clone(),
-                redis::TlsCertificates {
-                    client_tls,
-                    root_cert,
-                },
+                certificates.clone(),
             )?;
             *info = client.get_connection_info().clone();
         }
-        Ok(())
+        Ok(Some(crate::transport::tls_config(&certificates, insecure)?))
     }
 }
 

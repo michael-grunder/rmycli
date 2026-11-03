@@ -122,16 +122,16 @@ rmycli --scan --pattern 'user:*' --count 100
   strings, rather than RFC 4180 quoting. The live editor always escapes
   terminal control bytes, even with `--raw`; JSON and CSV work in the editor.
 - `--show-pushes` controls unsolicited RESP3 messages (default: on for terminal
-  stdout). The interactive worker reads the socket while idle, with a 100 ms
-  timeout between checks for submitted commands. Invalidations appear without
-  another command, in bold, while preserving the input and cursor. The default
-  interactive format is `-> invalidate: 'key'`, with one line per key, or
+  stdout). The async session reader receives messages while idle and wakes the
+  worker when a message or submitted command arrives. Invalidations appear
+  without another command, in bold, while preserving the input and cursor. The
+  default interactive format is `-> invalidate: 'key'`, with one line per key, or
   `-> invalidate: (nil)` for a cache-wide invalidation. Keys are escaped safely;
   binary keys use double quotes and byte escapes. JSON, CSV, and noninteractive
-  output retain their existing formats. Polling sends
-  no Redis commands and also runs during WATCH and MULTI. Hidden pushes are
-  still drained; Pub/Sub messages remain visible. Polling frequency and push
-  styling are currently fixed. Noninteractive reads remain command driven.
+  output retain their existing formats. Reading sends no Redis commands and
+  also runs during WATCH and MULTI. Hidden pushes are
+  still drained; Pub/Sub messages remain visible. Push styling is currently
+  fixed. Noninteractive push display remains command driven.
 - `--scan` streams one SCAN batch at a time until cursor zero without retaining
   the whole keyspace. Ctrl-C interrupts it; `-i` throttles requests. `--count`
   is a Redis work hint, not a result limit. Like redis-cli, this explicit listing
@@ -155,16 +155,22 @@ Use `redis-cli` for its separate administration and diagnostic tools:
 shell and ordinary command execution.
 
 Address-family selection (`-4`/`-6`), a separate `--sni`, `--tls-ciphers`, and
-`--tls-ciphersuites` are also currently unsupported: the synchronous redis-rs
-transport does not expose those controls. TLS uses the connection hostname for
-SNI and rustls cipher defaults. Unsupported switches before the command fail
-with a usage error; they are never accepted as no-ops. Full option parity is
+`--tls-ciphersuites` are also currently unsupported: rmycli does not expose
+those transport controls. TLS uses the connection hostname for SNI and rustls
+cipher defaults. Unsupported switches before the command fail with a usage
+error; they are never accepted as no-ops. Full option parity is
 not claimed.
 
-The synchronous Redis dependency is pinned to a local copy with a small
-[timeout-safe message-read patch](vendor/README.md). Its ordinary reply reader
-discards a later reply after a timeout, making it unsuitable for idle polling.
-The patch reuses the existing parser and TCP/TLS/Unix transports.
+The session uses asynchronous TCP, Unix sockets, or TLS, with the published
+Redis 1.8 parser and command encoder; no vendored dependency is required.
+A dedicated reader keeps partial frames across waits and feeds a bounded
+64-message channel. User commands remain serialized on the same connection,
+including protocol changes, transactions, RESP2/RESP3 Pub/Sub, and `MONITOR`.
+This raw stream is needed because redis-rs's async multiplexer does not expose
+arbitrary streaming replies on an existing connection. Dropping a session
+aborts its reader; Ctrl-C still kills the exact server client to cancel a
+blocking command. Completion, estimation, and metadata use separate
+synchronous connections with timeouts on their worker thread.
 
 ## Configuration and saved instances
 
@@ -481,10 +487,13 @@ Closing the socket cannot undo a command the server has already executed.
 
 The code separates byte parsing, command metadata and argument grammar, type
 hints, scan discovery, estimation, session transport, workers, and the terminal.
-Dependencies are `redis` for RESP and transport, `rustls` for the TLS crypto
-provider, `crossterm` for terminal I/O, `clap` for options, `serde_json` for
-metadata, and `unicode-width` for cursor/layout calculations. `toml` and
-`serde` parse typed configuration and reject unknown fields and invalid values;
+Dependencies are `redis` for RESP and auxiliary connections, `tokio` for async
+session I/O, and `combine` for the decoder state required by Redis's public
+async parser. `tokio-rustls`, `rustls`, and `rustls-native-certs` provide TLS,
+its crypto provider, and system trust roots. `crossterm` handles terminal I/O,
+`clap` handles options, `serde_json` handles metadata, and `unicode-width`
+handles cursor/layout calculations. `toml` and `serde` parse typed configuration
+and reject unknown fields and invalid values;
 `xdg` resolves configuration directories. Crossterm's Serde support validates
 color values. `toml_edit` preserves comments during CLI edits, and `tempfile`
 provides temporary files for atomic replacement.

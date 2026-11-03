@@ -13,19 +13,21 @@ mod output;
 mod scan;
 mod session;
 mod terminal;
+mod transport;
 mod worker;
 
 #[cfg(test)]
 mod integration_tests;
 
-use std::io::{self, BufRead, IsTerminal};
+use std::io::{self, IsTerminal};
 use std::time::Duration;
 
 use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
 use cli::Options;
 use session::Session;
 
-fn main() {
+#[tokio::main(flavor = "multi_thread", worker_threads = 1)]
+async fn main() {
     let matches = Options::command().get_matches();
     let options = Options::from_arg_matches(&matches)
         .unwrap_or_else(|error| error.exit());
@@ -33,7 +35,7 @@ fn main() {
         == Some(ValueSource::CommandLine)
         || matches.value_source("uri") == Some(ValueSource::CommandLine)
             && options.uri.as_ref().is_some_and(|uri| uri.contains('@'));
-    if let Err(error) = run(&options, explicit_credentials) {
+    if let Err(error) = run(&options, explicit_credentials).await {
         let message = error
             .downcast_ref::<redis::RedisError>()
             .map_or_else(|| error.to_string(), output::error_message);
@@ -42,7 +44,7 @@ fn main() {
     }
 }
 
-fn run(
+async fn run(
     options: &Options,
     explicit_credentials: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -69,19 +71,19 @@ fn run(
             "Warning: command-line passwords may be visible to other users. Prefer REDISCLI_AUTH or --askpass."
         );
     }
-    let mut session = Session::open(config)?;
+    let mut session = Session::open(config).await?;
     if options.verbose {
         eprintln!(
             "Connected to {} (database {}, {:?})",
-            session.config.info.addr,
-            session.config.info.redis.db,
-            session.config.info.redis.protocol
+            session.config.info.addr(),
+            session.config.info.redis_settings().db(),
+            session.config.info.redis_settings().protocol()
         );
     }
     if options.batch.scan {
-        batch::scan(&mut session, options)?;
+        batch::scan(&mut session, options).await?;
     } else if !args.is_empty() {
-        batch::execute(&mut session, &args, options)?;
+        batch::execute(&mut session, &args, options).await?;
     } else if io::stdin().is_terminal() && io::stdout().is_terminal() {
         terminal::run(
             session,
@@ -99,9 +101,15 @@ fn run(
             },
         )?;
     } else {
-        for line in io::stdin().lock().lines() {
-            let line = line?;
-            let parsed = input::parse(&line);
+        loop {
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line)? == 0 {
+                break;
+            }
+            let line = line.strip_suffix('\n').map_or(line.as_str(), |line| {
+                line.strip_suffix('\r').unwrap_or(line)
+            });
+            let parsed = input::parse(line);
             if let Some(error) = parsed.error {
                 return Err(error.into());
             }
@@ -111,14 +119,14 @@ fn run(
                 .map(|word| word.bytes)
                 .collect::<Vec<_>>();
             if !args.is_empty() {
-                batch::execute(&mut session, &args, options)?;
+                batch::execute(&mut session, &args, options).await?;
             }
         }
     }
     Ok(())
 }
 
-fn batch_command(
+async fn batch_command(
     session: &mut Session,
     args: &[Vec<u8>],
     options: &Options,
@@ -127,14 +135,9 @@ fn batch_command(
         && !options.yes
         && args[0].eq_ignore_ascii_case(b"LRANGE")
     {
-        let estimate =
-            session
-                .config
-                .connect(true)
-                .ok()
-                .and_then(|mut connection| {
-                    estimate::estimate(&mut connection, args)
-                });
+        let estimate = session.config.connect_auxiliary().ok().and_then(
+            |mut connection| estimate::estimate(&mut connection, args),
+        );
         if estimate::needs_confirmation(
             estimate,
             options.reply_threshold,
@@ -146,17 +149,21 @@ fn batch_command(
     }
     let show_pushes = session.config.show_pushes;
     let mut output_error = None;
-    let reply = session.execute_with_push(args, |reply| {
-        if show_pushes && output_error.is_none() {
-            output_error = options.output.print(reply).err();
-        }
-    })?;
+    let reply = session
+        .execute_with_push(args, |reply| {
+            if show_pushes && output_error.is_none() {
+                output_error = options.output.print(reply).err();
+            }
+        })
+        .await?;
     if let Some(error) = output_error {
         return Err(error.into());
     }
     options.output.print(&reply)?;
     while session.streaming {
-        options.output.print(&session.connection.recv_response()?)?;
+        options
+            .output
+            .print(&session.connection.recv_response().await?)?;
     }
     Ok(())
 }

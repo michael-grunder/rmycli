@@ -7,6 +7,7 @@ use crate::input::quote;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub info: ConnectionInfo,
+    pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     pub timeout: Duration,
     pub connect_timeout: Option<Duration>,
     pub name: Option<String>,
@@ -16,34 +17,20 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn connect(&self, auxiliary: bool) -> RedisResult<Connection> {
-        let mut info = self.info.clone();
-        if auxiliary {
-            info.redis.protocol = redis::ProtocolVersion::RESP2;
-        }
-        let client = Client::open(info)?;
-        let timeout = if auxiliary {
-            Some(
-                self.connect_timeout
-                    .map_or(self.timeout, |timeout| timeout.min(self.timeout)),
-            )
-        } else {
-            self.connect_timeout
-        };
-        let mut connection = if let Some(timeout) = timeout {
-            client.get_connection_with_timeout(timeout)?
-        } else {
-            client.get_connection()?
-        };
+    pub fn connect_auxiliary(&self) -> RedisResult<Connection> {
+        let info = self.info.clone().set_redis_settings(
+            self.info
+                .redis_settings()
+                .clone()
+                .set_protocol(redis::ProtocolVersion::RESP2),
+        );
+        let timeout = self
+            .connect_timeout
+            .map_or(self.timeout, |timeout| timeout.min(self.timeout));
+        let connection =
+            Client::open(info)?.get_connection_with_timeout(timeout)?;
         connection.set_write_timeout(Some(self.timeout))?;
-        // User commands may intentionally block. Auxiliary work has a timeout.
-        connection.set_read_timeout(auxiliary.then_some(self.timeout))?;
-        if !auxiliary && let Some(name) = &self.name {
-            redis::cmd("CLIENT")
-                .arg("SETNAME")
-                .arg(name)
-                .query::<()>(&mut connection)?;
-        }
+        connection.set_read_timeout(Some(self.timeout))?;
         Ok(connection)
     }
 }
@@ -57,7 +44,7 @@ pub fn command(args: &[Vec<u8>]) -> redis::Cmd {
 }
 
 pub struct Session {
-    pub connection: Connection,
+    pub connection: crate::transport::Connection,
     pub config: Config,
     pub transaction: bool,
     pub watched: bool,
@@ -66,9 +53,9 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open(config: Config) -> RedisResult<Self> {
+    pub async fn open(config: Config) -> RedisResult<Self> {
         Ok(Self {
-            connection: config.connect(false)?,
+            connection: crate::transport::Connection::open(&config).await?,
             config,
             transaction: false,
             watched: false,
@@ -81,32 +68,29 @@ impl Session {
         !self.transaction && !self.watched && !self.streaming
     }
 
-    /// Read idle traffic without changing Redis state or losing partial frames.
-    pub fn poll_message(&mut self) -> RedisResult<Option<Value>> {
-        self.connection
-            .set_read_timeout(Some(Duration::from_millis(100)))?;
-        let result = self.connection.recv_message();
-        self.connection.set_read_timeout(None)?;
-        match result {
-            Ok(value) => Ok(Some(value)),
-            Err(error) if error.is_timeout() => Ok(None),
-            Err(error) => Err(error),
-        }
+    #[cfg(test)]
+    async fn poll_message(&mut self) -> RedisResult<Option<Value>> {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            self.connection.recv_response(),
+        )
+        .await
+        .map_or_else(|_| Ok(None), |value| value.map(Some))
     }
 
     #[cfg(test)]
-    pub fn execute(&mut self, args: &[Vec<u8>]) -> RedisResult<Value> {
-        self.execute_with_push(args, |_| {})
+    pub async fn execute(&mut self, args: &[Vec<u8>]) -> RedisResult<Value> {
+        self.execute_with_push(args, |_| {}).await
     }
 
-    pub fn execute_with_push(
+    pub async fn execute_with_push(
         &mut self,
         args: &[Vec<u8>],
         mut push: impl FnMut(&Value),
     ) -> RedisResult<Value> {
         for redirects in 0..=5 {
             let can_redirect = self.assistance_allowed();
-            let result = self.execute_once(args, &mut push);
+            let result = self.execute_once(args, &mut push).await;
             let Err(error) = &result else {
                 return result;
             };
@@ -117,10 +101,15 @@ impl Session {
                 return result;
             };
             let mut config = self.config.clone();
-            redirect_address(&mut config.info.addr, target)?;
-            let mut connection = config.connect(false)?;
-            if error.kind() == redis::ErrorKind::Ask {
-                redis::cmd("ASKING").query::<()>(&mut connection)?;
+            let mut addr = config.info.addr().clone();
+            redirect_address(&mut addr, target)?;
+            config.info = config.info.set_addr(addr);
+            let mut connection =
+                crate::transport::Connection::open(&config).await?;
+            if error.kind()
+                == redis::ErrorKind::Server(redis::ServerErrorKind::Ask)
+            {
+                connection.query(&redis::cmd("ASKING")).await?;
             }
             self.connection = connection;
             self.config = config;
@@ -128,7 +117,7 @@ impl Session {
         unreachable!("the last redirect returns its error")
     }
 
-    fn execute_once(
+    async fn execute_once(
         &mut self,
         args: &[Vec<u8>],
         push: &mut impl FnMut(&Value),
@@ -137,20 +126,19 @@ impl Session {
             [b"SUBSCRIBE".as_slice(), b"PSUBSCRIBE", b"SSUBSCRIBE"]
                 .iter()
                 .any(|name| args[0].eq_ignore_ascii_case(name));
-        let result = self
-            .connection
-            .send_packed_command(&command(args).get_packed_command())
-            .and_then(|()| {
-                loop {
-                    match self.connection.recv_response()? {
-                        value @ Value::Push { .. } if !subscription => {
-                            push(&value);
-                        }
-                        Value::ServerError(error) => break Err(error.into()),
-                        value => break Ok(value),
-                    }
+        let result: RedisResult<Value> = async {
+            self.connection
+                .send_packed_command(&command(args).get_packed_command())
+                .await?;
+            loop {
+                match self.connection.recv_response().await? {
+                    value @ Value::Push { .. } if !subscription => push(&value),
+                    Value::ServerError(error) => break Err(error.into()),
+                    value => break Ok(value),
                 }
-            });
+            }
+        }
+        .await;
         match &result {
             Ok(value) => self.observe(args, value),
             Err(error)
@@ -195,7 +183,14 @@ impl Session {
                     .and_then(|a| std::str::from_utf8(a).ok())
                     .and_then(|a| a.parse().ok())
                 {
-                    self.config.info.redis.db = db;
+                    self.config.info =
+                        self.config.info.clone().set_redis_settings(
+                            self.config
+                                .info
+                                .redis_settings()
+                                .clone()
+                                .set_db(db),
+                        );
                 }
             }
             "AUTH" => self.update_auth(&args[1..]),
@@ -208,38 +203,13 @@ impl Session {
                     .get(2)
                     .map(|arg| String::from_utf8_lossy(arg).into_owned());
             }
-            "HELLO" => {
-                if let Some(index) = args
-                    .iter()
-                    .position(|arg| arg.eq_ignore_ascii_case(b"SETNAME"))
-                {
-                    self.config.name = args
-                        .get(index + 1)
-                        .map(|arg| String::from_utf8_lossy(arg).into_owned());
-                }
-                if let Some(protocol) = args.get(1) {
-                    if protocol == b"3" {
-                        self.config.info.redis.protocol =
-                            redis::ProtocolVersion::RESP3;
-                    }
-                    if protocol == b"2" {
-                        self.config.info.redis.protocol =
-                            redis::ProtocolVersion::RESP2;
-                    }
-                }
-                if let Some(index) =
-                    args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH"))
-                    && let Some(auth) = args.get(index + 1..index + 3)
-                {
-                    self.update_auth(auth);
-                }
-            }
+            "HELLO" => self.observe_hello(args),
             "RESET" => {
-                self.config.info.redis.db = 0;
-                self.config.info.redis.protocol = redis::ProtocolVersion::RESP2;
+                self.config.info =
+                    self.config.info.clone().set_redis_settings(
+                        redis::RedisConnectionInfo::default(),
+                    );
                 self.config.name = None;
-                self.config.info.redis.username = None;
-                self.config.info.redis.password = None;
                 self.transaction = false;
                 self.watched = false;
                 self.streaming = false;
@@ -253,6 +223,43 @@ impl Session {
         }
     }
 
+    fn observe_hello(&mut self, args: &[Vec<u8>]) {
+        if let Some(index) = args
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case(b"SETNAME"))
+        {
+            self.config.name = args
+                .get(index + 1)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned());
+        }
+        if let Some(protocol) = args.get(1) {
+            if protocol == b"3" {
+                self.config.info = self.config.info.clone().set_redis_settings(
+                    self.config
+                        .info
+                        .redis_settings()
+                        .clone()
+                        .set_protocol(redis::ProtocolVersion::RESP3),
+                );
+            }
+            if protocol == b"2" {
+                self.config.info = self.config.info.clone().set_redis_settings(
+                    self.config
+                        .info
+                        .redis_settings()
+                        .clone()
+                        .set_protocol(redis::ProtocolVersion::RESP2),
+                );
+            }
+        }
+        if let Some(index) =
+            args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH"))
+            && let Some(auth) = args.get(index + 1..index + 3)
+        {
+            self.update_auth(auth);
+        }
+    }
+
     fn update_auth(&mut self, auth: &[Vec<u8>]) {
         // Redis connection credentials are UTF-8. Binary AUTH still executes,
         // but auxiliary authentication will fail gracefully for such accounts.
@@ -263,9 +270,15 @@ impl Session {
             }
             _ => return,
         };
-        self.config.info.redis.username = user;
-        self.config.info.redis.password =
-            Some(String::from_utf8_lossy(password).into_owned());
+        let mut settings = redis::RedisConnectionInfo::default()
+            .set_db(self.config.info.redis_settings().db())
+            .set_protocol(self.config.info.redis_settings().protocol())
+            .set_password(String::from_utf8_lossy(password));
+        if let Some(user) = user {
+            settings = settings.set_username(user);
+        }
+        self.config.info =
+            self.config.info.clone().set_redis_settings(settings);
     }
 }
 
@@ -276,7 +289,7 @@ fn redirect_address(
     use redis::{ConnectionAddr, ErrorKind, RedisError};
     let invalid = || {
         RedisError::from((
-            ErrorKind::ResponseError,
+            ErrorKind::Client,
             "invalid cluster redirect address",
         ))
     };
@@ -296,9 +309,9 @@ fn redirect_address(
             *current_port = port;
             Ok(())
         }
-        ConnectionAddr::Unix(_) => Err(RedisError::from((
-            ErrorKind::ResponseError,
-            "cannot follow a cluster redirect from a Unix socket",
+        _ => Err(RedisError::from((
+            ErrorKind::Client,
+            "cannot follow a cluster redirect from this transport",
         ))),
     }
 }
@@ -361,6 +374,7 @@ pub fn format_reply(value: &Value) -> Vec<String> {
                 })
                 .collect::<String>()
         )],
+        _ => vec!["(unsupported Redis reply type)".into()],
     }
 }
 
@@ -384,8 +398,7 @@ mod tests {
             let mut reader = BufReader::new(stream);
             let mut parser = redis::Parser::new();
             while let Ok(value) = parser.parse_value(&mut reader) {
-                let args: Vec<String> =
-                    redis::from_redis_value(&value).unwrap();
+                let args: Vec<String> = redis::from_redis_value(value).unwrap();
                 let response = if args[0] == "CLIENT" {
                     b"+OK\r\n".to_vec()
                 } else {
@@ -401,6 +414,7 @@ mod tests {
         use redis::IntoConnectionInfo;
         Config {
             info: ("127.0.0.1", port).into_connection_info().unwrap(),
+            tls: None,
             timeout: Duration::from_secs(1),
             connect_timeout: Some(Duration::from_secs(1)),
             name: None,
@@ -410,8 +424,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn moved_and_ask_follow_redirects_and_keep_command_bytes() {
+    #[tokio::test]
+    async fn moved_and_ask_follow_redirects_and_keep_command_bytes() {
         for kind in ["MOVED", "ASK"] {
             let mut asking = false;
             let (port, target) = server(move |args| {
@@ -426,25 +440,27 @@ mod tests {
             let (source_port, source) = server(move |_| {
                 format!("-{kind} 1 127.0.0.1:{port}\r\n").into_bytes()
             });
-            let mut session = Session::open(config(source_port)).unwrap();
+            let mut session = Session::open(config(source_port)).await.unwrap();
             assert_eq!(
                 session
                     .execute(&[b"GET".to_vec(), b"key".to_vec()])
+                    .await
                     .unwrap(),
                 Value::BulkString(b"value".to_vec())
             );
             assert_eq!(
-                session.config.info.addr,
-                redis::ConnectionAddr::Tcp("127.0.0.1".into(), port)
+                session.config.info.addr(),
+                &redis::ConnectionAddr::Tcp("127.0.0.1".into(), port)
             );
             drop(session);
+            tokio::task::yield_now().await;
             source.join().unwrap();
             target.join().unwrap();
         }
     }
 
-    #[test]
-    fn redirects_never_replay_watched_or_transactional_commands() {
+    #[tokio::test]
+    async fn redirects_never_replay_watched_or_transactional_commands() {
         for (state, command) in [
             ("WATCH", "GET"),
             ("MULTI", "GET"),
@@ -453,32 +469,42 @@ mod tests {
         ] {
             let (port, server) =
                 server(|_| b"-MOVED 1 127.0.0.1:1\r\n".to_vec());
-            let mut session = Session::open(config(port)).unwrap();
+            let mut session = Session::open(config(port)).await.unwrap();
             session.watched = state == "WATCH";
             session.transaction = state == "MULTI";
             session.config.cluster = state != "disabled";
-            let error =
-                session.execute(&[command.as_bytes().to_vec()]).unwrap_err();
-            assert_eq!(error.kind(), redis::ErrorKind::Moved);
+            let error = session
+                .execute(&[command.as_bytes().to_vec()])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                redis::ErrorKind::Server(redis::ServerErrorKind::Moved)
+            );
             drop(session);
+            tokio::task::yield_now().await;
             server.join().unwrap();
         }
     }
 
-    #[test]
-    fn pushes_do_not_consume_the_command_reply() {
+    #[tokio::test]
+    async fn pushes_do_not_consume_the_command_reply() {
         let (port, server) = server(|_| {
-            b">2\r\n+invalidate\r\n*1\r\n$3\r\nkey\r\n+PONG\r\n".to_vec()
+            let mut replies =
+                b">2\r\n+invalidate\r\n*1\r\n$3\r\nkey\r\n".repeat(128);
+            replies.extend_from_slice(b"+PONG\r\n");
+            replies
         });
-        let mut session = Session::open(config(port)).unwrap();
+        let mut session = Session::open(config(port)).await.unwrap();
         let mut pushes = Vec::new();
         let reply = session
             .execute_with_push(&[b"PING".to_vec()], |value| {
                 pushes.push(value.clone());
             })
+            .await
             .unwrap();
         assert_eq!(reply, Value::SimpleString("PONG".into()));
-        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes.len(), 128);
         let mut output = Vec::new();
         session
             .config
@@ -487,11 +513,12 @@ mod tests {
             .unwrap();
         assert_eq!(output, b"invalidate\nkey\n");
         drop(session);
+        tokio::task::yield_now().await;
         server.join().unwrap();
     }
 
-    #[test]
-    fn idle_timeouts_preserve_fragmented_pushes_and_later_replies() {
+    #[tokio::test]
+    async fn cancelled_reads_preserve_fragmented_pushes_and_replies() {
         for finish_while_idle in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -505,7 +532,7 @@ mod tests {
                 let mut pings = 0;
                 while let Ok(value) = parser.parse_value(&mut stream) {
                     let args: Vec<String> =
-                        redis::from_redis_value(&value).unwrap();
+                        redis::from_redis_value(value).unwrap();
                     if args[0] == "PING" {
                         pings += 1;
                         if pings == 1 {
@@ -522,21 +549,21 @@ mod tests {
                     }
                 }
             });
-            let mut session = Session::open(config(port)).unwrap();
+            let mut session = Session::open(config(port)).await.unwrap();
             // Empty polls must not discard the next command's reply.
-            assert_eq!(session.poll_message().unwrap(), None);
-            assert_eq!(session.poll_message().unwrap(), None);
+            assert_eq!(session.poll_message().await.unwrap(), None);
+            assert_eq!(session.poll_message().await.unwrap(), None);
             let args = [b"PING".to_vec()];
             assert_eq!(
-                session.execute(&args).unwrap(),
+                session.execute(&args).await.unwrap(),
                 Value::SimpleString("PONG".into())
             );
-            assert_eq!(session.poll_message().unwrap(), None);
+            assert_eq!(session.poll_message().await.unwrap(), None);
             release.send(()).unwrap();
             let mut pushes = Vec::new();
             if finish_while_idle {
                 for _ in 0..10 {
-                    if let Some(value) = session.poll_message().unwrap() {
+                    if let Some(value) = session.poll_message().await.unwrap() {
                         pushes.push(value);
                         break;
                     }
@@ -546,6 +573,7 @@ mod tests {
                 session
                     .execute_with_push(&args, |value| pushes
                         .push(value.clone()))
+                    .await
                     .unwrap(),
                 Value::SimpleString("SECOND".into())
             );
@@ -559,8 +587,78 @@ mod tests {
                 }]
             );
             drop(session);
+            tokio::task::yield_now().await;
             server.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_auth_retries_only_for_the_old_server_arity_error() {
+        for first_reply in [
+            "-ERR wrong number of arguments for 'auth' command\r\n",
+            "-WRONGPASS invalid username-password pair\r\n",
+            ":1\r\n",
+        ] {
+            let mut calls = 0;
+            let (port, server) = server(move |args| {
+                calls += 1;
+                assert_eq!(args[0], "AUTH");
+                if calls == 1 {
+                    assert_eq!(args, &["AUTH", "default", "secret"]);
+                    first_reply.as_bytes().to_vec()
+                } else {
+                    assert!(first_reply.starts_with("-ERR wrong number"));
+                    assert_eq!(args, &["AUTH", "secret"]);
+                    b"+OK\r\n".to_vec()
+                }
+            });
+            let mut config = config(port);
+            config.info = config.info.clone().set_redis_settings(
+                config
+                    .info
+                    .redis_settings()
+                    .clone()
+                    .set_username("default")
+                    .set_password("secret"),
+            );
+            let session = Session::open(config).await;
+            assert_eq!(
+                session.is_ok(),
+                first_reply.starts_with("-ERR wrong number")
+            );
+            drop(session);
+            tokio::task::yield_now().await;
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_timeout_closes_the_socket_and_reader() {
+        use tokio::io::AsyncReadExt;
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut command = Vec::new();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                stream.read_to_end(&mut command),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_ne!(command, [] as [u8; 0]);
+        });
+        let mut config = config(port);
+        config.name = Some("timeout-test".into());
+        config.connect_timeout = Some(Duration::from_millis(50));
+        let error = Session::open(config)
+            .await
+            .err()
+            .expect("handshake must time out");
+        assert!(error.is_timeout());
+        server.await.unwrap();
     }
 
     #[test]

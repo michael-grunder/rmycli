@@ -4,24 +4,14 @@ use std::io::{self, IsTerminal, Write};
 use redis::Value;
 
 pub fn error_message(error: &redis::RedisError) -> String {
-    let display = error.to_string();
-    let extension = error.kind() == redis::ErrorKind::ExtensionError;
-    // redis-rs exposes no server-origin flag; local errors can share its kinds.
-    if !extension
-        && !display.starts_with("An error was signalled by the server")
+    if matches!(
+        error.kind(),
+        redis::ErrorKind::Server(_) | redis::ErrorKind::Extension
+    ) && let Some(code) = error.code()
     {
-        return display;
+        return server_error_message(code, error.detail()).to_owned();
     }
-    let code = error.code().or_else(|| {
-        (error.kind() == redis::ErrorKind::NoSub).then_some("NOSUB")
-    });
-    let detail = error.detail().filter(|detail| {
-        // redis-rs synthesizes this detail for code-only extension errors.
-        !extension || *detail != "Unknown extension error encountered"
-    });
-    code.map_or(display, |code| {
-        server_error_message(code, detail).to_owned()
-    })
+    error.to_string()
 }
 
 pub fn server_error_message<'a>(
@@ -195,6 +185,7 @@ fn raw_reply(
         Value::ServerError(error) => out.write_all(
             server_error_message(error.code(), error.details()).as_bytes(),
         ),
+        _ => Err(io::Error::other("unsupported Redis reply type")),
     }
 }
 
@@ -397,12 +388,12 @@ mod tests {
     fn client_and_connection_errors_keep_their_context() {
         for error in [
             redis::RedisError::from((
-                redis::ErrorKind::TypeError,
+                redis::ErrorKind::UnexpectedReturnType,
                 "unexpected reply",
                 "expected an integer".to_owned(),
             )),
             redis::RedisError::from((
-                redis::ErrorKind::ResponseError,
+                redis::ErrorKind::Client,
                 "invalid cluster redirect address",
             )),
             redis::RedisError::from(io::Error::new(

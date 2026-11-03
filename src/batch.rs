@@ -119,25 +119,25 @@ impl Options {
     }
 }
 
-pub fn execute(
+pub async fn execute(
     session: &mut Session,
     args: &[Vec<u8>],
     options: &cli::Options,
 ) -> Result<(), Error> {
     let mut remaining = options.batch.repeat;
     while remaining != 0 {
-        crate::batch_command(session, args, options)?;
+        crate::batch_command(session, args, options).await?;
         if remaining > 0 {
             remaining -= 1;
         }
         if remaining != 0 {
-            std::thread::sleep(options.batch.interval);
+            tokio::time::sleep(options.batch.interval).await;
         }
     }
     Ok(())
 }
 
-pub fn scan(
+pub async fn scan(
     session: &mut Session,
     options: &cli::Options,
 ) -> Result<(), Error> {
@@ -153,13 +153,18 @@ pub fn scan(
     let mut cursor = 0_u64;
     loop {
         // Stream each batch without retaining an unbounded keyspace in memory.
-        let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(batch.count.unwrap_or(10))
-            .query(&mut session.connection)?;
+        let reply = session
+            .connection
+            .query(
+                redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(batch.count.unwrap_or(10)),
+            )
+            .await?;
+        let (next, keys): (u64, Vec<Vec<u8>>) = redis::from_redis_value(reply)?;
         for key in keys {
             options.output.print(&redis::Value::BulkString(key))?;
         }
@@ -167,7 +172,7 @@ pub fn scan(
         if cursor == 0 {
             return Ok(());
         }
-        std::thread::sleep(batch.interval);
+        tokio::time::sleep(batch.interval).await;
     }
 }
 

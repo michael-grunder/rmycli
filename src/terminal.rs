@@ -480,7 +480,9 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                             [(
                                 format!(
                                     "{}{}",
-                                    prompt(app.config.info.redis.db),
+                                    prompt(
+                                        app.config.info.redis_settings().db()
+                                    ),
                                     app.editor.line
                                 ),
                                 false,
@@ -982,7 +984,7 @@ impl App {
         self.editor.remember();
         self.log([format!(
             "{}{}",
-            prompt(self.config.info.redis.db),
+            prompt(self.config.info.redis_settings().db()),
             self.editor.line
         )]);
         self.editor.line.clear();
@@ -1030,7 +1032,7 @@ impl App {
         };
         vec![
             format!("{state} • {} commands • database {}",
-                self.catalog.commands.len(), self.config.info.redis.db),
+                self.catalog.commands.len(), self.config.info.redis_settings().db()),
             "HELP command: full command help; HELP @group: command list".into(),
             "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
             "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
@@ -1082,7 +1084,7 @@ impl App {
                 EndSynchronizedUpdate
             );
         }
-        let prompt = prompt(self.config.info.redis.db);
+        let prompt = prompt(self.config.info.redis_settings().db());
         let inline_status = self.editor.line.is_empty()
             && self.popup.is_none()
             && self.help.is_none()
@@ -1323,10 +1325,10 @@ mod tests {
         assert!(!safe("a\x1b[2J").contains('\x1b'));
     }
 
-    fn test_app() -> (App, std::sync::mpsc::Receiver<Execution>) {
+    fn test_app() -> (App, tokio::sync::mpsc::UnboundedReceiver<Execution>) {
         use redis::IntoConnectionInfo;
         use std::sync::{Arc, atomic::AtomicU64, mpsc};
-        let (execution, executed) = mpsc::channel();
+        let (execution, executed) = tokio::sync::mpsc::unbounded_channel();
         let (assistance, _assisted) = mpsc::channel();
         let (_events, events) = mpsc::channel();
         let app = App {
@@ -1343,6 +1345,7 @@ mod tests {
                 generation: Arc::new(AtomicU64::new(0)),
             },
             config: Config {
+                tls: None,
                 info: ("localhost", 6379).into_connection_info().unwrap(),
                 timeout: Duration::from_secs(1),
                 connect_timeout: Some(Duration::from_secs(1)),
@@ -1404,7 +1407,7 @@ mod tests {
 
     #[test]
     fn push_output_is_bold_and_preserves_the_draft_and_cursor() {
-        let (mut app, executed) = test_app();
+        let (mut app, mut executed) = test_app();
         app.editor = Editor::default();
         app.editor.insert("GET draft");
         app.editor.left();
@@ -1454,7 +1457,7 @@ mod tests {
         }
 
         for row in [7, 23] {
-            let (mut app, executed) = test_app();
+            let (mut app, mut executed) = test_app();
             let mut screen = std::mem::ManuallyDrop::new(Screen { row });
             let mut out = FrameWriter::default();
             app.editor.line = "PING".into();
@@ -1596,7 +1599,7 @@ mod tests {
 
     #[test]
     fn assistance_scrolls_only_as_needed_and_clears_when_dismissed() {
-        let (mut app, executed) = test_app();
+        let (mut app, mut executed) = test_app();
         let mut screen = std::mem::ManuallyDrop::new(Screen { row: 23 });
         app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert!(app.help.is_some());
@@ -1622,7 +1625,7 @@ mod tests {
 
     #[test]
     fn help_is_on_demand_scrollable_and_never_executes_input() {
-        let (mut app, executed) = test_app();
+        let (mut app, mut executed) = test_app();
         app.on_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         let help = app.help.as_ref().unwrap();
         assert!(help.lines.iter().any(|line| line.contains("Connected")));
@@ -1663,14 +1666,16 @@ mod tests {
             Mode::Streaming,
         ] {
             for line in ["clear", "CLEAR", "  ClEaR  ", "\"clear\""] {
-                let (mut app, executed) = test_app();
+                let (mut app, mut executed) = test_app();
                 app.mode = mode;
                 app.editor.line = line.into();
                 app.editor.cursor = line.len();
                 app.editor.history.push_back("PING".into());
                 app.log(["PONG".into()]);
                 app.status = "Old status".into();
-                app.config.info.redis.db = 2;
+                app.config.info = app.config.info.clone().set_redis_settings(
+                    app.config.info.redis_settings().clone().set_db(2),
+                );
 
                 assert!(
                     !app.on_key(KeyEvent::new(
@@ -1687,7 +1692,7 @@ mod tests {
                 assert_eq!(app.status, "");
                 assert!(app.pending.args.is_none());
                 assert!(app.mode == mode);
-                assert_eq!(app.config.info.redis.db, 2);
+                assert_eq!(app.config.info.redis_settings().db(), 2);
                 assert!(executed.try_recv().is_err());
             }
         }
@@ -1695,7 +1700,7 @@ mod tests {
 
     #[test]
     fn clear_with_arguments_is_sent_to_redis() {
-        let (mut app, executed) = test_app();
+        let (mut app, mut executed) = test_app();
         app.editor.line = "clear key".into();
         app.editor.cursor = app.editor.line.len();
         app.log(["PONG".into()]);
@@ -1711,7 +1716,7 @@ mod tests {
 
     #[test]
     fn editing_invalidates_scan_results_and_pending_execution() {
-        let (mut app, executed) = test_app();
+        let (mut app, mut executed) = test_app();
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         app.on_worker(Event::Scanned {
             generation: 0,

@@ -48,12 +48,13 @@ impl RedisFixture {
             .spawn()
             .expect("install redis-server to run isolated integration tests");
         let mut info = ("127.0.0.1", 6379).into_connection_info().unwrap();
-        info.addr = ConnectionAddr::Unix(socket);
+        info = info.set_addr(ConnectionAddr::Unix(socket));
         let fixture = Self {
             child,
             path,
             config: Config {
                 info,
+                tls: None,
                 timeout: Duration::from_millis(300),
                 connect_timeout: Some(Duration::from_millis(300)),
                 name: None,
@@ -63,7 +64,7 @@ impl RedisFixture {
             },
         };
         let start = Instant::now();
-        while fixture.config.connect(true).is_err() {
+        while fixture.config.connect_auxiliary().is_err() {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "isolated Redis failed to start"
@@ -73,7 +74,7 @@ impl RedisFixture {
         fixture
     }
     fn connection(&self) -> Connection {
-        self.config.connect(true).unwrap()
+        self.config.connect_auxiliary().unwrap()
     }
 }
 impl Drop for RedisFixture {
@@ -104,8 +105,8 @@ fn worker_command(
     }
 }
 
-#[test]
-fn worker_shows_server_errors_without_library_context() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn worker_shows_server_errors_without_library_context() {
     use crate::worker::{Event, Workers};
 
     let fixture = RedisFixture::new();
@@ -113,8 +114,10 @@ fn worker_shows_server_errors_without_library_context() {
         [redis::ProtocolVersion::RESP2, redis::ProtocolVersion::RESP3]
     {
         let mut config = fixture.config.clone();
-        config.info.redis.protocol = protocol;
-        let workers = Workers::start(Session::open(config).unwrap());
+        config.info = config.info.clone().set_redis_settings(
+            config.info.redis_settings().clone().set_protocol(protocol),
+        );
+        let workers = Workers::start(Session::open(config).await.unwrap());
         assert!(matches!(
             workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
             Event::Connected { .. }
@@ -127,8 +130,8 @@ fn worker_shows_server_errors_without_library_context() {
     }
 }
 
-#[test]
-fn worker_displays_idle_invalidations_and_preserves_session_state() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn worker_displays_idle_invalidations_and_preserves_session_state() {
     use crate::worker::{Event, Execution, Workers};
 
     let fixture = RedisFixture::new();
@@ -136,7 +139,7 @@ fn worker_displays_idle_invalidations_and_preserves_session_state() {
     for show_pushes in [true, false] {
         let mut config = fixture.config.clone();
         config.show_pushes = show_pushes;
-        let workers = Workers::start(Session::open(config).unwrap());
+        let workers = Workers::start(Session::open(config).await.unwrap());
         let Event::Connected { client_id, .. } =
             workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
         else {
@@ -187,7 +190,7 @@ fn worker_displays_idle_invalidations_and_preserves_session_state() {
             };
             assert_eq!(lines, ["-> invalidate: (nil)"]);
         }
-        // Disconnection is noticed while idle, and reconnect restores polling.
+        // Disconnection is noticed while idle, and reconnect restores reading.
         redis::cmd("CLIENT")
             .arg("KILL")
             .arg("ID")
@@ -262,27 +265,27 @@ fn live_metadata_typed_scan_binary_keys_and_estimates() {
     assert_eq!(estimate::estimate(&mut connection, &unknown), None);
 }
 
-fn execute(session: &mut Session, line: &str) -> Value {
+async fn execute(session: &mut Session, line: &str) -> Value {
     let args = input::parse(line)
         .words
         .into_iter()
         .map(|w| w.bytes)
         .collect::<Vec<_>>();
-    session.execute(&args).unwrap()
+    session.execute(&args).await.unwrap()
 }
 
-#[test]
-fn session_database_transaction_and_background_isolation() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn session_database_transaction_and_background_isolation() {
     let fixture = RedisFixture::new();
-    let mut session = Session::open(fixture.config.clone()).unwrap();
-    execute(&mut session, "SELECT 2");
-    execute(&mut session, "RPUSH list:db2 x");
-    assert_eq!(session.config.info.redis.db, 2);
-    let mut auxiliary = session.config.connect(true).unwrap();
-    execute(&mut session, "MULTI");
+    let mut session = Session::open(fixture.config.clone()).await.unwrap();
+    execute(&mut session, "SELECT 2").await;
+    execute(&mut session, "RPUSH list:db2 x").await;
+    assert_eq!(session.config.info.redis_settings().db(), 2);
+    let mut auxiliary = session.config.connect_auxiliary().unwrap();
+    execute(&mut session, "MULTI").await;
     assert!(!session.assistance_allowed());
-    execute(&mut session, "SELECT 3");
-    execute(&mut session, "SET k v");
+    execute(&mut session, "SELECT 3").await;
+    execute(&mut session, "SET k v").await;
     let scan = scan::discover(
         &mut auxiliary,
         b"list:",
@@ -292,7 +295,7 @@ fn session_database_transaction_and_background_isolation() {
         || false,
     );
     assert_eq!(scan.keys.len(), 1);
-    let Value::Array(replies) = execute(&mut session, "EXEC") else {
+    let Value::Array(replies) = execute(&mut session, "EXEC").await else {
         panic!("expected EXEC array")
     };
     assert_eq!(
@@ -300,16 +303,16 @@ fn session_database_transaction_and_background_isolation() {
         2,
         "auxiliary SCAN must not enter transaction"
     );
-    assert_eq!(session.config.info.redis.db, 3);
+    assert_eq!(session.config.info.redis_settings().db(), 3);
     assert!(session.assistance_allowed());
-    execute(&mut session, "WATCH k");
+    execute(&mut session, "WATCH k").await;
     assert!(!session.assistance_allowed());
-    execute(&mut session, "UNWATCH");
+    execute(&mut session, "UNWATCH").await;
     assert!(session.assistance_allowed());
-    execute(&mut session, "MULTI");
-    execute(&mut session, "SELECT 4");
-    execute(&mut session, "DISCARD");
-    assert_eq!(session.config.info.redis.db, 3);
+    execute(&mut session, "MULTI").await;
+    execute(&mut session, "SELECT 4").await;
+    execute(&mut session, "DISCARD").await;
+    assert_eq!(session.config.info.redis_settings().db(), 3);
 }
 
 #[test]
@@ -323,9 +326,17 @@ fn restricted_introspection_keeps_manual_execution_available() {
         .query::<()>(&mut connection)
         .unwrap();
     let mut config = fixture.config.clone();
-    config.info.redis.username = Some("limited".into());
-    config.info.redis.password = Some(String::new());
-    let mut connection = config.connect(true).unwrap();
+    config.info = config.info.clone().set_redis_settings(
+        config.info.redis_settings().clone().set_username("limited"),
+    );
+    config.info = config.info.clone().set_redis_settings(
+        config
+            .info
+            .redis_settings()
+            .clone()
+            .set_password(String::new()),
+    );
+    let mut connection = config.connect_auxiliary().unwrap();
     let catalog = Catalog::load(&mut connection);
     assert_ne!(catalog.notices, [] as [std::string::String; 0]);
     assert!(!catalog.commands["LRANGE"].live_docs);
@@ -336,20 +347,20 @@ fn restricted_introspection_keeps_manual_execution_available() {
     );
 }
 
-#[test]
-fn exec_runtime_errors_preserve_successful_database_changes() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn exec_runtime_errors_preserve_successful_database_changes() {
     let fixture = RedisFixture::new();
-    let mut session = Session::open(fixture.config.clone()).unwrap();
-    execute(&mut session, "MULTI");
-    execute(&mut session, "SELECT 2");
-    execute(&mut session, "SET key value");
-    execute(&mut session, "LPUSH key wrong-type");
-    let Value::Array(replies) = execute(&mut session, "EXEC") else {
+    let mut session = Session::open(fixture.config.clone()).await.unwrap();
+    execute(&mut session, "MULTI").await;
+    execute(&mut session, "SELECT 2").await;
+    execute(&mut session, "SET key value").await;
+    execute(&mut session, "LPUSH key wrong-type").await;
+    let Value::Array(replies) = execute(&mut session, "EXEC").await else {
         panic!("EXEC must preserve individual replies")
     };
     assert_eq!(replies.len(), 3);
     assert!(matches!(replies[2], Value::ServerError(_)));
-    assert_eq!(session.config.info.redis.db, 2);
+    assert_eq!(session.config.info.redis_settings().db(), 2);
     assert!(session.assistance_allowed());
 }
 
@@ -376,18 +387,140 @@ fn getkeys_fallback_does_not_execute_and_distinguishes_equal_values() {
     );
 }
 
-#[test]
-fn authentication_changes_and_resp3_subscription_acknowledgment() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn authentication_changes_and_resp3_subscription_acknowledgment() {
     let fixture = RedisFixture::new();
-    let mut session = Session::open(fixture.config.clone()).unwrap();
-    execute(&mut session, "ACL SETUSER alice on >secret ~* &* +@all");
-    execute(&mut session, "AUTH alice secret");
-    assert_eq!(session.config.info.redis.username.as_deref(), Some("alice"));
-    assert!(session.config.connect(true).is_ok());
-    execute(&mut session, "HELLO 3");
-    let reply = execute(&mut session, "SUBSCRIBE updates");
+    let mut session = Session::open(fixture.config.clone()).await.unwrap();
+    execute(&mut session, "ACL SETUSER alice on >secret ~* &* +@all").await;
+    execute(&mut session, "AUTH alice secret").await;
+    assert_eq!(
+        session.config.info.redis_settings().username(),
+        Some("alice")
+    );
+    assert!(session.config.connect_auxiliary().is_ok());
+    execute(&mut session, "HELLO 3").await;
+    let reply = execute(&mut session, "SUBSCRIBE updates").await;
     assert!(matches!(reply, Value::Push { .. }));
     assert!(!session.assistance_allowed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn subscriptions_keep_the_session_and_all_replies() {
+    let fixture = RedisFixture::new();
+    let mut publisher = fixture.connection();
+    for protocol in [2, 3] {
+        let mut session = Session::open(fixture.config.clone()).await.unwrap();
+        execute(&mut session, "CLIENT SETNAME streaming-test").await;
+        execute(&mut session, "SELECT 2").await;
+        let Value::Int(id) = execute(&mut session, "CLIENT ID").await else {
+            panic!("expected client id");
+        };
+        execute(&mut session, &format!("HELLO {protocol}")).await;
+        let first = execute(&mut session, "SUBSCRIBE first second").await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.connection.recv_response(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for (reply, channel, count) in
+            [(first, b"first".as_slice(), 1), (second, b"second", 2)]
+        {
+            let data = match reply {
+                Value::Array(values) => {
+                    assert_eq!(protocol, 2);
+                    values
+                }
+                Value::Push {
+                    kind: redis::PushKind::Subscribe,
+                    data,
+                } => {
+                    assert_eq!(protocol, 3);
+                    data
+                }
+                other => panic!("unexpected subscription reply: {other:?}"),
+            };
+            assert_eq!(
+                &data[data.len() - 2..],
+                &[Value::BulkString(channel.to_vec()), Value::Int(count)]
+            );
+        }
+        let clients: String = redis::cmd("CLIENT")
+            .arg("LIST")
+            .query(&mut publisher)
+            .unwrap();
+        let client = clients
+            .lines()
+            .find(|line| line.starts_with(&format!("id={id} ")))
+            .unwrap();
+        assert!(
+            client.contains("name=streaming-test ")
+                && client.contains("db=2 ")
+                && client.contains("sub=2 ")
+        );
+        redis::cmd("PUBLISH")
+            .arg("second")
+            .arg(b"a\x00\xff")
+            .query::<i64>(&mut publisher)
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.connection.recv_response(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let data = match reply {
+            Value::Array(data) | Value::Push { data, .. } => data,
+            other => panic!("unexpected message: {other:?}"),
+        };
+        assert_eq!(
+            data.last(),
+            Some(&Value::BulkString(b"a\x00\xff".to_vec()))
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn monitor_keeps_the_session() {
+    let fixture = RedisFixture::new();
+    let mut publisher = fixture.connection();
+    let mut session = Session::open(fixture.config.clone()).await.unwrap();
+    execute(&mut session, "CLIENT SETNAME monitor-test").await;
+    let Value::Int(id) = execute(&mut session, "CLIENT ID").await else {
+        panic!("expected client id");
+    };
+    assert_eq!(execute(&mut session, "MONITOR").await, Value::Okay);
+    redis::cmd("ECHO")
+        .arg("monitor-marker")
+        .query::<String>(&mut publisher)
+        .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        session.connection.recv_response(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(reply, Value::SimpleString(line) if line.contains("monitor-marker"))
+    );
+    let clients: String = redis::cmd("CLIENT")
+        .arg("LIST")
+        .query(&mut publisher)
+        .unwrap();
+    let client = clients
+        .lines()
+        .find(|line| line.starts_with(&format!("id={id} ")))
+        .unwrap();
+    assert!(
+        client.contains("name=monitor-test ")
+            && client.split_whitespace().any(|field| field
+                .strip_prefix("flags=")
+                .is_some_and(|flags| flags.contains('O'))),
+        "{client}"
+    );
 }
 
 #[test]
