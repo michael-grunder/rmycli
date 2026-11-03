@@ -55,6 +55,11 @@ impl RedisFixture {
             config: Config {
                 info,
                 timeout: Duration::from_millis(300),
+                connect_timeout: Some(Duration::from_millis(300)),
+                name: None,
+                cluster: false,
+                output: crate::output::Options::default(),
+                show_pushes: false,
             },
         };
         let start = Instant::now();

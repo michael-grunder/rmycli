@@ -1,0 +1,42 @@
+Examples:
+  rmycli                              Open the interactive shell
+  rmycli -3                           Connect using RESP3 (HELLO 3)
+  rmycli -h localhost -p 6380 -n 2     Select host, port, and database
+  rmycli -t 0.5 PING                  Set a 500 ms connection timeout
+  rmycli -s /tmp/redis.sock            Connect through a Unix socket
+  rmycli -u redis://localhost:6379/2   Connect using a URI
+  REDISCLI_AUTH=secret rmycli --user alice
+  rmycli --askpass --user alice        Prompt without echoing the password
+  rmycli --tls --cacert ca.pem -h redis.example.com
+  rmycli -c -h cluster.example.com GET greeting
+  rmycli --json HGETALL account:1
+  rmycli -r 5 -i 0.5 INCR counter
+  printf 'hello\n' | rmycli -x SET greeting
+  rmycli -D '' --raw DUMP key > key.dump
+  rmycli -X payload RESTORE key2 0 payload REPLACE < key.dump
+  rmycli --quoted-input GET '"key\x00with-nul"'
+  rmycli --eval script.lua key1 key2 , arg1 arg2
+  rmycli --scan --pattern 'user:*' --count 100
+  rmycli --instance qa                Use a saved connection
+  rmycli config --help                Help for local configuration commands
+
+Usage notes:
+  Put options before the command. Everything after the command is a Redis
+  argument, including words beginning with '-'. The comma in --eval separates
+  keys from script arguments. -r -1 repeats until interrupted; Ctrl-C exits.
+  Without a command, a terminal opens the editor; piped stdin runs one command
+  per line. --raw is automatic for redirected stdout; --no-raw forces readable
+  output. The live editor always escapes control bytes, even with --raw.
+  -h means host, not help. Use --help for this page and F1 for editor help.
+  REDISCLI_AUTH supplies a password; --pass/-a overrides it, --askpass wins.
+  REDIS_URL supplies a URI. --help and --version never load configuration.
+
+Compatibility:
+  This is an interactive shell, not a replacement for redis-cli's administration
+  suite. Cluster management (--cluster), replication/RDB transfer, --pipe,
+  latency/statistics/key-analysis/benchmark modes, and the Lua debugger are
+  omitted. Use redis-cli for those modes.
+  The current transport does not expose address-family selection (-4/-6),
+  --sni overrides, or OpenSSL cipher-list options. TLS uses the connection
+  hostname for SNI and rustls cipher defaults. See README for compatibility
+  details. Unsupported switches are rejected, never silently ignored.

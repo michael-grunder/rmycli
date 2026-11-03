@@ -6,7 +6,7 @@ use std::thread;
 use crate::estimate;
 use crate::metadata::Catalog;
 use crate::scan::{self, Discovery, Limits};
-use crate::session::{Config, Session, command, format_reply};
+use crate::session::{Config, Session, command};
 
 pub enum Execution {
     Run(Vec<Vec<u8>>),
@@ -219,14 +219,24 @@ fn execution_loop(
     while let Ok(request) = requests.recv() {
         match request {
             Execution::Run(args) => {
-                let result = session.execute(&args);
+                let previous_addr = session.config.info.addr.clone();
+                let output = session.config.output.clone();
+                let show_pushes = session.config.show_pushes;
+                let result = session.execute_with_push(&args, |reply| {
+                    if show_pushes {
+                        let _ = events.send(Event::Output(output.lines(reply)));
+                    }
+                });
+                if previous_addr != session.config.info.addr {
+                    id = client_id(&mut session);
+                }
                 let connected = result
                     .as_ref()
                     .err()
                     .is_none_or(|error| !error.is_io_error());
                 let lines = result.map_or_else(
                     |error| vec![format!("(error) {error}")],
-                    |reply| format_reply(&reply),
+                    |reply| output.lines(&reply),
                 );
                 if events
                     .send(Event::Executed {
@@ -248,7 +258,7 @@ fn execution_loop(
                     match session.connection.recv_response() {
                         Ok(reply) => {
                             if events
-                                .send(Event::Output(format_reply(&reply)))
+                                .send(Event::Output(output.lines(&reply)))
                                 .is_err()
                             {
                                 return;

@@ -10,7 +10,8 @@ executes arbitrary commands, discovers the server's command catalog, shows
 syntax and argument help while editing, and completes keys using bounded,
 cancellable `SCAN` requests. It also estimates `LRANGE` replies before execution.
 
-Full `redis-cli` option parity, cluster routing/discovery, replication/RDB
+Common `redis-cli` connection, scripting, and output options are supported,
+including RESP3 and cluster redirects. Cluster-wide discovery, replication/RDB
 transfers, and estimates for commands other than `LRANGE` are not implemented.
 See **Compatibility and limits** below for metadata and streaming limitations.
 
@@ -21,6 +22,7 @@ Use Rust with edition 2024 support (the current toolchain is recommended):
 ```sh
 cargo install --path . --locked
 rmycli
+rmycli -3
 rmycli -h localhost -p 6379 -n 2
 rmycli -s /tmp/redis.sock
 rmycli -u redis://localhost:6379/2
@@ -28,8 +30,13 @@ rmycli -u rediss://redis.example.com:6379/0
 REDISCLI_AUTH=secret rmycli --user alice
 ```
 
-`--tls` enables certificate-verified TLS for `-h`/`-p` connections. System trust
-roots are used. A URL supplies connection settings; explicit `-n`, `--user`,
+`--tls` enables certificate-verified TLS for `-h`/`-p` connections or upgrades
+an existing TCP URI without changing its host or port. System trust roots are
+used unless `--cacert FILE` or `--cacertdir DIR` supplies PEM CA certificates.
+Use `--cert FILE --key FILE` for a PEM client certificate chain and private key.
+These flags also work with `rediss://` URLs and TLS instances. `--insecure`
+explicitly disables certificate verification; verification is otherwise on.
+A URL supplies connection settings; explicit `-n`, `--user`,
 and `-a`/`REDISCLI_AUTH` override its database and credentials. `REDIS_URL` is
 also supported. Use `rmycli --help` for all options (`-h` selects the host).
 
@@ -46,9 +53,102 @@ Command-line arguments pass through as supplied by the operating system.
 Interactive and stdin input support single/double quotes, backslash escapes,
 and `\xHH` byte escapes. Suggestions round-trip through the same parser, so
 spaces, quotes, backslashes, NULs, and non-UTF-8 key bytes remain intact.
-Formatted output escapes terminal control sequences; `--raw` writes bulk
-reply bytes verbatim in noninteractive mode. Redis errors exit noninteractive
-mode with a nonzero status.
+Formatted output escapes terminal control sequences. Redirected stdout now
+uses raw output by default, like `redis-cli`; `--no-raw` restores formatted
+output. `--raw` writes reply bytes verbatim in noninteractive mode. Redis errors
+exit noninteractive mode with a nonzero status, with or without `-e`.
+
+## Familiar redis-cli options
+
+`rmycli --help` groups options by purpose and includes connection, scripting,
+TLS, and configuration examples. `-h` selects the host; help is `--help`.
+Options precede the command. Once a command starts, subsequent arguments pass
+through unchanged, including `-1`, `--raw`, and other option-looking values.
+Existing rmycli long names, including `--password`, remain supported.
+The names and core semantics follow the [Redis CLI reference][redis-cli].
+
+| Purpose | Supported redis-cli options |
+| --- | --- |
+| Connection | `-h`, `-p`, `-s`, `-u`, `-n`, `-t` |
+| Authentication | `-a`, `--pass`, `--user`, `--askpass`, `--no-auth-warning` |
+| Protocol and session | `-2`, `-3`, `--name`, `-c`, `--show-pushes yes/no` |
+| TLS | `--tls`, `--cacert`, `--cacertdir`, `--cert`, `--key`, `--insecure` |
+| Output | `--raw`, `--no-raw`, `--csv`, `--json`, `--quoted-json`, `-d`, `-D` |
+| Scripting | `-x`, `-X`, `--quoted-input`, `-r`, `-i`, `--eval`, `-e` |
+| Key listing | `--scan`, `--pattern`, `--quoted-pattern`, `--count` |
+| Information | `--help`, `--version`, `-v`, `--verbose` |
+
+```sh
+rmycli -3 --name maintenance -h localhost -p 6379
+rmycli --askpass --user alice
+rmycli --tls --cacert ca.pem --cert client.pem --key client.key
+rmycli --json HGETALL account:1
+rmycli -r 5 -i 0.5 INCR counter
+printf 'hello\n' | rmycli -x SET greeting
+rmycli -D '' --raw DUMP key > key.dump
+rmycli -X payload RESTORE key2 0 payload REPLACE < key.dump
+rmycli --quoted-input GET '"key\x00with-nul"'
+rmycli --eval script.lua key1 key2 , arg1 arg2
+rmycli --scan --pattern 'user:*' --count 100
+```
+
+- RESP2 remains the default. `-3` negotiates RESP3 on connection; `--json`
+  and `--quoted-json` also select RESP3 unless `-2` is given. `-2` and `-3`
+  together are rejected. Auxiliary connections use RESP2 independently.
+- `--pass`/`-a` takes precedence over `REDISCLI_AUTH`; `--askpass` overrides
+  every password source. The prompt requires terminal stdin and disables echo;
+  it cannot be combined with `-x`/`-X`. Use `REDISCLI_AUTH` with piped input.
+  Explicit command-line credentials produce a warning unless suppressed.
+- `-t` is a connection timeout in **seconds**, including fractions; `-t 0`
+  uses the OS timeout. Without `-t`, the existing `--timeout-ms` default of
+  1,000 ms applies. Auxiliary connections stay bounded by `--timeout-ms` even
+  with `-t 0`. Commands that intentionally block still have no read timeout.
+- `-x` appends all stdin bytes, including trailing newlines, as one argument.
+  `-X TAG` replaces the first argument matching TAG and rejects a missing tag
+  or replacement of the command name. `--quoted-input` decodes each supplied
+  argument separately, including `\xHH` escapes.
+- `-r N` repeats a command in noninteractive mode, with `-i` seconds between
+  executions. `-r 0` executes nothing; `-r -1` repeats until Ctrl-C.
+  `--eval FILE` sends `EVAL`, using the standalone comma to separate keys
+  from arguments; without a comma all trailing arguments are keys.
+- `-d` separates raw array elements and `-D` separates raw replies. Empty
+  delimiters are allowed. JSON preserves valid UTF-8; invalid UTF-8 falls back
+  to ASCII byte escapes. `--quoted-json` always represents byte escapes as
+  literal JSON strings. Nonfinite doubles become strings and nested errors
+  become objects so output remains valid JSON. CSV uses redis-cli's escaped
+  strings, rather than RFC 4180 quoting. The live editor always escapes
+  terminal control bytes, even with `--raw`; JSON and CSV work in the editor.
+- `--show-pushes` controls unsolicited RESP3 messages received during command
+  reads (default: on for terminal stdout). It does not hide Pub/Sub messages.
+  The editor does not poll the connection for pushes while idle.
+- `--scan` streams one SCAN batch at a time until cursor zero without retaining
+  the whole keyspace. Ctrl-C interrupts it; `-i` throttles requests. `--count`
+  is a Redis work hint, not a result limit. Like redis-cli, this explicit listing
+  may contain duplicates and is not a snapshot. It does not use the bounded
+  completion budgets and makes no unique-key-count claim.
+- `-c` follows up to five MOVED/ASK redirects, including ASKING before an ASK
+  retry. It preserves TLS, authentication, database, protocol, and client name.
+  It never retries network failures, or redirects while MULTI/WATCH is active.
+  Reconnecting to a redirected node does not restore other connection-local
+  state. Discovery and estimates cover only the currently connected node.
+  `-c` cannot be combined with `-s`.
+
+### Deliberately omitted and currently unsupported options
+
+Use `redis-cli` for its separate administration and diagnostic tools:
+`--cluster` and its sub-options; `--replica`/`--slave`, `--rdb`,
+`--functions-rdb`; `--pipe`/`--pipe-timeout`; `--stat`, `--latency*`,
+`--intrinsic-latency`, `--lru-test`, `--vset-recall*`; `--bigkeys`, `--memkeys*`,
+`--keystats*`, `--hotkeys` and their `--cursor`/`--top` modifiers; and
+`--ldb`/`--ldb-sync-mode`. These are distinct workflows beyond the interactive
+shell and ordinary command execution.
+
+Address-family selection (`-4`/`-6`), a separate `--sni`, `--tls-ciphers`, and
+`--tls-ciphersuites` are also currently unsupported: the synchronous redis-rs
+transport does not expose those controls. TLS uses the connection hostname for
+SNI and rustls cipher defaults. Unsupported switches before the command fail
+with a usage error; they are never accepted as no-ops. Full option parity is
+not claimed.
 
 ## Configuration and saved instances
 
@@ -106,7 +206,7 @@ the latter reads the password from that variable when the instance is selected.
 A missing password variable is an error unless a higher-priority password is
 provided. Protect a file containing passwords with owner-only permissions.
 
-Explicit `-h`, `-p`, `-n`, `--user`, and `-a` override the selected instance's
+Explicit `-h`, `-p`, `-n`, `--user`, and `-a`/`--pass` override the selected instance's
 values. `REDISCLI_AUTH` overrides its password too; `-a` takes precedence over
 that environment variable. `--tls` can enable TLS on an instance. `--instance`
 cannot be combined with `-u`/`REDIS_URL` or `-s`; unset `REDIS_URL` before
@@ -345,8 +445,8 @@ Closing the socket cannot undo a command the server has already executed.
 - Some partial commands are intrinsically ambiguous: after `XREAD STREAMS k`,
   the next word could be another key or the first ID. Suggestions are advisory,
   not command validation. Unrecognized option ordering may reduce argument hints.
-- A scan describes only the connected node and database. Redis Cluster routing,
-  redirection following, and cluster-wide discovery are not implemented.
+- A scan describes only the connected node and database. `-c` follows command
+  redirects; slot-map routing and cluster-wide discovery are not implemented.
   Even a completed SCAN is not a snapshot of a changing keyspace.
 - Pub/Sub and MONITOR replies stream to the transcript. In interactive streaming
   mode, Ctrl-C ends the stream; reconnect before submitting further commands.
@@ -354,8 +454,8 @@ Closing the socket cannot undo a command the server has already executed.
 - History is bounded and displayed output is released by the application, but
   command replies are decoded in memory before display. The `LRANGE` estimate
   is not a general reply-memory cap.
-- No persistent history, SSH tunnels, custom TLS certificate flags, or full
-  `redis-cli` option compatibility is claimed by this version.
+- No persistent history, SSH tunnels, or full `redis-cli` option compatibility
+  is claimed by this version. See the option compatibility section above.
 
 ## Development
 
@@ -394,3 +494,5 @@ See [AGENTS.md](AGENTS.md), [CHANGELOG.md](CHANGELOG.md), and the bundled help's
 
 [command]: https://redis.io/docs/latest/commands/command/
 [command-docs]: https://redis.io/docs/latest/commands/command-docs/
+
+[redis-cli]: https://redis.io/docs/latest/develop/tools/cli/

@@ -8,15 +8,42 @@ use crate::input::quote;
 pub struct Config {
     pub info: ConnectionInfo,
     pub timeout: Duration,
+    pub connect_timeout: Option<Duration>,
+    pub name: Option<String>,
+    pub cluster: bool,
+    pub output: crate::output::Options,
+    pub show_pushes: bool,
 }
 
 impl Config {
     pub fn connect(&self, auxiliary: bool) -> RedisResult<Connection> {
-        let client = Client::open(self.info.clone())?;
-        let connection = client.get_connection_with_timeout(self.timeout)?;
+        let mut info = self.info.clone();
+        if auxiliary {
+            info.redis.protocol = redis::ProtocolVersion::RESP2;
+        }
+        let client = Client::open(info)?;
+        let timeout = if auxiliary {
+            Some(
+                self.connect_timeout
+                    .map_or(self.timeout, |timeout| timeout.min(self.timeout)),
+            )
+        } else {
+            self.connect_timeout
+        };
+        let mut connection = if let Some(timeout) = timeout {
+            client.get_connection_with_timeout(timeout)?
+        } else {
+            client.get_connection()?
+        };
         connection.set_write_timeout(Some(self.timeout))?;
         // User commands may intentionally block. Auxiliary work has a timeout.
         connection.set_read_timeout(auxiliary.then_some(self.timeout))?;
+        if !auxiliary && let Some(name) = &self.name {
+            redis::cmd("CLIENT")
+                .arg("SETNAME")
+                .arg(name)
+                .query::<()>(&mut connection)?;
+        }
         Ok(connection)
     }
 }
@@ -54,7 +81,45 @@ impl Session {
         !self.transaction && !self.watched && !self.streaming
     }
 
+    #[cfg(test)]
     pub fn execute(&mut self, args: &[Vec<u8>]) -> RedisResult<Value> {
+        self.execute_with_push(args, |_| {})
+    }
+
+    pub fn execute_with_push(
+        &mut self,
+        args: &[Vec<u8>],
+        mut push: impl FnMut(&Value),
+    ) -> RedisResult<Value> {
+        for redirects in 0..=5 {
+            let can_redirect = self.assistance_allowed();
+            let result = self.execute_once(args, &mut push);
+            let Err(error) = &result else {
+                return result;
+            };
+            if !self.config.cluster || !can_redirect || redirects == 5 {
+                return result;
+            }
+            let Some((target, _)) = error.redirect_node() else {
+                return result;
+            };
+            let mut config = self.config.clone();
+            redirect_address(&mut config.info.addr, target)?;
+            let mut connection = config.connect(false)?;
+            if error.kind() == redis::ErrorKind::Ask {
+                redis::cmd("ASKING").query::<()>(&mut connection)?;
+            }
+            self.connection = connection;
+            self.config = config;
+        }
+        unreachable!("the last redirect returns its error")
+    }
+
+    fn execute_once(
+        &mut self,
+        args: &[Vec<u8>],
+        push: &mut impl FnMut(&Value),
+    ) -> RedisResult<Value> {
         let subscription =
             [b"SUBSCRIBE".as_slice(), b"PSUBSCRIBE", b"SSUBSCRIBE"]
                 .iter()
@@ -65,7 +130,9 @@ impl Session {
             .and_then(|()| {
                 loop {
                     match self.connection.recv_response()? {
-                        Value::Push { .. } if !subscription => {}
+                        value @ Value::Push { .. } if !subscription => {
+                            push(&value);
+                        }
                         Value::ServerError(error) => break Err(error.into()),
                         value => break Ok(value),
                     }
@@ -119,8 +186,34 @@ impl Session {
                 }
             }
             "AUTH" => self.update_auth(&args[1..]),
+            "CLIENT"
+                if args.get(1).is_some_and(|arg| {
+                    arg.eq_ignore_ascii_case(b"SETNAME")
+                }) =>
+            {
+                self.config.name = args
+                    .get(2)
+                    .map(|arg| String::from_utf8_lossy(arg).into_owned());
+            }
             "HELLO" => {
-                // Auxiliary connections keep RESP2 independently of the main protocol.
+                if let Some(index) = args
+                    .iter()
+                    .position(|arg| arg.eq_ignore_ascii_case(b"SETNAME"))
+                {
+                    self.config.name = args
+                        .get(index + 1)
+                        .map(|arg| String::from_utf8_lossy(arg).into_owned());
+                }
+                if let Some(protocol) = args.get(1) {
+                    if protocol == b"3" {
+                        self.config.info.redis.protocol =
+                            redis::ProtocolVersion::RESP3;
+                    }
+                    if protocol == b"2" {
+                        self.config.info.redis.protocol =
+                            redis::ProtocolVersion::RESP2;
+                    }
+                }
                 if let Some(index) =
                     args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH"))
                     && let Some(auth) = args.get(index + 1..index + 3)
@@ -130,6 +223,8 @@ impl Session {
             }
             "RESET" => {
                 self.config.info.redis.db = 0;
+                self.config.info.redis.protocol = redis::ProtocolVersion::RESP2;
+                self.config.name = None;
                 self.config.info.redis.username = None;
                 self.config.info.redis.password = None;
                 self.transaction = false;
@@ -158,6 +253,40 @@ impl Session {
         self.config.info.redis.username = user;
         self.config.info.redis.password =
             Some(String::from_utf8_lossy(password).into_owned());
+    }
+}
+
+fn redirect_address(
+    addr: &mut redis::ConnectionAddr,
+    target: &str,
+) -> RedisResult<()> {
+    use redis::{ConnectionAddr, ErrorKind, RedisError};
+    let invalid = || {
+        RedisError::from((
+            ErrorKind::ResponseError,
+            "invalid cluster redirect address",
+        ))
+    };
+    let (host, port) = target.rsplit_once(':').ok_or_else(invalid)?;
+    let port = port.parse::<u16>().map_err(|_| invalid())?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match addr {
+        ConnectionAddr::Tcp(current, current_port)
+        | ConnectionAddr::TcpTls {
+            host: current,
+            port: current_port,
+            ..
+        } => {
+            if !host.is_empty() {
+                host.clone_into(current);
+            }
+            *current_port = port;
+            Ok(())
+        }
+        ConnectionAddr::Unix(_) => Err(RedisError::from((
+            ErrorKind::ResponseError,
+            "cannot follow a cluster redirect from a Unix socket",
+        ))),
     }
 }
 
@@ -210,5 +339,151 @@ pub fn format_reply(value: &Value) -> Vec<String> {
             "(error) {}",
             quote(format!("{error:?}").as_bytes())
         )],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+
+    fn server(
+        mut reply: impl FnMut(&[String]) -> Vec<u8> + Send + 'static,
+    ) -> (u16, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut parser = redis::Parser::new();
+            while let Ok(value) = parser.parse_value(&mut reader) {
+                let args: Vec<String> =
+                    redis::from_redis_value(&value).unwrap();
+                let response = if args[0] == "CLIENT" {
+                    b"+OK\r\n".to_vec()
+                } else {
+                    reply(&args)
+                };
+                reader.get_mut().write_all(&response).unwrap();
+            }
+        });
+        (port, thread)
+    }
+
+    fn config(port: u16) -> Config {
+        use redis::IntoConnectionInfo;
+        Config {
+            info: ("127.0.0.1", port).into_connection_info().unwrap(),
+            timeout: Duration::from_secs(1),
+            connect_timeout: Some(Duration::from_secs(1)),
+            name: None,
+            cluster: true,
+            output: crate::output::Options::default(),
+            show_pushes: true,
+        }
+    }
+
+    #[test]
+    fn moved_and_ask_follow_redirects_and_keep_command_bytes() {
+        for kind in ["MOVED", "ASK"] {
+            let mut asking = false;
+            let (port, target) = server(move |args| {
+                if args[0] == "ASKING" {
+                    asking = true;
+                    return b"+OK\r\n".to_vec();
+                }
+                assert_eq!(args, &["GET", "key"]);
+                assert_eq!(asking, kind == "ASK");
+                b"$5\r\nvalue\r\n".to_vec()
+            });
+            let (source_port, source) = server(move |_| {
+                format!("-{kind} 1 127.0.0.1:{port}\r\n").into_bytes()
+            });
+            let mut session = Session::open(config(source_port)).unwrap();
+            assert_eq!(
+                session
+                    .execute(&[b"GET".to_vec(), b"key".to_vec()])
+                    .unwrap(),
+                Value::BulkString(b"value".to_vec())
+            );
+            assert_eq!(
+                session.config.info.addr,
+                redis::ConnectionAddr::Tcp("127.0.0.1".into(), port)
+            );
+            drop(session);
+            source.join().unwrap();
+            target.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn redirects_never_replay_watched_or_transactional_commands() {
+        for (state, command) in [
+            ("WATCH", "GET"),
+            ("MULTI", "GET"),
+            ("MULTI", "EXEC"),
+            ("disabled", "GET"),
+        ] {
+            let (port, server) =
+                server(|_| b"-MOVED 1 127.0.0.1:1\r\n".to_vec());
+            let mut session = Session::open(config(port)).unwrap();
+            session.watched = state == "WATCH";
+            session.transaction = state == "MULTI";
+            session.config.cluster = state != "disabled";
+            let error =
+                session.execute(&[command.as_bytes().to_vec()]).unwrap_err();
+            assert_eq!(error.kind(), redis::ErrorKind::Moved);
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn pushes_do_not_consume_the_command_reply() {
+        let (port, server) = server(|_| {
+            b">2\r\n+invalidate\r\n*1\r\n$3\r\nkey\r\n+PONG\r\n".to_vec()
+        });
+        let mut session = Session::open(config(port)).unwrap();
+        let mut pushes = Vec::new();
+        let reply = session
+            .execute_with_push(&[b"PING".to_vec()], |value| {
+                pushes.push(value.clone());
+            })
+            .unwrap();
+        assert_eq!(reply, Value::SimpleString("PONG".into()));
+        assert_eq!(pushes.len(), 1);
+        let mut output = Vec::new();
+        session
+            .config
+            .output
+            .write(&mut output, &pushes[0], false)
+            .unwrap();
+        assert_eq!(output, b"invalidate\nkey\n");
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirect_addresses_preserve_tls_and_support_ipv6_and_empty_hosts() {
+        let mut addr = redis::ConnectionAddr::TcpTls {
+            host: "old".into(),
+            port: 1,
+            insecure: false,
+            tls_params: None,
+        };
+        redirect_address(&mut addr, "[::1]:6380").unwrap();
+        assert!(
+            matches!(&addr, redis::ConnectionAddr::TcpTls { host, port: 6380, insecure: false, .. } if host == "::1")
+        );
+        redirect_address(&mut addr, ":6381").unwrap();
+        assert!(
+            matches!(&addr, redis::ConnectionAddr::TcpTls { host, port: 6381, .. } if host == "::1")
+        );
+        assert!(redirect_address(&mut addr, "host:not-a-port").is_err());
     }
 }

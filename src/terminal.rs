@@ -1327,6 +1327,11 @@ mod tests {
             config: Config {
                 info: ("localhost", 6379).into_connection_info().unwrap(),
                 timeout: Duration::from_secs(1),
+                connect_timeout: Some(Duration::from_secs(1)),
+                name: None,
+                cluster: false,
+                output: crate::output::Options::default(),
+                show_pushes: false,
             },
             client_id: None,
             mode: Mode::Ready,

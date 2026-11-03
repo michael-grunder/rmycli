@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Match redis-cli's raw-output default when stdout is redirected; `--no-raw`
+  retains human-readable output. Raw integers, maps, nils, and delimiters now
+  work consistently for scripting.
+
 - Bound command history with a ring buffer and avoid reparsing the input line
   twice when computing completion context.
 
@@ -33,6 +37,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Omit the database suffix from the prompt and transcript for database zero.
 
 ### Added
+
+- Redis-cli-compatible RESP2/RESP3 selection, password aliases and hidden
+  password prompting, connection timeout in seconds, client names, and bounded
+  MOVED/ASK redirect following outside transactions and WATCH.
+- TLS CA files/directories, client certificates and keys, and explicit
+  `--insecure`, including support alongside connection URLs and saved instances.
+- Binary stdin arguments (`-x`/`-X`), quoted input, command repetition and delays,
+  Lua files with key/argument separation, and streaming SCAN with glob filters.
+- CSV, JSON, ASCII-safe JSON, raw reply delimiters, RESP3 push display controls,
+  verbose connection status, and familiar version/error-status switches.
+- Grouped `--help` with practical examples and documented compatibility limits;
+  isolated CLI, TLS, and redirect regression tests.
 
 - Interactive `CLEAR` command (case insensitive) to clear the screen
   locally, like Ctrl-L, without changing the Redis session.

@@ -195,6 +195,44 @@ def config_terminal_output(path, *args, no_color=None):
     return data
 
 
+def password_prompt(socket, cancel=False):
+    """Verify --askpass hides input and restores terminal echo on both paths."""
+    master, slave = pty.openpty()
+    original = termios.tcgetattr(slave)
+    env = {k: v for k, v in os.environ.items() if k != "REDIS_URL"}
+    env["REDISCLI_AUTH"] = "wrong-environment-password"
+    process = subprocess.Popen(
+        [str(BINARY), "--no-config", "-s", socket, "--askpass", "--user",
+         "ask-test", "-a", "wrong-flag-password", "PING"],
+        stdin=slave, stdout=slave, stderr=slave, env=env,
+    )
+    data = b""
+    try:
+        deadline = time.monotonic() + 5
+        while b"Password:" not in data:
+            assert time.monotonic() < deadline, "missing password prompt"
+            if select.select([master], [], [], 0.1)[0]:
+                data += os.read(master, 65536)
+        while termios.tcgetattr(slave)[3] & termios.ECHO:
+            assert time.monotonic() < deadline, "password echo was not disabled"
+            time.sleep(0.01)
+        os.write(master, b"\x03" if cancel else b"hidden-test-password\r")
+        process.wait(timeout=5)
+        while select.select([master], [], [], 0)[0]:
+            data += os.read(master, 65536)
+        assert b"hidden-test-password" not in data, data
+        assert b"wrong-flag-password" not in data, data
+        assert bool(termios.tcgetattr(slave)[3] & termios.ECHO) == bool(original[3] & termios.ECHO)
+        assert process.returncode == (1 if cancel else 0), data
+        assert (b"cancelled" if cancel else b"PONG") in data, data
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(slave)
+        os.close(master)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="rmycli-terminal-") as directory:
         settings_path = Path(directory) / "preview.toml"
@@ -242,7 +280,11 @@ def main():
             assert cli("--yes", "--reply-threshold", "1", "LRANGE", "list:a", "0", "-1").returncode == 0
             assert b"PONG" in cli(stdin=b"MULTI\nPING\nEXEC\n").stdout
 
-            bottom = Terminal(socket, start_row=34)
+            redis("ACL", "SETUSER", "ask-test", "on", ">hidden-test-password", "~*", "+@all")
+            password_prompt(socket)
+            password_prompt(socket, cancel=True)
+
+            bottom = Terminal(socket, "-3", start_row=34)
             terminals.append(bottom)
             bottom.send(b"\x1bOP")  # F1 at the bottom of the terminal.
             frame = bottom.expect_frame(
@@ -372,7 +414,7 @@ def main():
             second.send(b"\x1b\x15PING\r")
             second.expect("PONG")
 
-            third = Terminal(socket, "--scan-max-batches", "0")
+            third = Terminal(socket, "-3", "--scan-max-batches", "0")
             terminals.append(third)
             third.send(b"LRANGE list:\t")
             third.expect("at least 0 matches (partial scan)")
