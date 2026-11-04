@@ -53,6 +53,8 @@ impl RedisFixture {
             child,
             path,
             config: Config {
+                auth_store: None,
+                binary_auth: false,
                 info,
                 tls: None,
                 timeout: Duration::from_millis(300),
@@ -700,4 +702,179 @@ fn tls_has_a_crypto_provider() {
     let _ = rustls::ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn authentication_reloads_metadata_and_defers_refresh_during_watch() {
+    use crate::worker::{Event, Workers};
+    let fixture = RedisFixture::new();
+    let mut admin = fixture.connection();
+    redis::cmd("CONFIG")
+        .arg(&["SET", "requirepass", "secret"])
+        .query::<()>(&mut admin)
+        .unwrap();
+    redis::cmd("ACL")
+        .arg(&[
+            "SETUSER", "limited", "on", ">secret", "~*", "+@all", "-command",
+        ])
+        .query::<()>(&mut admin)
+        .unwrap();
+    let session = Session::open(fixture.config.clone()).await.unwrap();
+    let workers = Workers::start(session);
+    let Event::Connected { catalog, .. } =
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+    else {
+        panic!("expected startup catalog")
+    };
+    assert_eq!(catalog.notices.len(), 1);
+    assert!(catalog.notices[0].contains("Authentication required"));
+    assert!(!catalog.commands["GET"].live_docs);
+    assert!(
+        worker_command(&workers, "AUTH wrong")[0]
+            .contains("invalid username-password")
+    );
+    assert!(workers.events.try_recv().is_err());
+    for command in ["AUTH secret", "HELLO 3 AUTH default secret"] {
+        worker_command(&workers, command);
+        let Event::Connected {
+            catalog,
+            client_id,
+            config,
+        } = workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected refreshed catalog")
+        };
+        assert!(catalog.notices.is_empty(), "{:?}", catalog.notices);
+        assert!(catalog.commands["GET"].live_docs);
+        assert!(client_id.is_some());
+        assert_eq!(
+            redis::cmd("PING")
+                .query::<String>(&mut config.connect_auxiliary().unwrap())
+                .unwrap(),
+            "PONG"
+        );
+    }
+    worker_command(&workers, "WATCH key");
+    worker_command(&workers, "AUTH limited secret");
+    worker_command(&workers, "PING");
+    worker_command(&workers, "UNWATCH");
+    let Event::Connected { catalog, .. } =
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+    else {
+        panic!("expected deferred catalog")
+    };
+    assert!(!catalog.commands["GET"].live_docs);
+    assert!(
+        catalog
+            .notices
+            .iter()
+            .any(|notice| notice.contains("COMMAND unavailable"))
+    );
+    assert!(
+        !catalog
+            .notices
+            .iter()
+            .any(|notice| notice.contains("Authentication required"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn only_successful_authentication_is_saved_including_exec_and_hello() {
+    use crate::auth::{SaveAuth, Store};
+    let fixture = RedisFixture::new();
+    let mut admin = fixture.connection();
+    redis::cmd("ACL")
+        .arg(&["SETUSER", "alice", "on", ">AUTH", "~*", "+@all"])
+        .query::<()>(&mut admin)
+        .unwrap();
+    let path = fixture.path.join("auth.toml");
+    let mut config = fixture.config.clone();
+    config.auth_store = Some(Store {
+        path: path.clone(),
+        policy: SaveAuth::Local,
+    });
+    let mut session = Session::open(config).await.unwrap();
+    assert!(!path.exists());
+    let args = input::parse("AUTH alice wrong")
+        .words
+        .into_iter()
+        .map(|word| word.bytes)
+        .collect::<Vec<_>>();
+    assert!(session.execute(&args).await.is_err());
+    assert_eq!(session.auth_revision, 0);
+    assert!(!path.exists());
+    execute(&mut session, "MULTI").await;
+    execute(&mut session, "AUTH alice AUTH").await;
+    assert!(!path.exists());
+    execute(&mut session, "DISCARD").await;
+    assert!(!path.exists());
+    execute(&mut session, "MULTI").await;
+    execute(&mut session, "AUTH alice AUTH").await;
+    execute(&mut session, "EXEC").await;
+    assert_eq!(session.auth_revision, 1);
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(before.contains("alice"));
+    execute(&mut session, "HELLO 3 SETNAME AUTH AUTH alice AUTH").await;
+    assert_eq!(session.auth_revision, 2);
+    assert_eq!(session.config.name.as_deref(), Some("AUTH"));
+    assert_eq!(
+        session.config.info.redis_settings().username(),
+        Some("alice")
+    );
+    assert_eq!(
+        session.config.info.redis_settings().password(),
+        Some("AUTH")
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    execute(&mut session, "HELLO 3 SETNAME AUTH").await;
+    assert_eq!(session.auth_revision, 2);
+    execute(&mut session, "RESET").await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    assert!(session.config.info.redis_settings().password().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn failed_saves_and_binary_credentials_do_not_break_authentication() {
+    use crate::auth::{SaveAuth, Store};
+    let fixture = RedisFixture::new();
+    let mut admin = fixture.connection();
+    redis::cmd("ACL")
+        .arg(&["SETUSER", "alice", "on", ">secret", "~*", "+@all"])
+        .arg(b">\xff")
+        .query::<()>(&mut admin)
+        .unwrap();
+    let path = fixture.path.join("auth.toml");
+    std::fs::write(&path, "[broken").unwrap();
+    let mut config = fixture.config.clone();
+    config.auth_store = Some(Store {
+        path: path.clone(),
+        policy: SaveAuth::Always,
+    });
+    let mut session = Session::open(config).await.unwrap();
+    execute(&mut session, "AUTH alice secret").await;
+    assert!(
+        session
+            .notices
+            .pop()
+            .unwrap()
+            .contains("could not be saved")
+    );
+    assert_eq!(
+        execute(&mut session, "PING").await,
+        Value::SimpleString("PONG".into())
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[broken");
+    std::fs::remove_file(&path).unwrap();
+    session
+        .execute(&[b"AUTH".to_vec(), b"alice".to_vec(), vec![0xff]])
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    assert!(session.config.info.redis_settings().password().is_none());
+    assert!(session.config.connect_auxiliary().is_err());
+    assert!(Session::open(session.config.clone()).await.is_err());
+    assert_eq!(
+        execute(&mut session, "PING").await,
+        Value::SimpleString("PONG".into())
+    );
 }

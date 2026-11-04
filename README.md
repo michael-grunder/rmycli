@@ -190,7 +190,8 @@ Settings are read once at startup from the first available file, in this order:
    `/etc/xdg`). Relative directory entries are ignored.
 
 Use `--config /path/to/settings.toml` to select a file explicitly, or
-`--no-config` to use built-in settings. Files are not merged. Missing discovered
+`--no-config` to use built-in settings and ignore saved authentication. Files are
+not merged. Missing discovered
 files are skipped; a missing explicit file, unreadable file, malformed TOML,
 unknown setting, or invalid value causes an error before connecting. No file is
 created during normal startup. `--help` and `--version` work without loading
@@ -242,6 +243,79 @@ that environment variable. `--tls` can enable TLS on an instance. `--instance`
 cannot be combined with `-u`/`REDIS_URL` or `-s`; unset `REDIS_URL` before
 selecting an instance. Without `--instance`, connection behavior is unchanged.
 Connection timeouts and discovery/reply limits remain command-line options.
+
+### Saved server authentication
+
+When a server requires authentication, the interactive shell says so and uses
+bundled metadata until you authenticate with `AUTH password`,
+`AUTH username password`, or `HELLO 3 AUTH username password`. Successful
+authentication reloads `COMMAND` and `COMMAND DOCS` for completions and help,
+and supplies credentials to background connections. Failed authentication does
+not refresh metadata or save credentials. Refresh waits until MULTI/WATCH ends;
+queued authentication is applied only when EXEC reports it succeeded. Servers
+that deny introspection through ACLs still use bundled metadata.
+
+Credentials can be kept separately in `$XDG_CONFIG_HOME/rmycli-auth.toml`
+(normally `~/.config/rmycli-auth.toml`). This user-only lookup also applies when
+`--config` selects a different main settings file. Add server stanzas manually:
+
+```toml
+[servers."redis://127.0.0.1:7000"]
+# Omit user for password-only authentication.
+user = "default"
+password = "replace-me"
+
+[servers."rediss://redis.example.com:6379"]
+user = "alice"
+password = "replace-me-too"
+
+# Other endpoint forms:
+# [servers."redis://[::1]:6379"]
+# password = "ipv6-password"
+# [servers."unix:/absolute/path/to/redis.sock"]
+# password = "socket-password"
+```
+
+Entries match the transport, hostname, and port (or socket path) exactly, with
+no wildcard or DNS alias matching. Use lowercase hostnames without a trailing
+dot and include the port; databases share credentials. `localhost` and
+`127.0.0.1` are separate entries, as are TLS and plain TCP. Socket paths match
+as supplied. Each endpoint stores one account. Existing URL, instance, CLI,
+environment, and `--askpass` passwords take precedence over saved credentials.
+An explicit username uses the saved password only if the account matches.
+`--no-config` disables both reading and writing this file.
+
+Automatic saving is **disabled by default**. Set the top-level `save-auth` in
+the main `rmycli.toml`, before any table headings:
+
+```toml
+save-auth = false     # Default: never save automatically.
+# save-auth = "local"  # Save only for localhost, loopback IPs, or Unix sockets.
+# save-auth = "always" # Save for every server.
+```
+
+Alternatively, run `rmycli config set save-auth local`. Use `false` or `always`
+to select the other policies, or `rmycli config unset save-auth` to restore the
+default. TOML requires quotes around `"local"` and `"always"`.
+
+Saving applies after successful connection-time authentication and successful
+AUTH/HELLO AUTH commands, including stdin commands. It updates that endpoint's
+credentials while retaining other server entries. `local` recognizes
+`localhost`, IPv4/IPv6 loopback addresses, and Unix sockets; it does not resolve
+arbitrary hostnames or include private network addresses. Changing the policy
+to `false` stops future saves but still reads existing entries. Delete an entry
+to forget it; RESET does not delete saved credentials.
+
+Passwords are stored as **plaintext**. Protect manually created auth files with
+`chmod 600 ~/.config/rmycli-auth.toml`. Automatic writes replace files atomically
+with owner-only permissions on Unix and follow existing symlinks. Invalid files
+are reported without echoing their contents and are never overwritten. A save
+failure leaves the authenticated connection usable and prints a warning.
+Concurrent saves use a short-lived `.toml.lock` file; a conflicting save warns
+instead of overwriting another writer. If a process crashes during a save,
+remove its stale lock after ensuring no other process is saving. Binary,
+non-UTF-8 credentials execute unchanged but cannot be saved or reused by
+background connections or reconnects.
 
 The theme controls the foreground color of inline argument hints. Command
 names are case insensitive, with whitespace normalized; a subcommand's color

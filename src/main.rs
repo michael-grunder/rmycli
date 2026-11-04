@@ -1,5 +1,6 @@
 #![warn(clippy::all, clippy::nursery, clippy::pedantic)]
 
+mod auth;
 mod batch;
 mod cli;
 mod config;
@@ -65,13 +66,27 @@ async fn run(
         options.settings.no_config,
     )?;
     let args = batch::stdin_command(options)?;
-    let config = options.config(&settings)?;
+    let mut config = options.config(&settings)?;
+    if !options.settings.no_config {
+        config.auth_store = auth::Store::discover(settings.save_auth);
+        if let Some(store) = &config.auth_store {
+            store.apply(&mut config.info).map_err(|error| {
+                format!(
+                    "cannot load auth file {}: {error}",
+                    store.path.display()
+                )
+            })?;
+        }
+    }
     if explicit_credentials && !options.no_auth_warning && !options.askpass {
         eprintln!(
             "Warning: command-line passwords may be visible to other users. Prefer REDISCLI_AUTH or --askpass."
         );
     }
     let mut session = Session::open(config).await?;
+    for notice in session.notices.drain(..) {
+        eprintln!("{notice}");
+    }
     if options.verbose {
         eprintln!(
             "Connected to {} (database {}, {:?})",
@@ -156,6 +171,9 @@ async fn batch_command(
             }
         })
         .await?;
+    for notice in session.notices.drain(..) {
+        eprintln!("{notice}");
+    }
     if let Some(error) = output_error {
         return Err(error.into());
     }

@@ -6,6 +6,8 @@ use crate::input::quote;
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub auth_store: Option<crate::auth::Store>,
+    pub binary_auth: bool,
     pub info: ConnectionInfo,
     pub tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     pub timeout: Duration,
@@ -17,7 +19,19 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn check_auth(&self) -> RedisResult<()> {
+        if self.binary_auth {
+            return Err((
+                redis::ErrorKind::Client,
+                "Binary credentials cannot be reused on another connection",
+            )
+                .into());
+        }
+        Ok(())
+    }
+
     pub fn connect_auxiliary(&self) -> RedisResult<Connection> {
+        self.check_auth()?;
         let info = self.info.clone().set_redis_settings(
             self.info
                 .redis_settings()
@@ -49,19 +63,25 @@ pub struct Session {
     pub transaction: bool,
     pub watched: bool,
     pub streaming: bool,
+    pub auth_revision: u64,
+    pub notices: Vec<String>,
     queued: Vec<Vec<Vec<u8>>>,
 }
 
 impl Session {
     pub async fn open(config: Config) -> RedisResult<Self> {
-        Ok(Self {
+        let mut session = Self {
             connection: crate::transport::Connection::open(&config).await?,
             config,
             transaction: false,
             watched: false,
             streaming: false,
+            auth_revision: 0,
+            notices: Vec::new(),
             queued: Vec::new(),
-        })
+        };
+        session.save_auth();
+        Ok(session)
     }
 
     pub const fn assistance_allowed(&self) -> bool {
@@ -205,6 +225,8 @@ impl Session {
             }
             "HELLO" => self.observe_hello(args),
             "RESET" => {
+                self.auth_revision += 1;
+                self.config.binary_auth = false;
                 self.config.info =
                     self.config.info.clone().set_redis_settings(
                         redis::RedisConnectionInfo::default(),
@@ -224,14 +246,6 @@ impl Session {
     }
 
     fn observe_hello(&mut self, args: &[Vec<u8>]) {
-        if let Some(index) = args
-            .iter()
-            .position(|arg| arg.eq_ignore_ascii_case(b"SETNAME"))
-        {
-            self.config.name = args
-                .get(index + 1)
-                .map(|arg| String::from_utf8_lossy(arg).into_owned());
-        }
         if let Some(protocol) = args.get(1) {
             if protocol == b"3" {
                 self.config.info = self.config.info.clone().set_redis_settings(
@@ -252,33 +266,68 @@ impl Session {
                 );
             }
         }
-        if let Some(index) =
-            args.iter().position(|a| a.eq_ignore_ascii_case(b"AUTH"))
-            && let Some(auth) = args.get(index + 1..index + 3)
-        {
+        let mut options = args.get(2..).unwrap_or_default();
+        let mut auth = None;
+        while let Some(option) = options.first() {
+            if option.eq_ignore_ascii_case(b"AUTH") && options.len() >= 3 {
+                auth = Some(&options[1..3]);
+                options = &options[3..];
+            } else if option.eq_ignore_ascii_case(b"SETNAME")
+                && options.len() >= 2
+            {
+                self.config.name =
+                    Some(String::from_utf8_lossy(&options[1]).into_owned());
+                options = &options[2..];
+            } else {
+                break;
+            }
+        }
+        if let Some(auth) = auth {
             self.update_auth(auth);
         }
     }
 
     fn update_auth(&mut self, auth: &[Vec<u8>]) {
-        // Redis connection credentials are UTF-8. Binary AUTH still executes,
-        // but auxiliary authentication will fail gracefully for such accounts.
         let (user, password) = match auth {
             [password] => (None, password),
-            [user, password] => {
-                (Some(String::from_utf8_lossy(user).into_owned()), password)
-            }
+            [user, password] => (Some(user.as_slice()), password),
             _ => return,
         };
-        let mut settings = redis::RedisConnectionInfo::default()
+        self.auth_revision += 1;
+        self.config.binary_auth = true;
+        let settings = redis::RedisConnectionInfo::default()
             .set_db(self.config.info.redis_settings().db())
-            .set_protocol(self.config.info.redis_settings().protocol())
-            .set_password(String::from_utf8_lossy(password));
+            .set_protocol(self.config.info.redis_settings().protocol());
+        self.config.info = self
+            .config
+            .info
+            .clone()
+            .set_redis_settings(settings.clone());
+        // Never persist a lossy conversion of successfully submitted bytes.
+        let Ok(password) = std::str::from_utf8(password) else {
+            self.notices.push("Binary credentials cannot be reused for background requests, reconnects, or saved authentication.".into());
+            return;
+        };
+        let Ok(user) = user.map(std::str::from_utf8).transpose() else {
+            self.notices.push("Binary credentials cannot be reused for background requests, reconnects, or saved authentication.".into());
+            return;
+        };
+        let mut settings = settings.set_password(password);
         if let Some(user) = user {
             settings = settings.set_username(user);
         }
         self.config.info =
             self.config.info.clone().set_redis_settings(settings);
+        self.config.binary_auth = false;
+        self.save_auth();
+    }
+
+    fn save_auth(&mut self) {
+        if let Some(store) = &self.config.auth_store
+            && let Err(error) = store.save(&self.config.info)
+        {
+            self.notices.push(format!("Authentication succeeded, but credentials could not be saved: {error}"));
+        }
     }
 }
 
@@ -413,6 +462,8 @@ mod tests {
     fn config(port: u16) -> Config {
         use redis::IntoConnectionInfo;
         Config {
+            auth_store: None,
+            binary_auth: false,
             info: ("127.0.0.1", port).into_connection_info().unwrap(),
             tls: None,
             timeout: Duration::from_secs(1),

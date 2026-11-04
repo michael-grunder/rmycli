@@ -570,6 +570,7 @@ impl App {
                 config,
                 client_id,
             } => {
+                self.invalidate();
                 self.log(catalog.notices.clone());
                 self.status.clear();
                 self.busy_until = None;
@@ -1453,6 +1454,8 @@ mod tests {
                 generation: Arc::new(AtomicU64::new(0)),
             },
             config: Config {
+                auth_store: None,
+                binary_auth: false,
                 tls: None,
                 info: ("localhost", 6379).into_connection_info().unwrap(),
                 timeout: Duration::from_secs(1),

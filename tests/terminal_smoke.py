@@ -74,7 +74,7 @@ class Frame:
 
 
 class Terminal:
-    def __init__(self, socket, *options, env=None, start_row=7):
+    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         connection = ["-s", socket] if socket else []
@@ -100,7 +100,11 @@ class Terminal:
         assert b"Connected" not in self.screen_data
         assert b"Tab: complete" not in self.screen_data
         frame = Frame(self.screen_data, self.height, self.start_row)
-        assert frame.y == start_row
+        if startup_notice:
+            self.expect(startup_notice)
+            assert b"COMMAND unavailable" not in self.screen_data
+        else:
+            assert frame.y == start_row
         assert frame.row(start_row - 1) == "previous shell output"
 
     def read(self):
@@ -464,7 +468,7 @@ def main():
                 f'port = {port}\nuser = "qa"\n'
                 'password-env = "RMYCLI_QA_AUTH"\n',
             )
-            auth_env = {"RMYCLI_QA_AUTH": "qa-test-secret"}
+            auth_env = {"RMYCLI_QA_AUTH": "qa-test-secret", "XDG_CONFIG_HOME": directory}
             configured = Terminal(None, "--config", str(config), "--instance", "qa",
                                   env=auth_env)
             terminals.append(configured)
@@ -499,6 +503,31 @@ def main():
             configured.send(b"\x15LRANGE list:a 0 -1\r")
             configured.expect_frame(lambda f: any(f.row(y) == "1) a" for y in range(f.y)),
                                     "authenticated execution and auxiliary requests")
+            auth_settings = Path(directory) / "auth-settings.toml"
+            auth_settings.write_text('save-auth = "local"\n')
+            saved_auth = Path(directory) / "rmycli-auth.toml"
+            unauthenticated = Terminal(
+                socket, "--config", str(auth_settings),
+                env={"XDG_CONFIG_HOME": directory},
+                startup_notice="Authentication required",
+            )
+            terminals.append(unauthenticated)
+            unauthenticated.send(b"AUTH qa wrong\r")
+            unauthenticated.expect("invalid username-password")
+            assert not saved_auth.exists()
+            unauthenticated.send(b"AUTH qa qa-test-secret\r")
+            unauthenticated.expect_frame(
+                lambda f: f.row(f.y - 1) == "OK" and f.row(f.y) == "rmycli>",
+                "successful authentication returns to the prompt",
+            )
+            assert saved_auth.exists()
+            unauthenticated.send(b"LRANGE list:a\t")
+            unauthenticated.expect("1 matches")
+            restored = Terminal(socket, "--config", str(auth_settings),
+                                env={"XDG_CONFIG_HOME": directory})
+            terminals.append(restored)
+            restored.send(b"ACL WHOAMI\r")
+            restored.expect_frame(lambda f: f.row(f.y - 1) == "qa", "saved auth reused")
             print("Terminal and CLI smoke tests passed")
         finally:
             for terminal in terminals:

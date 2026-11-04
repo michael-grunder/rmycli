@@ -123,6 +123,10 @@ impl Catalog {
                     catalog = live;
                 }
             }
+            Err(error) if error.code() == Some("NOAUTH") => {
+                catalog.notices.push("Authentication required. Use AUTH [username] password; server completions and help will reload after successful authentication. Using bundled metadata until then.".into());
+                return catalog;
+            }
             Err(_) => catalog.notices.push("COMMAND unavailable; using bundled metadata (may differ from server)".into()),
         }
         match redis::cmd("COMMAND").arg("DOCS").query::<Reply>(connection) {

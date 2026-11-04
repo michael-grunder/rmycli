@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, de::Error};
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Settings {
+    pub save_auth: crate::auth::SaveAuth,
     pub theme: Theme,
     pub instances: BTreeMap<String, Instance>,
 }

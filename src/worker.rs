@@ -217,7 +217,7 @@ async fn announce(
     events: &SyncSender<Event>,
 ) -> Option<i64> {
     let id = client_id(session).await;
-    let catalog = session.config.connect_auxiliary().map_or_else(
+    let mut catalog = session.config.connect_auxiliary().map_or_else(
         |error| {
             let mut catalog = Catalog::bundled();
             catalog
@@ -227,6 +227,7 @@ async fn announce(
         },
         |mut connection| Catalog::load(&mut connection),
     );
+    catalog.notices.append(&mut session.notices);
     let _ = events.send(Event::Connected {
         catalog: Box::new(catalog),
         config: session.config.clone(),
@@ -275,6 +276,7 @@ async fn execution_loop(
     events: &SyncSender<Event>,
 ) {
     let mut id = announce(&mut session, events).await;
+    let mut auth_revision = session.auth_revision;
     let mut listening = true;
     loop {
         let request = tokio::select! {
@@ -321,12 +323,13 @@ async fn execution_loop(
                     .err()
                     .is_none_or(|error| !error.is_io_error());
                 listening = connected;
-                let lines = result.unwrap_or_else(|error| {
+                let mut lines = result.unwrap_or_else(|error| {
                     vec![format!(
                         "(error) {}",
                         crate::output::error_message(&error)
                     )]
                 });
+                lines.append(&mut session.notices);
                 if events
                     .send(Event::Executed {
                         lines,
@@ -340,6 +343,13 @@ async fn execution_loop(
                 {
                     return;
                 }
+                if connected
+                    && session.assistance_allowed()
+                    && auth_revision != session.auth_revision
+                {
+                    id = announce(&mut session, events).await;
+                    auth_revision = session.auth_revision;
+                }
             }
             Execution::Reconnect => {
                 match Session::open(session.config.clone()).await {
@@ -347,6 +357,7 @@ async fn execution_loop(
                         session = fresh;
                         listening = true;
                         id = announce(&mut session, events).await;
+                        auth_revision = session.auth_revision;
                     }
                     Err(error) => {
                         let _ = events.send(Event::Failed(format!(

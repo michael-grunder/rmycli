@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Explain when a server requires authentication, and reload completion and help
+  metadata after successful AUTH or HELLO AUTH without disturbing MULTI/WATCH.
+- Parse HELLO options without mistaking passwords or client names for options.
 - Avoid flashing the startup metadata-loading message on fast connections;
   show it only after 200 ms or when you type.
 - Display RESP3 invalidations while the interactive prompt is idle, without
@@ -55,6 +58,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Separate `rmycli-auth.toml` server credentials, with automatic matching by
+  endpoint and opt-in `save-auth = false`, `"local"`, or `"always"` in the main
+  config. Successful authentication can save credentials atomically with
+  owner-only permissions on Unix; automatic saving defaults to off.
 - Link the GitHub repository as both the package homepage and source repository.
 - License the application source code under MIT, retaining the bundled Redis
   documentation's separate CC BY-SA 4.0 license and attribution.

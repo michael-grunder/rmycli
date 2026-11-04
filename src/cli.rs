@@ -218,6 +218,8 @@ impl Options {
         }
         info = info.set_redis_settings(redis);
         Ok(Config {
+            auth_store: None,
+            binary_auth: false,
             info,
             tls,
             timeout: Duration::from_millis(self.timeout_ms),

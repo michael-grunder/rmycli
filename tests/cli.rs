@@ -408,3 +408,89 @@ fn tls_server(
     });
     (port, server)
 }
+
+#[test]
+fn saved_auth_is_opt_in_reused_and_overridden_by_explicit_credentials() {
+    let fixture = Fixture::new();
+    fixture.success(&["CONFIG", "SET", "requirepass", "secret"], b"");
+    let settings = fixture.dir.path().join("rmycli.toml");
+    let auth = fixture.dir.path().join("rmycli-auth.toml");
+    std::fs::write(&settings, "save-auth = false\n").unwrap();
+    let configured = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rmycli"));
+        command
+            .env_remove("REDIS_URL")
+            .env_remove("REDISCLI_AUTH")
+            .env("XDG_CONFIG_HOME", fixture.dir.path())
+            .arg("-s")
+            .arg(&fixture.socket);
+        command
+    };
+    let output = configured()
+        .args(["-a", "secret", "PING"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!auth.exists());
+    std::fs::write(&settings, "save-auth = 'local'\n").unwrap();
+    assert!(
+        !configured()
+            .args(["-a", "wrong", "PING"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!auth.exists());
+    let mut child = configured()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"AUTH secret\nPING\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"OK\nPONG\n");
+    let saved = std::fs::read_to_string(&auth).unwrap();
+    std::fs::write(&settings, "save-auth = false\n").unwrap();
+    assert_eq!(configured().arg("PING").output().unwrap().stdout, b"PONG\n");
+    assert!(
+        !configured()
+            .args(["-a", "wrong", "PING"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !configured()
+            .args(["--user", "different", "PING"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !configured()
+            .args(["--no-config", "PING"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(std::fs::read_to_string(&auth).unwrap(), saved);
+}

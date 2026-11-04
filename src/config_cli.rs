@@ -191,6 +191,7 @@ struct SettingKey {
 
 #[derive(Clone, Copy)]
 enum Kind {
+    SaveAuth,
     Color,
     String,
     Integer,
@@ -205,6 +206,7 @@ impl SettingKey {
             .iter().map(|part| part.get().to_owned()).collect::<Vec<_>>();
         let names = parts.iter().map(String::as_str).collect::<Vec<_>>();
         let kind = match names.as_slice() {
+            ["save-auth"] => Kind::SaveAuth,
             ["theme", "inline-hint"] => Kind::Color,
             ["theme", "commands", name] if !name.trim().is_empty() => {
                 Kind::Color
@@ -228,6 +230,15 @@ impl SettingKey {
 
     fn value(&self, text: &str) -> Result<Value> {
         Ok(match self.kind {
+            Kind::SaveAuth => match text {
+                "false" => Value::from(false),
+                "local" | "always" => Value::from(text),
+                _ => {
+                    return Err(
+                        "save-auth requires false, local, or always".into()
+                    );
+                }
+            },
             Kind::Integer => Value::from(
                 text.parse::<i64>()
                     .map_err(|_| "this setting requires an integer")?,
@@ -294,6 +305,9 @@ impl SettingKey {
     }
 
     fn default_value(&self, settings: &Settings) -> Result<String> {
+        if matches!(self.kind, Kind::SaveAuth) {
+            return Ok("false".into());
+        }
         if let Some(color) = self.color(settings) {
             return Ok(serde_json::to_value(color)?
                 .as_str()

@@ -456,3 +456,36 @@ fn inline_tables_can_be_edited_and_symlinks_are_preserved() {
         assert!(parsed["theme"]["commands"].get("get").is_none());
     }
 }
+
+#[test]
+fn auth_saving_policy_can_be_read_set_and_unset() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        success(&mut fixture.config(&["get", "save-auth"])),
+        "false\n"
+    );
+    for value in ["local", "always", "false"] {
+        assert_eq!(
+            success(&mut fixture.config(&["set", "save-auth", value])),
+            format!("{value}\n")
+        );
+        assert_eq!(
+            success(&mut fixture.config(&["get", "save-auth"])),
+            format!("{value}\n")
+        );
+    }
+    let path = fixture.0.join("user/rmycli.toml");
+    let before = std::fs::read_to_string(&path).unwrap();
+    for value in ["true", "never", "1"] {
+        assert!(
+            error(&mut fixture.config(&["set", "save-auth", value]))
+                .contains("save-auth")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    success(&mut fixture.config(&["unset", "save-auth"]));
+    assert_eq!(
+        success(&mut fixture.config(&["get", "save-auth"])),
+        "false\n"
+    );
+}

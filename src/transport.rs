@@ -25,6 +25,7 @@ fn closed() -> redis::RedisError {
 
 impl Connection {
     pub async fn open(config: &Config) -> RedisResult<Self> {
+        config.check_auth()?;
         let connect = async {
             let stream: Stream = match config.info.addr() {
                 ConnectionAddr::Tcp(host, port) => {

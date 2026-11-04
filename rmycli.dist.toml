@@ -12,7 +12,7 @@
 #
 # All settings are optional. Unknown fields and invalid values are errors.
 # Uncomment examples as needed; do not define the same setting twice.
-# Only theme and named-instance settings are currently supported here.
+# Theme, named-instance, and authentication-saving settings are supported here.
 # Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
 # command-line options. See README.md and rmycli --help.
 #
@@ -23,6 +23,18 @@
 # Color reads and updates include a colored sample in terminals.
 # --color always forces previews; --color never suppresses them.
 # Automatic previews respect NO_COLOR and are omitted from piped output.
+
+# Automatic credential saving, after successful authentication only.
+# false (default): never save automatically; still read manually saved entries.
+# "local": save for localhost, loopback IP addresses, and Unix sockets.
+# "always": save for every server. Passwords are stored in plaintext.
+# The file is $XDG_CONFIG_HOME/rmycli-auth.toml (normally
+# ~/.config/rmycli-auth.toml); --no-config disables reading and writing it.
+# Use [servers."redis://127.0.0.1:7000"] with password and optional user in
+# that separate file. See README.md for TLS, IPv6, and socket examples.
+# Automatic writes use owner-only permissions on Unix.
+#   rmycli config set save-auth local
+save-auth = false
 
 [theme]
 # Foreground color of inline argument hints. Default: "dark_grey".
