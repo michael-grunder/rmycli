@@ -67,14 +67,14 @@ class Frame:
         return "".join(self.cells.get((row, x), " ") for x in range(width)).rstrip()
 
     def hint_is_inline(self, typed, hint, colors=("90", "38;5;8")):
-        prompt = "rmycli> "
+        prompt = self.row(self.y).split(">", 1)[0] + "> "
         return (self.row(self.y) == prompt + typed + hint
                 and self.x == len(prompt + typed)
                 and (not hint or self.colors.get((self.y, self.x)) in colors))
 
 
 class Terminal:
-    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None):
+    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None, endpoint=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         connection = ["-s", socket] if socket else []
@@ -91,10 +91,11 @@ class Terminal:
         self.height = 35
         self.start_row = start_row
         started = time.monotonic()
-        self.expect("rmycli>")
+        prompt = f"{endpoint or socket}>"
+        self.expect(prompt)
         if b"Loading server command metadata" in self.screen_data:
             assert time.monotonic() - started >= 0.2, "startup status flashed"
-        self.expect_frame(lambda f: f.row(f.y) == "rmycli>"
+        self.expect_frame(lambda f: f.row(f.y) == prompt
                           and not f.row(f.y + 1), "quiet connected prompt")
         assert b"\x1b[?1049h" not in self.screen_data
         assert b"Connected" not in self.screen_data
@@ -301,15 +302,15 @@ def main():
                 tracking.expect(reply)
             tracking.send(b"GET draft\x1b[D")
             tracking.expect_frame(
-                lambda f: f.row(f.y) == "rmycli> GET draft"
-                and f.x == len("rmycli> GET draf"), "draft before invalidation",
+                lambda f: f.row(f.y) == f"{socket}> GET draft"
+                and f.x == len(f"{socket}> GET draf"), "draft before invalidation",
             )
             tracking.data = b""
             redis("SET", "tracked", "changed")
             frame = tracking.expect_frame(
                 lambda f: any(f.row(y) == "-> invalidate: 'tracked'" for y in range(f.y))
-                and f.row(f.y) == "rmycli> GET draft"
-                and f.x == len("rmycli> GET draf"), "idle push preserves input",
+                and f.row(f.y) == f"{socket}> GET draft"
+                and f.x == len(f"{socket}> GET draf"), "idle push preserves input",
             )
             row = next(y for y in range(frame.y) if frame.row(y) == "-> invalidate: 'tracked'")
             assert frame.colors[row, 0] == "1", "push was not bold"
@@ -328,14 +329,14 @@ def main():
             assert any("Connected" in frame.row(y) for y in range(frame.y + 1, 35))
             bottom.send(b"\x1b")
             bottom.expect_frame(
-                lambda f: f.row(f.y) == "rmycli>"
+                lambda f: f.row(f.y) == f"{socket}>"
                 and all(not f.row(y) for y in range(f.y + 1, 35)),
                 "Escape removes help without leaving panel fragments",
             )
             for _ in range(20):
                 bottom.send(b"PING\r")
                 bottom.expect_frame(
-                    lambda f: f.row(f.y) == "rmycli>" and f.row(f.y - 1) == "PONG"
+                    lambda f: f.row(f.y) == f"{socket}>" and f.row(f.y - 1) == "PONG"
                     and not f.row(f.y + 1),
                     "output scrolls naturally and keeps the prompt after the reply",
                 )
@@ -350,11 +351,11 @@ def main():
             bottom.send(b"\x1b")
             bottom.expect_frame(lambda f: f.hint_is_inline("lrange", " key start stop"),
                                 "help dismissal preserves the draft and inline hint")
-            bottom.resize(10, 45)
+            bottom.resize(10, 90)
             bottom.expect_frame(lambda f: f.y < 10 and f.hint_is_inline("lrange", " key start stop"),
                                 "resizing preserves input within the new terminal bounds")
             bottom.send(b"\x15")
-            bottom.expect_frame(lambda f: f.row(f.y) == "rmycli>", "clear the draft")
+            bottom.expect_frame(lambda f: f.row(f.y) == f"{socket}>", "clear the draft")
             bottom.send(b"\x1bOP")
             bottom.expect_frame(lambda f: "┌ Help" in f.row(f.y + 1),
                                 "help before exiting")
@@ -369,14 +370,14 @@ def main():
             terminals.append(terminal)
             terminal.send(b"PING\r")
             frame = terminal.expect_frame(
-                lambda f: f.row(f.y - 1) == "PONG" and f.row(f.y) == "rmycli>",
+                lambda f: f.row(f.y - 1) == "PONG" and f.row(f.y) == f"{socket}>",
                 "reply followed immediately by the next prompt",
             )
             assert frame.y == 9
             assert frame.row(6) == "previous shell output"
             terminal.send(b"clear\r")
             terminal.expect_frame(
-                lambda f: f.row(f.y) == "rmycli>"
+                lambda f: f.row(f.y) == f"{socket}>"
                 and all(not f.row(y) for y in range(f.y)),
                 "clear leaves an empty transcript and prompt",
             )
@@ -403,7 +404,7 @@ def main():
             frame = terminal.expect_frame(
                 lambda f: "┌ 1/2 " in f.row(f.y + 2), "bordered popup below input",
             )
-            assert frame.row(frame.y + 2).index("┌") == len("rmycli> LPOP ")
+            assert frame.row(frame.y + 2).index("┌") == len(f"{socket}> LPOP ")
             assert "list:a" in frame.row(frame.y + 3)
             assert "list:b" in frame.row(frame.y + 4)
             terminal.send(b"\t\r")
@@ -418,7 +419,7 @@ def main():
             assert redis("LLEN", "list:b") == 2
 
             terminal.send(b"SELECT 1\r")
-            terminal.expect("rmycli[1]>")
+            terminal.expect(f"{socket}[1]>")
             terminal.send(b"LRANGE list:\t")
             terminal.expect("0 matches")
             terminal.send(b"\x15BLPOP missing 0\r")
@@ -426,7 +427,7 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("Connection lost")
             terminal.send(b"\\reconnect\r")
-            terminal.expect_frame(lambda f: f.row(f.y) == "rmycli[1]>" and not f.row(f.y + 1), "reconnected prompt")
+            terminal.expect_frame(lambda f: f.row(f.y) == f"{socket}[1]>" and not f.row(f.y + 1), "reconnected prompt")
             terminal.send(b"SUBSCRIBE channel\r")
             terminal.expect("subscribe")
             time.sleep(0.3)  # A quiet stream must not skip the next message.
@@ -435,7 +436,7 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("Stream ended")
             terminal.send(b"\\reconnect\r")
-            terminal.expect_frame(lambda f: f.row(f.y) == "rmycli[1]>" and not f.row(f.y + 1), "reconnected prompt")
+            terminal.expect_frame(lambda f: f.row(f.y) == f"{socket}[1]>" and not f.row(f.y + 1), "reconnected prompt")
 
             second = Terminal(socket, "--completion-threshold", "1")
             terminals.append(second)
@@ -470,7 +471,7 @@ def main():
             )
             auth_env = {"RMYCLI_QA_AUTH": "qa-test-secret", "XDG_CONFIG_HOME": directory}
             configured = Terminal(None, "--config", str(config), "--instance", "qa",
-                                  env=auth_env)
+                                  env=auth_env, endpoint=f"127.0.0.1:{port}")
             terminals.append(configured)
             configured.send(b"ACL WHOAMI\r")
             configured.expect_frame(lambda f: any(f.row(y) == "qa" for y in range(f.y)),
@@ -487,7 +488,7 @@ def main():
             )
             configured.send(b"\x15xgroup create")
             configured.expect_frame(
-                lambda f: f.row(f.y).startswith("rmycli> xgroup create key group")
+                lambda f: f.row(f.y).startswith(f"127.0.0.1:{port}> xgroup create key group")
                 and f.colors.get((f.y, f.x)) in ("91", "38;5;9"),
                 "subcommand color overrides parent command",
             )
@@ -517,7 +518,7 @@ def main():
             assert not saved_auth.exists()
             unauthenticated.send(b"AUTH qa qa-test-secret\r")
             unauthenticated.expect_frame(
-                lambda f: f.row(f.y - 1) == "OK" and f.row(f.y) == "rmycli>",
+                lambda f: f.row(f.y - 1) == "OK" and f.row(f.y) == f"{socket}>",
                 "successful authentication returns to the prompt",
             )
             assert saved_auth.exists()

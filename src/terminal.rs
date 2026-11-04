@@ -505,9 +505,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                             [(
                                 format!(
                                     "{}{}",
-                                    prompt(
-                                        app.config.info.redis_settings().db()
-                                    ),
+                                    prompt(&app.config.info),
                                     app.editor.line
                                 ),
                                 false,
@@ -1089,7 +1087,7 @@ impl App {
         self.editor.remember();
         self.log([format!(
             "{}{}",
-            prompt(self.config.info.redis_settings().db()),
+            prompt(&self.config.info),
             self.editor.line
         )]);
         self.editor.line.clear();
@@ -1190,7 +1188,7 @@ impl App {
                 EndSynchronizedUpdate
             );
         }
-        let mut prompt = prompt(self.config.info.redis_settings().db());
+        let mut prompt = prompt(&self.config.info);
         if self.control_keys.contains(&true) {
             prompt.insert_str(prompt.len() - 2, "[Ctrl]");
         }
@@ -1198,7 +1196,7 @@ impl App {
             && self.popup.is_none()
             && self.help.is_none()
             && display_width(&safe(&self.status))
-                <= width.saturating_sub(prompt.len());
+                <= width.saturating_sub(display_width(&safe(&prompt)));
         let available = usize::from(height - 1);
         let status = if self.status.is_empty() || inline_status {
             Vec::new()
@@ -1274,11 +1272,13 @@ impl App {
     }
 }
 
-fn prompt(database: i64) -> String {
+fn prompt(info: &redis::ConnectionInfo) -> String {
+    let address = info.addr();
+    let database = info.redis_settings().db();
     if database == 0 {
-        "rmycli> ".into()
+        format!("{address}> ")
     } else {
-        format!("rmycli[{database}]> ")
+        format!("{address}[{database}]> ")
     }
 }
 
@@ -1361,9 +1361,28 @@ fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize) {
 mod tests {
     use super::*;
     #[test]
-    fn default_database_prompt_and_unicode_clipping() {
-        assert_eq!(prompt(0), "rmycli> ");
-        assert_eq!(prompt(12), "rmycli[12]> ");
+    fn prompt_uses_endpoint_and_nonzero_database_without_credentials() {
+        use redis::IntoConnectionInfo;
+
+        for (url, expected) in [
+            ("redis://127.0.0.1", "127.0.0.1:6379> "),
+            ("redis://127.0.0.1:7000", "127.0.0.1:7000> "),
+            ("redis://localhost:7000/12", "localhost:7000[12]> "),
+            (
+                "rediss://alice:secret@redis.example:6380/2",
+                "redis.example:6380[2]> ",
+            ),
+        ] {
+            assert_eq!(prompt(&url.into_connection_info().unwrap()), expected);
+        }
+        let socket = redis::ConnectionAddr::Unix("/tmp/redis.sock".into())
+            .into_connection_info()
+            .unwrap();
+        assert_eq!(prompt(&socket), "/tmp/redis.sock> ");
+    }
+
+    #[test]
+    fn unicode_clipping() {
         assert_eq!(fit("你好abcdef", 5), "你好a");
         assert_eq!(fit("key start stop", 0), "");
     }
@@ -1461,7 +1480,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 connect_timeout: Some(Duration::from_secs(1)),
                 name: None,
-                cluster: false,
+                cluster: crate::session::ClusterMode::Auto,
                 output: crate::output::Options::default(),
                 show_pushes: false,
             },
@@ -1562,9 +1581,9 @@ mod tests {
                 app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
                 let text = String::from_utf8(rendered).unwrap();
                 let expected = if kind == KeyEventKind::Release {
-                    "rmycli> KEYS MixedCase:*"
+                    "localhost:6379> KEYS MixedCase:*"
                 } else {
-                    "rmycli[Ctrl]> KEYS MixedCase:*"
+                    "localhost:6379[Ctrl]> KEYS MixedCase:*"
                 };
                 assert!(text.contains(expected), "{text:?}");
                 assert_eq!(app.editor.cursor, 5);
@@ -1712,7 +1731,7 @@ mod tests {
         assert!(!text.contains("Connected"));
         assert!(!text.contains("F1"));
 
-        app.log(["rmycli> PING".into(), "PONG".into()]);
+        app.log(["localhost:6379> PING".into(), "PONG".into()]);
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         assert_eq!(screen.row, 9);
@@ -1796,10 +1815,10 @@ mod tests {
             app.draw(&mut screen, &mut out, (80, 24)).unwrap();
             let submitted = &out.frames[1];
             assert!(!submitted.contains(&hint));
-            let echoed = submitted.find("rmycli> PING\r\n").unwrap();
+            let echoed = submitted.find("localhost:6379> PING\r\n").unwrap();
             assert!(submitted.find("\x1b[J").unwrap() < echoed);
             // A quick reply must not follow a transient prompt or status.
-            assert!(!submitted[echoed + 1..].contains("rmycli> "));
+            assert!(!submitted[echoed + 1..].contains("localhost:6379> "));
             assert!(!submitted.contains("Executing"));
             assert!(!app.tick(Instant::now()));
 
@@ -1815,7 +1834,7 @@ mod tests {
             let reply = &out.frames[2];
             assert!(
                 reply.find("PONG\r\n").unwrap()
-                    < reply.find("rmycli> ").unwrap()
+                    < reply.find("localhost:6379> ").unwrap()
             );
             assert!(!reply.contains(&hint));
             assert!(!reply.contains("Executing"));
@@ -1844,7 +1863,7 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(text.contains("rmycli> "));
+        assert!(text.contains("localhost:6379> "));
         assert!(text.contains("Executing"));
         assert!(app.mode == Mode::Busy);
     }
@@ -1857,7 +1876,11 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
-        assert!(String::from_utf8(rendered).unwrap().contains("rmycli> x"));
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("localhost:6379> x")
+        );
     }
 
     #[test]
@@ -1872,7 +1895,7 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(!text.contains("rmycli>"));
+        assert!(!text.contains("localhost:6379>"));
         assert!(!text.contains("Loading"));
 
         app.on_worker(Event::Connected {
@@ -1885,7 +1908,7 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(text.contains("rmycli>"));
+        assert!(text.contains("localhost:6379>"));
         assert!(!text.contains("Loading"));
 
         app.mode = Mode::Busy;

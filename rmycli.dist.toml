@@ -12,7 +12,7 @@
 #
 # All settings are optional. Unknown fields and invalid values are errors.
 # Uncomment examples as needed; do not define the same setting twice.
-# Theme, named-instance, and authentication-saving settings are supported here.
+# Cluster detection, theme, named-instance, and auth-saving settings live here.
 # Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
 # command-line options. See README.md and rmycli --help.
 #
@@ -23,6 +23,12 @@
 # Color reads and updates include a colored sample in terminals.
 # --color always forces previews; --color never suppresses them.
 # Automatic previews respect NO_COLOR and are omitted from piped output.
+
+# Detect cluster mode after connecting and follow MOVED/ASK redirects.
+# false disables automatic detection; -c still explicitly enables redirects.
+# Valkey standalone CLIENT CAPA REDIRECT support is independent of this setting.
+#   rmycli config set auto-cluster false
+auto-cluster = true
 
 # Automatic credential saving, after successful authentication only.
 # false (default): never save automatically; still read manually saved entries.

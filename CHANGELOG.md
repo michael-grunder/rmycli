@@ -25,6 +25,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Automatically detect cluster mode after connecting; `auto-cluster = false`
+  disables automatic MOVED/ASK following, while `-c` remains an explicit override.
+
+- Show the current host and port (or Unix socket path) in the interactive
+  prompt and command transcript, like redis-cli, retaining nonzero database
+  suffixes and the Ctrl indicator.
+
 - Use Ctrl+Enter instead of Shift+Enter for alternate KEYS scanning. Request
   modifier press/release events and show `[Ctrl]` in the prompt while either
   Ctrl key is held on terminals that support the Kitty keyboard protocol.
@@ -58,6 +65,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Detect Valkey and negotiate `CLIENT CAPA REDIRECT` to follow standalone
+  primary redirects, including during `--scan`. Preserve connection settings,
+  cap redirect chains, and avoid replaying transactional or watched commands.
+  Retry detection after successful authentication without disturbing session
+  state; unsupported or denied probes leave manual commands available.
 - Separate `rmycli-auth.toml` server credentials, with automatic matching by
   endpoint and opt-in `save-auth = false`, `"local"`, or `"always"` in the main
   config. Successful authentication can save credentials atomically with

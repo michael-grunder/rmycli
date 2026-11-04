@@ -81,6 +81,32 @@ fn success(command: &mut Command) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+#[test]
+fn automatic_cluster_setting_can_be_read_disabled_and_reset() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        success(&mut fixture.config(&["get", "auto-cluster"])),
+        "true\n"
+    );
+    assert_eq!(
+        success(&mut fixture.config(&["set", "auto-cluster", "false"])),
+        "false\n"
+    );
+    assert_eq!(
+        success(&mut fixture.config(&["get", "auto-cluster"])),
+        "false\n"
+    );
+    assert!(
+        error(&mut fixture.config(&["set", "auto-cluster", "no"]))
+            .contains("true or false")
+    );
+    success(&mut fixture.config(&["unset", "auto-cluster"]));
+    assert_eq!(
+        success(&mut fixture.config(&["get", "auto-cluster"])),
+        "true\n"
+    );
+}
+
 fn assert_path_error(command: &mut Command, path: &Path, expected: &str) {
     let error = error(command);
     assert!(error.contains(path.to_str().unwrap()), "{error}");

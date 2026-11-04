@@ -13,9 +13,16 @@ pub struct Config {
     pub timeout: Duration,
     pub connect_timeout: Option<Duration>,
     pub name: Option<String>,
-    pub cluster: bool,
+    pub cluster: ClusterMode,
     pub output: crate::output::Options,
     pub show_pushes: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterMode {
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 impl Config {
@@ -66,6 +73,7 @@ pub struct Session {
     pub auth_revision: u64,
     pub notices: Vec<String>,
     queued: Vec<Vec<Vec<u8>>>,
+    routing_revision: u64,
 }
 
 impl Session {
@@ -79,6 +87,7 @@ impl Session {
             auth_revision: 0,
             notices: Vec::new(),
             queued: Vec::new(),
+            routing_revision: 0,
         };
         session.save_auth();
         Ok(session)
@@ -111,13 +120,37 @@ impl Session {
         for redirects in 0..=5 {
             let can_redirect = self.assistance_allowed();
             let result = self.execute_once(args, &mut push).await;
+            if self.assistance_allowed()
+                && self.routing_revision != self.auth_revision
+            {
+                self.routing_revision = self.auth_revision;
+                if let Err(error) =
+                    self.connection.detect_server(&self.config, &mut push).await
+                {
+                    self.notices.push(format!(
+                        "Server detection failed: {}",
+                        crate::output::error_message(&error)
+                    ));
+                }
+            }
             let Err(error) = &result else {
                 return result;
             };
-            if !self.config.cluster || !can_redirect || redirects == 5 {
+            if !can_redirect || redirects == 5 {
                 return result;
             }
-            let Some((target, _)) = error.redirect_node() else {
+            let target = if self.connection.redirect
+                && error.code() == Some("REDIRECT")
+            {
+                error.detail()
+            } else if self.config.cluster == ClusterMode::Enabled
+                || self.connection.cluster
+            {
+                error.redirect_node().map(|(target, _)| target)
+            } else {
+                None
+            };
+            let Some(target) = target else {
                 return result;
             };
             let mut config = self.config.clone();
@@ -126,6 +159,7 @@ impl Session {
             config.info = config.info.set_addr(addr);
             let mut connection =
                 crate::transport::Connection::open(&config).await?;
+            connection.cluster |= self.connection.cluster;
             if error.kind()
                 == redis::ErrorKind::Server(redis::ServerErrorKind::Ask)
             {
@@ -225,6 +259,8 @@ impl Session {
             }
             "HELLO" => self.observe_hello(args),
             "RESET" => {
+                self.connection.cluster = false;
+                self.connection.redirect = false;
                 self.auth_revision += 1;
                 self.config.binary_auth = false;
                 self.config.info =
@@ -336,14 +372,13 @@ fn redirect_address(
     target: &str,
 ) -> RedisResult<()> {
     use redis::{ConnectionAddr, ErrorKind, RedisError};
-    let invalid = || {
-        RedisError::from((
-            ErrorKind::Client,
-            "invalid cluster redirect address",
-        ))
-    };
+    let invalid =
+        || RedisError::from((ErrorKind::Client, "invalid redirect address"));
     let (host, port) = target.rsplit_once(':').ok_or_else(invalid)?;
     let port = port.parse::<u16>().map_err(|_| invalid())?;
+    if port == 0 || host.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
     let host = host.trim_start_matches('[').trim_end_matches(']');
     match addr {
         ConnectionAddr::Tcp(current, current_port)
@@ -360,7 +395,7 @@ fn redirect_address(
         }
         _ => Err(RedisError::from((
             ErrorKind::Client,
-            "cannot follow a cluster redirect from this transport",
+            "cannot follow a redirect from this transport",
         ))),
     }
 }
@@ -437,6 +472,16 @@ mod tests {
     fn server(
         mut reply: impl FnMut(&[String]) -> Vec<u8> + Send + 'static,
     ) -> (u16, JoinHandle<()>) {
+        mock_server(move |args| match args[0].as_str() {
+            "INFO" => b"-ERR unknown command 'INFO'\r\n".to_vec(),
+            "CLIENT" => b"+OK\r\n".to_vec(),
+            _ => reply(args),
+        })
+    }
+
+    fn mock_server(
+        mut reply: impl FnMut(&[String]) -> Vec<u8> + Send + 'static,
+    ) -> (u16, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let thread = thread::spawn(move || {
@@ -448,11 +493,7 @@ mod tests {
             let mut parser = redis::Parser::new();
             while let Ok(value) = parser.parse_value(&mut reader) {
                 let args: Vec<String> = redis::from_redis_value(value).unwrap();
-                let response = if args[0] == "CLIENT" {
-                    b"+OK\r\n".to_vec()
-                } else {
-                    reply(&args)
-                };
+                let response = reply(&args);
                 reader.get_mut().write_all(&response).unwrap();
             }
         });
@@ -469,10 +510,340 @@ mod tests {
             timeout: Duration::from_secs(1),
             connect_timeout: Some(Duration::from_secs(1)),
             name: None,
-            cluster: true,
+            cluster: ClusterMode::Enabled,
             output: crate::output::Options::default(),
             show_pushes: true,
         }
+    }
+
+    fn info(mode: &str, valkey: bool) -> Vec<u8> {
+        let version = if valkey {
+            "valkey_version:8.1.0\r\n"
+        } else {
+            ""
+        };
+        let mode_field = if valkey { "server_mode" } else { "redis_mode" };
+        let text = format!("# Server\r\n{mode_field}:{mode}\r\n{version}");
+        format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+    }
+
+    #[tokio::test]
+    async fn automatic_cluster_detection_and_opt_out() {
+        for (automatic, forced) in
+            [(true, false), (false, false), (false, true)]
+        {
+            let (port, server) = mock_server(|args| match args[0].as_str() {
+                "INFO" => info("cluster", false),
+                "GET" => b"-MOVED 1 host:not-a-port\r\n".to_vec(),
+                _ => panic!("unexpected command: {args:?}"),
+            });
+            let mut config = config(port);
+            config.cluster = if forced {
+                ClusterMode::Enabled
+            } else if automatic {
+                ClusterMode::Auto
+            } else {
+                ClusterMode::Disabled
+            };
+            let mut session = Session::open(config).await.unwrap();
+            assert_eq!(session.connection.cluster, automatic);
+            let error = session.execute(&[b"GET".to_vec()]).await.unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if automatic || forced {
+                    redis::ErrorKind::Client
+                } else {
+                    redis::ErrorKind::Server(redis::ServerErrorKind::Moved)
+                }
+            );
+            drop(session);
+            tokio::task::yield_now().await;
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn valkey_redirect_negotiates_on_each_connection_and_keeps_settings()
+    {
+        let mut capable = false;
+        let (port, target) = mock_server(move |args| match args[0].as_str() {
+            "AUTH" => {
+                assert_eq!(args, &["AUTH", "alice", "secret"]);
+                b"+OK\r\n".to_vec()
+            }
+            "SELECT" => {
+                assert_eq!(args, &["SELECT", "2"]);
+                b"+OK\r\n".to_vec()
+            }
+            "INFO" => info("standalone", true),
+            "CLIENT" => {
+                if args[1] == "CAPA" {
+                    assert_eq!(args, &["CLIENT", "CAPA", "REDIRECT"]);
+                    capable = true;
+                } else {
+                    assert_eq!(args, &["CLIENT", "SETNAME", "test"]);
+                }
+                b"+OK\r\n".to_vec()
+            }
+            "GET" => {
+                assert!(capable);
+                assert_eq!(args, &["GET", "key with spaces\0"]);
+                b"$5\r\nvalue\r\n".to_vec()
+            }
+            _ => panic!("unexpected command: {args:?}"),
+        });
+        let mut capable = false;
+        let (source_port, source) =
+            mock_server(move |args| match args[0].as_str() {
+                "INFO" => info("standalone", true),
+                "CLIENT" if args[1] == "CAPA" => {
+                    capable = true;
+                    b"+OK\r\n".to_vec()
+                }
+                "GET" => {
+                    assert!(capable);
+                    format!("-REDIRECT 127.0.0.1:{port}\r\n").into_bytes()
+                }
+                _ => b"+OK\r\n".to_vec(),
+            });
+        let mut config = config(source_port);
+        config.cluster = ClusterMode::Disabled;
+        config.name = Some("test".into());
+        config.info = config.info.clone().set_redis_settings(
+            config
+                .info
+                .redis_settings()
+                .clone()
+                .set_username("alice")
+                .set_password("secret")
+                .set_db(2),
+        );
+        let mut session = Session::open(config).await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                session
+                    .execute(&[b"GET".to_vec(), b"key with spaces\0".to_vec()])
+                    .await
+                    .unwrap(),
+                Value::BulkString(b"value".to_vec())
+            );
+        }
+        assert_eq!(
+            session.config.info.addr(),
+            &redis::ConnectionAddr::Tcp("127.0.0.1".into(), port)
+        );
+        drop(session);
+        tokio::task::yield_now().await;
+        source.join().unwrap();
+        target.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_or_denied_detection_does_not_prevent_commands() {
+        for (server_info, capability) in [
+            (info("standalone", false), b"+OK\r\n".to_vec()),
+            (b"-NOPERM INFO denied\r\n".to_vec(), b"+OK\r\n".to_vec()),
+            (
+                b"-NOAUTH Authentication required\r\n".to_vec(),
+                b"+OK\r\n".to_vec(),
+            ),
+            (
+                info("standalone", true),
+                b"-ERR unknown subcommand CAPA\r\n".to_vec(),
+            ),
+            (
+                info("standalone", true),
+                b"-NOPERM CAPA denied\r\n".to_vec(),
+            ),
+        ] {
+            let (port, server) =
+                mock_server(move |args| match args[0].as_str() {
+                    "INFO" => server_info.clone(),
+                    "CLIENT" => {
+                        assert!(
+                            server_info
+                                .windows(14)
+                                .any(|v| v == b"valkey_version")
+                        );
+                        capability.clone()
+                    }
+                    "PING" => b"+PONG\r\n".to_vec(),
+                    "GET" => b"-REDIRECT host:not-a-port\r\n".to_vec(),
+                    _ => panic!("unexpected command: {args:?}"),
+                });
+            let mut session = Session::open(config(port)).await.unwrap();
+            assert!(!session.connection.cluster);
+            assert!(!session.connection.redirect);
+            assert_eq!(
+                session.execute(&[b"PING".to_vec()]).await.unwrap(),
+                Value::SimpleString("PONG".into())
+            );
+            assert_eq!(
+                session
+                    .execute(&[b"GET".to_vec()])
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Some("REDIRECT")
+            );
+            drop(session);
+            tokio::task::yield_now().await;
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn valkey_redirect_does_not_replay_stateful_commands() {
+        for state in ["WATCH", "MULTI", "streaming"] {
+            let (port, server) = mock_server(|args| match args[0].as_str() {
+                "INFO" => info("standalone", true),
+                "CLIENT" => b"+OK\r\n".to_vec(),
+                _ => b"-REDIRECT host:not-a-port\r\n".to_vec(),
+            });
+            let mut session = Session::open(config(port)).await.unwrap();
+            session.watched = state == "WATCH";
+            session.transaction = state == "MULTI";
+            session.streaming = state == "streaming";
+            assert_eq!(
+                session
+                    .execute(&[b"GET".to_vec()])
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Some("REDIRECT")
+            );
+            drop(session);
+            tokio::task::yield_now().await;
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_chains_are_bounded() {
+        for kind in ["REDIRECT", "MOVED 1", "ASK 1"] {
+            let mut port = 1;
+            let mut servers = Vec::new();
+            for index in 0..6 {
+                let target = port;
+                let (next, server) =
+                    mock_server(move |args| match args[0].as_str() {
+                        "INFO" if index == 5 || kind == "REDIRECT" => {
+                            info("cluster", true)
+                        }
+                        "INFO" => b"-NOPERM INFO denied\r\n".to_vec(),
+                        "CLIENT" | "ASKING" => b"+OK\r\n".to_vec(),
+                        _ => format!("-{kind} 127.0.0.1:{target}\r\n")
+                            .into_bytes(),
+                    });
+                port = next;
+                servers.push(server);
+            }
+            let mut config = config(port);
+            config.cluster = ClusterMode::Auto;
+            let mut session = Session::open(config).await.unwrap();
+            assert_eq!(
+                session
+                    .execute(&[b"GET".to_vec()])
+                    .await
+                    .unwrap_err()
+                    .code(),
+                kind.split_whitespace().next()
+            );
+            drop(session);
+            tokio::task::yield_now().await;
+            for server in servers {
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detection_after_authentication_waits_for_watch_and_preserves_pushes()
+     {
+        let mut authenticated = false;
+        let mut watched = false;
+        let mut restricted = false;
+        let (port, server) = mock_server(move |args| match args[0].as_str() {
+            "AUTH" => {
+                if args[1] == "wrong" {
+                    b"-WRONGPASS invalid password\r\n".to_vec()
+                } else {
+                    authenticated = true;
+                    restricted = args[1] == "limited";
+                    b"+OK\r\n".to_vec()
+                }
+            }
+            "WATCH" => {
+                watched = true;
+                b"+OK\r\n".to_vec()
+            }
+            "UNWATCH" => {
+                watched = false;
+                b"+OK\r\n".to_vec()
+            }
+            "RESET" => {
+                authenticated = false;
+                restricted = false;
+                b"+RESET\r\n".to_vec()
+            }
+            "INFO" => {
+                assert!(!watched);
+                if restricted {
+                    b"-NOPERM INFO denied\r\n".to_vec()
+                } else if authenticated {
+                    let mut response =
+                        b">2\r\n+invalidate\r\n*1\r\n$3\r\nkey\r\n".to_vec();
+                    response.extend(info("cluster", true));
+                    response
+                } else {
+                    b"-NOAUTH Authentication required\r\n".to_vec()
+                }
+            }
+            "CLIENT" => {
+                assert!(authenticated && !watched);
+                b"+OK\r\n".to_vec()
+            }
+            _ => panic!("unexpected command: {args:?}"),
+        });
+        let mut config = config(port);
+        config.cluster = ClusterMode::Auto;
+        let mut session = Session::open(config).await.unwrap();
+        assert!(!session.connection.redirect);
+        assert!(
+            session
+                .execute(&[b"AUTH".to_vec(), b"wrong".to_vec()])
+                .await
+                .is_err()
+        );
+        assert!(!session.connection.redirect);
+        session
+            .execute(&[b"WATCH".to_vec(), b"key".to_vec()])
+            .await
+            .unwrap();
+        session
+            .execute(&[b"AUTH".to_vec(), b"secret".to_vec()])
+            .await
+            .unwrap();
+        assert!(!session.connection.redirect);
+        let mut pushes = Vec::new();
+        session
+            .execute_with_push(&[b"UNWATCH".to_vec()], |value| {
+                pushes.push(value.clone());
+            })
+            .await
+            .unwrap();
+        assert!(session.connection.cluster && session.connection.redirect);
+        assert_eq!(pushes.len(), 1);
+        session
+            .execute(&[b"AUTH".to_vec(), b"limited".to_vec()])
+            .await
+            .unwrap();
+        assert!(session.connection.cluster && session.connection.redirect);
+        session.execute(&[b"RESET".to_vec()]).await.unwrap();
+        assert!(!session.connection.cluster && !session.connection.redirect);
+        drop(session);
+        tokio::task::yield_now().await;
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -488,10 +859,16 @@ mod tests {
                 assert_eq!(asking, kind == "ASK");
                 b"$5\r\nvalue\r\n".to_vec()
             });
-            let (source_port, source) = server(move |_| {
-                format!("-{kind} 1 127.0.0.1:{port}\r\n").into_bytes()
+            let (source_port, source) = mock_server(move |args| {
+                if args[0] == "INFO" {
+                    info("cluster", false)
+                } else {
+                    format!("-{kind} 1 127.0.0.1:{port}\r\n").into_bytes()
+                }
             });
-            let mut session = Session::open(config(source_port)).await.unwrap();
+            let mut config = config(source_port);
+            config.cluster = ClusterMode::Auto;
+            let mut session = Session::open(config).await.unwrap();
             assert_eq!(
                 session
                     .execute(&[b"GET".to_vec(), b"key".to_vec()])
@@ -523,7 +900,11 @@ mod tests {
             let mut session = Session::open(config(port)).await.unwrap();
             session.watched = state == "WATCH";
             session.transaction = state == "MULTI";
-            session.config.cluster = state != "disabled";
+            session.config.cluster = if state == "disabled" {
+                ClusterMode::Disabled
+            } else {
+                ClusterMode::Enabled
+            };
             let error = session
                 .execute(&[command.as_bytes().to_vec()])
                 .await
@@ -729,5 +1110,18 @@ mod tests {
             matches!(&addr, redis::ConnectionAddr::TcpTls { host, port: 6381, .. } if host == "::1")
         );
         assert!(redirect_address(&mut addr, "host:not-a-port").is_err());
+        redirect_address(&mut addr, "::1:6382").unwrap();
+        assert!(
+            matches!(&addr, redis::ConnectionAddr::TcpTls { host, port: 6382, .. } if host == "::1")
+        );
+        for target in [
+            "host:0",
+            "host:65536",
+            "host",
+            "host :6379",
+            "host:6379 extra",
+        ] {
+            assert!(redirect_address(&mut addr, target).is_err(), "{target}");
+        }
     }
 }

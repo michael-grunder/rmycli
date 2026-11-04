@@ -2,7 +2,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{config, session::Config};
+use crate::{
+    config,
+    session::{ClusterMode, Config},
+};
 use clap::Parser;
 use redis::{ConnectionAddr, IntoConnectionInfo};
 
@@ -112,7 +115,7 @@ pub struct Options {
     /// Set the main connection's CLIENT SETNAME
     #[arg(long, help_heading = "Connection")]
     pub name: Option<String>,
-    /// Follow MOVED/ASK redirects outside transactions and WATCH
+    /// Force MOVED/ASK following even if automatic cluster detection is off
     #[arg(short = 'c', conflicts_with = "socket", help_heading = "Connection")]
     pub cluster: bool,
     /// Print RESP3 push messages (yes/no; default: yes on a terminal)
@@ -228,7 +231,13 @@ impl Options {
                 .or_else(|| Some(Duration::from_millis(self.timeout_ms)))
                 .filter(|duration| !duration.is_zero()),
             name: self.name.clone(),
-            cluster: self.cluster,
+            cluster: if self.cluster {
+                ClusterMode::Enabled
+            } else if settings.auto_cluster {
+                ClusterMode::Auto
+            } else {
+                ClusterMode::Disabled
+            },
             output: self.output.clone(),
             show_pushes: self.show_pushes.as_deref().map_or_else(
                 || std::io::IsTerminal::is_terminal(&std::io::stdout()),
@@ -302,6 +311,26 @@ mod tests {
              db = 2\nuser = 'alice'\npassword = 'qa-secret'\ntls = true",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn automatic_cluster_setting_keeps_explicit_override() {
+        let settings = config::Settings::parse("auto-cluster = false").unwrap();
+        for flags in [&["rmycli"][..], &["rmycli", "-c"][..]] {
+            let config = options(flags).config(&settings).unwrap();
+            assert_eq!(
+                config.cluster,
+                if flags.len() == 2 {
+                    ClusterMode::Enabled
+                } else {
+                    ClusterMode::Disabled
+                }
+            );
+        }
+        let config = options(&["rmycli"])
+            .config(&config::Settings::default())
+            .unwrap();
+        assert_eq!(config.cluster, ClusterMode::Auto);
     }
 
     #[test]

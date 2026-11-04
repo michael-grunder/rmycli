@@ -60,7 +60,7 @@ impl RedisFixture {
                 timeout: Duration::from_millis(300),
                 connect_timeout: Some(Duration::from_millis(300)),
                 name: None,
-                cluster: false,
+                cluster: crate::session::ClusterMode::Auto,
                 output: crate::output::Options::default(),
                 show_pushes: false,
             },

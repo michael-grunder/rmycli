@@ -8,11 +8,13 @@ use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::session::Config;
+use crate::session::{ClusterMode, Config};
 
 type Stream = Box<dyn redis::aio::AsyncStream + Unpin + Send>;
 
 pub struct Connection {
+    pub cluster: bool,
+    pub redirect: bool,
     writer: Option<WriteHalf<Stream>>,
     incoming: mpsc::Receiver<RedisResult<Value>>,
     reader: JoinHandle<()>,
@@ -78,12 +80,15 @@ impl Connection {
                 }
             });
             let mut connection = Self {
+                cluster: false,
+                redirect: false,
                 writer: Some(writer),
                 incoming,
                 reader,
                 write_timeout: config.timeout,
             };
             connection.handshake(config).await?;
+            connection.detect_server(config, &mut |_| {}).await?;
             Ok(connection)
         };
         if let Some(timeout) = config.connect_timeout {
@@ -148,6 +153,59 @@ impl Connection {
         Ok(())
     }
 
+    pub async fn detect_server(
+        &mut self,
+        config: &Config,
+        push: &mut impl FnMut(&Value),
+    ) -> RedisResult<()> {
+        // AUTH can revoke introspection without clearing negotiated capabilities.
+        // Unix sockets have no TCP hostname to preserve on an empty-host redirect.
+        if matches!(config.info.addr(), ConnectionAddr::Unix(_)) {
+            return Ok(());
+        }
+        let probe = async {
+            let reply = self
+                .query_with_push(redis::cmd("INFO").arg("SERVER"), push)
+                .await?;
+            let Ok(info) = redis::from_redis_value::<redis::InfoDict>(reply)
+            else {
+                return Ok(());
+            };
+            self.cluster = config.cluster == ClusterMode::Auto
+                && info
+                    .get::<String>("server_mode")
+                    .or_else(|| info.get("redis_mode"))
+                    .as_deref()
+                    == Some("cluster");
+            if info.contains_key(&"valkey_version") {
+                self.redirect = self
+                    .query_with_push(
+                        redis::cmd("CLIENT").arg("CAPA").arg("REDIRECT"),
+                        push,
+                    )
+                    .await?
+                    == Value::Okay;
+            }
+            Ok::<(), redis::RedisError>(())
+        };
+        match tokio::time::timeout(config.timeout, probe).await {
+            Ok(Err(error)) if error.code().is_some() => {
+                // Introspection and newer capabilities may be unavailable or denied.
+                Ok(())
+            }
+            Ok(result) => result,
+            Err(_) => {
+                // A late probe reply must never be mistaken for a user's reply.
+                self.close();
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "server detection timed out",
+                )
+                .into())
+            }
+        }
+    }
+
     pub async fn send_packed_command(
         &mut self,
         bytes: &[u8],
@@ -180,11 +238,19 @@ impl Connection {
     }
 
     pub async fn query(&mut self, command: &redis::Cmd) -> RedisResult<Value> {
+        self.query_with_push(command, &mut |_| {}).await
+    }
+
+    async fn query_with_push(
+        &mut self,
+        command: &redis::Cmd,
+        push: &mut impl FnMut(&Value),
+    ) -> RedisResult<Value> {
         self.send_packed_command(&command.get_packed_command())
             .await?;
         loop {
             match self.recv_response().await? {
-                Value::Push { .. } => {}
+                value @ Value::Push { .. } => push(&value),
                 Value::ServerError(error) => return Err(error.into()),
                 value => return Ok(value),
             }

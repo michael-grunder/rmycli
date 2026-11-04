@@ -6,12 +6,24 @@ use std::path::{Path, PathBuf};
 use crossterm::style::Color;
 use serde::{Deserialize, Deserializer, de::Error};
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Settings {
+    pub auto_cluster: bool,
     pub save_auth: crate::auth::SaveAuth,
     pub theme: Theme,
     pub instances: BTreeMap<String, Instance>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            auto_cluster: true,
+            save_auth: crate::auth::SaveAuth::default(),
+            theme: Theme::default(),
+            instances: BTreeMap::new(),
+        }
+    }
 }
 
 impl Settings {
@@ -200,6 +212,12 @@ mod tests {
     #[test]
     fn defaults_and_partial_settings() {
         let settings = Settings::parse("").unwrap();
+        assert!(settings.auto_cluster);
+        assert!(
+            !Settings::parse("auto-cluster = false")
+                .unwrap()
+                .auto_cluster
+        );
         assert_eq!(settings.theme.hint_color("GET"), Color::DarkGrey);
         assert!(settings.instances.is_empty());
         let settings =
@@ -231,6 +249,8 @@ mod tests {
     fn invalid_settings_are_rejected() {
         for source in [
             "unknown = true",
+            "auto-cluster = 'false'",
+            "auto-cluster = 1",
             "[theme]\ninline-hnit = 'red'",
             "[theme]\ninline-hint = 'invisible'",
             "[theme]\ninline-hint = '#12345g'",

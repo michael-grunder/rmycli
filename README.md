@@ -145,12 +145,29 @@ rmycli --scan --pattern 'user:*' --count 100
   is a Redis work hint, not a result limit. Like redis-cli, this explicit listing
   may contain duplicates and is not a snapshot. It does not use the bounded
   completion budgets and makes no unique-key-count claim.
-- `-c` follows up to five MOVED/ASK redirects, including ASKING before an ASK
-  retry. It preserves TLS, authentication, database, protocol, and client name.
-  It never retries network failures, or redirects while MULTI/WATCH is active.
-  Reconnecting to a redirected node does not restore other connection-local
-  state. Discovery and estimates cover only the currently connected node.
-  `-c` cannot be combined with `-s`.
+- Cluster mode is detected automatically using `INFO SERVER` after connecting.
+  Set top-level `auto-cluster = false` in `rmycli.toml`, or run
+  `rmycli config set auto-cluster false`, to disable automatic cluster mode.
+  `-c` explicitly enables MOVED/ASK following even when detection is disabled
+  or denied by ACLs. ASK retries send ASKING first.
+- Valkey connections automatically advertise `CLIENT CAPA REDIRECT` when
+  supported, enabling standalone replicas to redirect commands to their primary
+  during failover. Valkey uses `REDIRECT host:port`, without a cluster slot.
+  This works independently of `auto-cluster` and `-c`, including with `--scan`.
+  Use `READONLY` to deliberately read from a Valkey replica. See
+  [CLIENT CAPA](https://valkey.io/commands/client-capa/).
+- Detection and capability negotiation run after authentication and on each
+  redirected connection. Unsupported or ACL-denied probes leave manual commands
+  available; detection is retried after successful AUTH/HELLO AUTH or RESET,
+  once MULTI/WATCH ends. Automatic redirects require TCP or TLS; Unix sockets
+  keep direct-connection behavior, and `-c` cannot be combined with `-s`.
+- Redirect following stops after five redirects. It preserves TLS,
+  authentication, database, protocol, and client name, but does not restore other
+  connection-local state. Network failures are never retried, and commands are
+  never redirected while MULTI/WATCH or streaming is active. This supports
+  server-directed failover, not guaranteed recovery from a lost connection.
+  Discovery and estimates use separate direct connections to the current node;
+  they do not negotiate redirects or discover the whole cluster.
 
 ### Deliberately omitted and currently unsupported options
 
@@ -448,8 +465,8 @@ yet. With a completion popup open, either Enter only accepts the candidate.
 
 Ctrl+Enter requires a terminal that distinguishes it from Enter. The editor
 requests the Kitty keyboard protocol, including modifier presses and releases.
-On supporting terminals, holding either Ctrl key changes `rmycli>` to
-`rmycli[Ctrl]>`; releasing it restores the prompt. Modifier events leave the
+On supporting terminals, holding either Ctrl key changes `127.0.0.1:6379>` to
+`127.0.0.1:6379[Ctrl]>`; releasing it restores the prompt. Modifier events leave the
 input, completion popup, and confirmation unchanged. Shift remains available
 for typing case-sensitive keys. Ctrl+Enter with a popup open only accepts the
 candidate; release events never submit commands.
@@ -485,8 +502,10 @@ them. Short status messages share the input line when it is empty. Help,
 completion, and longer messages reserve space below the prompt only when
 visible, scrolling as needed at the bottom of the terminal.
 Closing a panel removes it and preserves the input. Errors, discovery progress,
-and confirmations still appear when needed. The prompt is `rmycli>` for database
-zero and `rmycli[N]>` otherwise.
+and confirmations still appear when needed. The prompt shows the current host
+and port, such as `127.0.0.1:6379>` or `127.0.0.1:7000>`. Nonzero databases
+add a suffix, such as `127.0.0.1:6379[2]>`; database zero has no suffix. Unix
+connections show the socket path instead of host and port.
 
 History is bounded to 500 commands and is not saved to disk. Pasting text never
 submits a command. Output retention is controlled by your terminal's scrollback
@@ -497,7 +516,7 @@ settings; the application does not keep a separate transcript.
 For example:
 
 ```text
-rmycli> LRANGE list:<Tab>
+127.0.0.1:6379> LRANGE list:<Tab>
 ```
 
 starts discovery on an independent connection with:

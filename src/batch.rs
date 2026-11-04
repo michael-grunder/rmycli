@@ -154,14 +154,16 @@ pub async fn scan(
     loop {
         // Stream each batch without retaining an unbounded keyspace in memory.
         let reply = session
-            .connection
-            .query(
-                redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .arg("COUNT")
-                    .arg(batch.count.unwrap_or(10)),
+            .execute_with_push(
+                &[
+                    b"SCAN".to_vec(),
+                    cursor.to_string().into_bytes(),
+                    b"MATCH".to_vec(),
+                    pattern.clone(),
+                    b"COUNT".to_vec(),
+                    batch.count.unwrap_or(10).to_string().into_bytes(),
+                ],
+                |_| {},
             )
             .await?;
         let (next, keys): (u64, Vec<Vec<u8>>) = redis::from_redis_value(reply)?;
