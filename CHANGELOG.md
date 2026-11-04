@@ -55,6 +55,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Link the GitHub repository as both the package homepage and source repository.
 - License the application source code under MIT, retaining the bundled Redis
   documentation's separate CC BY-SA 4.0 license and attribution.
 - Add crates.io discovery metadata, a verified Rust 1.88 minimum, an explicit
