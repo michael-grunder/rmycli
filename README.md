@@ -323,6 +323,12 @@ arbitrary hostnames or include private network addresses. Changing the policy
 to `false` stops future saves but still reads existing entries. Delete an entry
 to forget it; RESET does not delete saved credentials.
 
+MOVED, ASK, and Valkey REDIRECT connections reuse the session's credentials.
+After a successful redirected connection, those credentials are also saved for
+the destination endpoint if `save-auth` permits it. Later direct connections to
+that node can then use its saved credentials. Failed authentication never saves
+credentials for the destination.
+
 Passwords are stored as **plaintext**. Protect manually created auth files with
 `chmod 600 ~/.config/rmycli-auth.toml`. Automatic writes replace files atomically
 with owner-only permissions on Unix and follow existing symlinks. Invalid files

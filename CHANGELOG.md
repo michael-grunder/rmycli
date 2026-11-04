@@ -28,6 +28,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Save credentials for successfully authenticated MOVED, ASK, and Valkey REDIRECT
+  destinations when permitted by `save-auth`, so later direct connections to
+  those nodes can authenticate automatically.
+
 - Automatically detect cluster mode after connecting; `auto-cluster = false`
   disables automatic MOVED/ASK following, while `-c` remains an explicit override.
 

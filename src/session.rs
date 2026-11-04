@@ -167,6 +167,7 @@ impl Session {
             }
             self.connection = connection;
             self.config = config;
+            self.save_auth();
         }
         unreachable!("the last redirect returns its error")
     }
@@ -884,6 +885,97 @@ mod tests {
             tokio::task::yield_now().await;
             source.join().unwrap();
             target.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_save_credentials_only_after_successful_authentication() {
+        use crate::auth::{SaveAuth, Store};
+
+        for kind in ["MOVED 1", "ASK 1", "REDIRECT"] {
+            for (policy, accepted, broken_store) in [
+                (SaveAuth::Local, true, false),
+                (SaveAuth::Always, true, false),
+                (SaveAuth::Never, true, false),
+                (SaveAuth::Local, false, false),
+                (SaveAuth::Local, true, true),
+            ] {
+                let (port, target) = server(move |args| {
+                    if args[0] == "AUTH" {
+                        assert_eq!(args, &["AUTH", "alice", "secret"]);
+                        if !accepted {
+                            return b"-WRONGPASS invalid credentials\r\n"
+                                .to_vec();
+                        }
+                    }
+                    b"+OK\r\n".to_vec()
+                });
+                let (source_port, source) = server(move |args| {
+                    if args[0] == "GET" {
+                        format!("-{kind} 127.0.0.1:{port}\r\n").into_bytes()
+                    } else {
+                        b"+OK\r\n".to_vec()
+                    }
+                });
+                let dir = tempfile::tempdir().unwrap();
+                let store = Store {
+                    path: dir.path().join("auth.toml"),
+                    policy,
+                };
+                let mut source_config = config(source_port);
+                source_config.auth_store = Some(store.clone());
+                source_config.info =
+                    source_config.info.clone().set_redis_settings(
+                        source_config
+                            .info
+                            .redis_settings()
+                            .clone()
+                            .set_username("alice")
+                            .set_password("secret"),
+                    );
+                let mut session = Session::open(source_config).await.unwrap();
+                session.connection.redirect = kind == "REDIRECT";
+                if broken_store {
+                    std::fs::write(&store.path, "[broken").unwrap();
+                }
+                let result =
+                    session.execute(&[b"GET".to_vec(), b"foo".to_vec()]).await;
+                if accepted {
+                    assert_eq!(result.unwrap(), Value::Okay);
+                } else {
+                    assert_eq!(result.unwrap_err().code(), Some("WRONGPASS"));
+                }
+                if broken_store {
+                    assert_eq!(
+                        std::fs::read_to_string(&store.path).unwrap(),
+                        "[broken"
+                    );
+                    assert!(session.notices.iter().any(|notice| {
+                        notice.contains("could not be saved")
+                    }));
+                } else {
+                    assert_eq!(session.notices, Vec::<String>::new());
+                    for (endpoint, saved) in
+                        [(source_port, true), (port, accepted)]
+                    {
+                        let mut direct = config(endpoint).info;
+                        store.apply(&mut direct).unwrap();
+                        let saved = saved && policy != SaveAuth::Never;
+                        assert_eq!(
+                            direct.redis_settings().username(),
+                            saved.then_some("alice")
+                        );
+                        assert_eq!(
+                            direct.redis_settings().password(),
+                            saved.then_some("secret")
+                        );
+                    }
+                }
+                drop(session);
+                tokio::task::yield_now().await;
+                source.join().unwrap();
+                target.join().unwrap();
+            }
         }
     }
 
