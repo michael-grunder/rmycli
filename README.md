@@ -445,6 +445,7 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Left / Right, Home / End, Ctrl-A / Ctrl-E | Move the cursor |
 | Backspace / Delete, Ctrl-U / Ctrl-K | Delete characters or text before/after the cursor |
 | Up / Down | Browse in-memory command history |
+| Ctrl-R | Search command history with fuzzy matching |
 | F1 | Open or close command help, editor shortcuts, and connection details |
 | PageUp / PageDown, Up / Down with help open | Scroll the help panel |
 | Enter with help open | Close help without submitting input |
@@ -454,6 +455,29 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | `HELP command`, `HELP @group` | Full command help or commands in a group |
 | `HELP`, `\help` | Open editor help and connection details |
 | `\reconnect` | Open a new connection and refresh metadata |
+
+Ctrl-R opens a history popup, using the current input as the initial query.
+Type to filter, use Ctrl-R / Down / Tab for the next match and Up / Shift-Tab
+for the previous match. Enter recalls the selection for editing; press Enter
+again to execute it. Esc or Ctrl-C closes search and restores the original
+input and cursor. An empty query shows all retained commands; no matches leaves
+the search open. Duplicate commands appear once, newest first. History remains
+in memory for this session, limited to the last 500 submitted entries.
+
+Search supports fuzzy terms and the leading-apostrophe convention from
+[fzf](https://junegunn.github.io/fzf/search-syntax/): `gusr` matches
+`GET user:42`, while `'user` requires the contiguous substring `user`.
+Space-separated terms must all match, in any order; `get 'user` combines both
+styles. Escape a space with a backslash to keep it inside a term:
+`'GET\ user` searches for the exact substring `GET user`. Lowercase terms
+ignore case; a term containing uppercase letters is case sensitive. The
+apostrophe is a prefix, not a pair of shell quotes. Other fzf operators and
+fzf's relevance scoring are not implemented; results stay newest first.
+
+Ctrl-R uses the ordinary terminal control character, including inside tmux;
+it does not require extended keys or the Kitty keyboard protocol. No tmux
+configuration changes are needed with its default bindings. A custom tmux
+binding or terminal shortcut that intercepts Ctrl-R can still prevent delivery.
 
 Experiment with `KEYS *` or `KEYS foo:*` followed by **Ctrl+Enter** to stream
 keys using `SCAN` until cursor zero. The pattern is passed through unchanged:
@@ -663,6 +687,10 @@ and Python 3, then run:
 cargo build --locked
 python3 tests/terminal_smoke.py
 ```
+
+When `tmux` is installed, the smoke suite also checks Ctrl-R search in a
+private tmux server with no user configuration. Linux CI installs tmux for this
+check. The test does not connect to or modify existing tmux sessions.
 
 Use the 80-column `rustfmt.toml` configuration and keep `Cargo.lock` tracked.
 See [AGENTS.md](AGENTS.md), [CHANGELOG.md](CHANGELOG.md), and the bundled help's

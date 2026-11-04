@@ -24,7 +24,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     config::Theme,
-    estimate, hints, input,
+    estimate, hints, history, input,
     metadata::Catalog,
     scan::{Discovery, Limits},
     session::{Config, Session},
@@ -36,7 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Quick replies replace the submitted line directly. Only commands that
 /// outlast this delay get an intermediate prompt with a busy status.
 const BUSY_PROMPT_DELAY: Duration = Duration::from_millis(200);
-/// Number of submitted lines kept for Up/Down recall.
+/// Number of submitted lines kept for recall and search.
 const HISTORY_LIMIT: usize = 500;
 
 struct Screen {
@@ -169,6 +169,27 @@ impl Editor {
             .next()
             .map_or(0, char::len_utf8);
     }
+    fn edit(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => self.insert(&c.to_string()),
+            KeyCode::Left => self.left(),
+            KeyCode::Right => self.right(),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.line.len(),
+            KeyCode::Up => self.history(true),
+            KeyCode::Down => self.history(false),
+            KeyCode::Backspace if self.cursor > 0 => {
+                let end = self.cursor;
+                self.left();
+                self.line.drain(self.cursor..end);
+            }
+            KeyCode::Delete if self.cursor < self.line.len() => {
+                self.line.remove(self.cursor);
+            }
+            _ => {}
+        }
+    }
+
     fn remember(&mut self) {
         if self.history.back() != Some(&self.line) {
             self.history.push_back(self.line.clone());
@@ -194,6 +215,25 @@ impl Editor {
         self.line = self.history.get(index).unwrap_or(&self.draft).clone();
         self.history_index = (index < self.history.len()).then_some(index);
         self.cursor = self.line.len();
+    }
+}
+
+struct HistorySearch {
+    query: Editor,
+    popup: Popup,
+}
+
+impl HistorySearch {
+    fn status(&self) -> String {
+        format!(
+            "{} matches • Ctrl-R/↓ next • ↑ previous • Enter recall • Esc/Ctrl-C cancel • 'term exact",
+            self.popup.candidates.len()
+        )
+    }
+
+    fn refresh(&mut self, history: &VecDeque<String>) {
+        self.popup.candidates = history::search(history, &self.query.line);
+        self.popup.selected = 0;
     }
 }
 
@@ -432,6 +472,7 @@ struct App {
     status: String,
     popup: Option<Popup>,
     help: Option<Help>,
+    history_search: Option<HistorySearch>,
     scan: Option<Discovery>,
     listing: Option<Arc<AtomicBool>>,
     control_keys: [bool; 2],
@@ -457,6 +498,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         status: "Loading server command metadata…".into(),
         popup: None,
         help: None,
+        history_search: None,
         scan: None,
         listing: None,
         control_keys: [false; 2],
@@ -520,9 +562,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
                     app.control_keys = [false; 2];
                 }
                 TerminalEvent::Paste(text) => {
-                    app.invalidate();
-                    // Pasting never submits commands, including embedded newlines.
-                    app.editor.insert(&text.replace(['\r', '\n'], " "));
+                    app.paste(&text);
                 }
                 TerminalEvent::Resize(_, height) => {
                     // The terminal can reflow existing output on resize.
@@ -673,10 +713,17 @@ impl App {
         }
         // Typing ahead or cancelling should show the full prompt and status.
         self.busy_until = None;
+        if self.history_search.is_some() {
+            return self.search_key(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code != KeyCode::Enter
         {
             match key.code {
+                KeyCode::Char('r') => {
+                    self.start_history_search();
+                    return false;
+                }
                 KeyCode::Char('d') => {
                     if let Some(cancelled) = &self.listing {
                         cancelled.store(true, Ordering::Relaxed);
@@ -750,9 +797,99 @@ impl App {
             }
             code => {
                 self.invalidate();
-                self.edit(code);
+                self.editor.edit(code);
             }
         }
+        false
+    }
+
+    fn start_history_search(&mut self) {
+        self.invalidate();
+        let mut search = HistorySearch {
+            query: Editor {
+                line: self.editor.line.clone(),
+                cursor: self.editor.line.len(),
+                ..Editor::default()
+            },
+            popup: Popup {
+                candidates: Vec::new(),
+                selected: 0,
+                span: 0..0,
+            },
+        };
+        search.refresh(&self.editor.history);
+        self.history_search = Some(search);
+    }
+
+    fn paste(&mut self, text: &str) {
+        self.busy_until = None;
+        // Pasting never submits commands, including embedded newlines.
+        let text = text.replace(['\r', '\n'], " ");
+        if let Some(search) = &mut self.history_search {
+            search.query.insert(&text);
+            search.refresh(&self.editor.history);
+        } else {
+            self.invalidate();
+            self.editor.insert(&text);
+        }
+    }
+
+    fn search_key(&mut self, key: KeyEvent) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if key.code == KeyCode::Esc
+            || (control && key.code == KeyCode::Char('c'))
+        {
+            self.history_search = None;
+            return false;
+        }
+        if control && key.code == KeyCode::Char('d') {
+            self.history_search = None;
+            return self.on_key(key);
+        }
+        let search = self.history_search.as_mut().unwrap();
+        if key.code == KeyCode::Enter {
+            if let Some(line) =
+                search.popup.candidates.get(search.popup.selected)
+            {
+                self.editor.line.clone_from(line);
+                self.editor.cursor = line.len();
+                self.editor.history_index = None;
+                self.history_search = None;
+            }
+            return false;
+        }
+        let cycle = match key.code {
+            KeyCode::Char('r' | 'n') if control => Some(false),
+            KeyCode::Char('p') if control => Some(true),
+            KeyCode::Down | KeyCode::Tab => Some(false),
+            KeyCode::Up | KeyCode::BackTab => Some(true),
+            _ => None,
+        };
+        if let Some(reverse) = cycle {
+            if !search.popup.candidates.is_empty() {
+                search.popup.cycle(reverse);
+            }
+            return false;
+        }
+        if control {
+            match key.code {
+                KeyCode::Char('a') => search.query.cursor = 0,
+                KeyCode::Char('e') => {
+                    search.query.cursor = search.query.line.len();
+                }
+                KeyCode::Char('u') => {
+                    search.query.line.drain(..search.query.cursor);
+                    search.query.cursor = 0;
+                }
+                KeyCode::Char('k') => {
+                    search.query.line.truncate(search.query.cursor);
+                }
+                _ => return false,
+            }
+        } else {
+            search.query.edit(key.code);
+        }
+        search.refresh(&self.editor.history);
         false
     }
 
@@ -810,27 +947,6 @@ impl App {
             }
         }
         true
-    }
-
-    fn edit(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Char(c) => self.editor.insert(&c.to_string()),
-            KeyCode::Left => self.editor.left(),
-            KeyCode::Right => self.editor.right(),
-            KeyCode::Home => self.editor.cursor = 0,
-            KeyCode::End => self.editor.cursor = self.editor.line.len(),
-            KeyCode::Up => self.editor.history(true),
-            KeyCode::Down => self.editor.history(false),
-            KeyCode::Backspace if self.editor.cursor > 0 => {
-                let end = self.editor.cursor;
-                self.editor.left();
-                self.editor.line.drain(self.editor.cursor..end);
-            }
-            KeyCode::Delete if self.editor.cursor < self.editor.line.len() => {
-                self.editor.line.remove(self.editor.cursor);
-            }
-            _ => {}
-        }
     }
 
     fn confirm_key(&mut self, code: KeyCode) -> bool {
@@ -1139,6 +1255,7 @@ impl App {
             "HELP command: full command help; HELP @group: command list".into(),
             "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
             "Ctrl+Enter on KEYS <pattern>: stream SCAN batches; Ctrl-C stops without disconnecting".into(),
+            "Ctrl-R: fuzzy history search; 'term: exact substring; Enter: recall; Esc/Ctrl-C: restore draft".into(),
             "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
             "F1: command and editor help; PgUp/PgDn: scroll help; Ctrl-D or \\quit: exit".into(),
             "CLEAR or Ctrl-L: clear the screen; terminal scrollback retains output".into(),
@@ -1161,6 +1278,31 @@ impl App {
         self.draw_frame(screen, &mut frame, (width, height))?;
         out.write_all(&frame)?;
         out.flush()
+    }
+
+    fn input_prompt(&self) -> String {
+        let mut prompt = if self.history_search.is_some() {
+            "history> ".into()
+        } else {
+            prompt(&self.config.info)
+        };
+        if self.control_keys.contains(&true) {
+            prompt.insert_str(prompt.len() - 2, "[Ctrl]");
+        }
+        prompt
+    }
+
+    fn hint_color(&self, line: &str) -> Color {
+        let args = input::parse(line)
+            .words
+            .into_iter()
+            .map(|word| word.bytes)
+            .collect::<Vec<_>>();
+        self.catalog
+            .resolve(&args)
+            .map_or(self.options.theme.inline_hint, |(command, _)| {
+                self.options.theme.hint_color(&command.name)
+            })
     }
 
     fn draw_frame(
@@ -1188,20 +1330,23 @@ impl App {
                 EndSynchronizedUpdate
             );
         }
-        let mut prompt = prompt(&self.config.info);
-        if self.control_keys.contains(&true) {
-            prompt.insert_str(prompt.len() - 2, "[Ctrl]");
-        }
-        let inline_status = self.editor.line.is_empty()
-            && self.popup.is_none()
+        let search = self.history_search.as_ref();
+        let editor = search.map_or(&self.editor, |search| &search.query);
+        let popup =
+            search.map_or(self.popup.as_ref(), |search| Some(&search.popup));
+        let search_status = search.map(HistorySearch::status);
+        let status_text = search_status.as_ref().unwrap_or(&self.status);
+        let prompt = self.input_prompt();
+        let inline_status = editor.line.is_empty()
+            && popup.is_none()
             && self.help.is_none()
-            && display_width(&safe(&self.status))
+            && display_width(&safe(status_text))
                 <= width.saturating_sub(display_width(&safe(&prompt)));
         let available = usize::from(height - 1);
-        let status = if self.status.is_empty() || inline_status {
+        let status = if status_text.is_empty() || inline_status {
             Vec::new()
         } else {
-            wrap(&self.status, width)
+            wrap(status_text, width)
                 .into_iter()
                 .take(available)
                 .collect()
@@ -1215,45 +1360,40 @@ impl App {
             help.offset = help.offset.min(count.saturating_sub(rows));
             rows + 2
         } else {
-            self.popup.as_ref().map_or(0, |popup| {
+            popup.map_or(0, |popup| {
                 popup.candidates.len().min(8).min(panel_available - 2) + 2
             })
         };
         screen.reserve(out, 1 + status.len() + panel_rows, height)?;
         let input_row = usize::from(screen.row);
         let (line, column) = viewport(
-            &format!("{prompt}{}", self.editor.line),
-            prompt.len() + self.editor.cursor,
+            &format!("{prompt}{}", editor.line),
+            prompt.len() + editor.cursor,
             width,
         );
         draw_line(out, input_row, &line, Color::White)?;
-        let hint = if inline_status {
-            self.status.clone()
+        let hint = if search.is_some() {
+            String::new()
+        } else if inline_status {
+            status_text.clone()
         } else {
-            self.catalog
-                .inline_hint(&self.editor.line, self.editor.cursor)
+            self.catalog.inline_hint(&editor.line, editor.cursor)
         };
         let used = display_width(&line);
         let hint = fit(&safe(&hint), width.saturating_sub(used));
-        let args = input::parse(&self.editor.line)
-            .words
-            .into_iter()
-            .map(|word| word.bytes)
-            .collect::<Vec<_>>();
-        let color = self
-            .catalog
-            .resolve(&args)
-            .map_or(self.options.theme.inline_hint, |(command, _)| {
-                self.options.theme.hint_color(&command.name)
-            });
+        let color = self.hint_color(&editor.line);
         queue!(out, SetForegroundColor(color), Print(hint), ResetColor)?;
         let panel_row = input_row + 1 + status.len();
         if let Some(help) = &self.help {
             help.draw(out, panel_row, width, panel_rows)?;
-        } else if let Some(popup) = &self.popup {
-            let anchor = column.saturating_sub(display_width(&safe(
-                &self.editor.line[popup.span.start..self.editor.cursor],
-            )));
+        } else if let Some(popup) = popup {
+            let anchor = if search.is_some() {
+                0
+            } else {
+                column.saturating_sub(display_width(&safe(
+                    &editor.line[popup.span.start..editor.cursor],
+                )))
+            };
             popup.draw(out, anchor, panel_row, width, panel_rows)?;
         }
         for (offset, line) in status.iter().enumerate() {
@@ -1491,6 +1631,7 @@ mod tests {
             status: String::new(),
             popup: None,
             help: None,
+            history_search: None,
             scan: None,
             listing: None,
             control_keys: [false; 2],
@@ -1508,6 +1649,138 @@ mod tests {
             },
         };
         (app, executed)
+    }
+
+    #[test]
+    fn history_search_recalls_without_executing_and_ignores_stale_work() {
+        let (mut app, mut executed) = test_app();
+        app.editor.line.clear();
+        app.editor.cursor = 0;
+        app.editor.history = ["GET user:1", "GET upper:2", "GET user:3"]
+            .map(String::from)
+            .into();
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(app.pending.args.is_none());
+        app.paste("gusr");
+        let search = app.history_search.as_ref().unwrap();
+        assert_eq!(search.popup.candidates, ["GET user:3", "GET user:1"]);
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.history_search.as_ref().unwrap().popup.selected, 1);
+        app.on_worker(Event::Estimated {
+            generation: 0,
+            count: Some(1),
+        });
+        app.on_worker(Event::Scanned {
+            generation: 0,
+            state: Discovery {
+                keys: std::collections::BTreeSet::from([b"unrelated".to_vec()]),
+                complete: true,
+                ..Discovery::default()
+            },
+        });
+        assert!(app.popup.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        assert!(app.history_search.is_none());
+        assert_eq!(app.editor.line, "GET user:1");
+        assert_eq!(app.editor.cursor, app.editor.line.len());
+        assert!(executed.try_recv().is_err());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Execution::Run(args) = executed.try_recv().unwrap() else {
+            panic!("expected recalled command");
+        };
+        assert_eq!(args, [b"GET".to_vec(), b"user:1".to_vec()]);
+    }
+
+    #[test]
+    fn history_search_cancel_preserves_draft_cursor_and_running_command() {
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.editor.cursor = 2;
+            app.editor.history_index = Some(0);
+            app.editor.draft = "original".into();
+            app.mode = Mode::Busy;
+            let cancelled = Arc::new(AtomicBool::new(false));
+            app.listing = Some(cancelled.clone());
+            app.on_key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            ));
+            assert_eq!(
+                app.history_search.as_ref().unwrap().query.line,
+                "GET a"
+            );
+            app.paste("different\nquery");
+            app.on_key(key);
+            assert!(app.history_search.is_none());
+            assert_eq!(app.editor.line, "GET a");
+            assert_eq!(app.editor.cursor, 2);
+            assert_eq!(app.editor.history_index, Some(0));
+            assert_eq!(app.editor.draft, "original");
+            assert!(!cancelled.load(Ordering::Relaxed));
+            assert!(app.mode == Mode::Busy);
+            assert!(executed.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn history_query_editing_empty_results_and_key_releases_are_safe() {
+        let (mut app, mut executed) = test_app();
+        app.editor.history.push_back("GET café".into());
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.paste("'cfé");
+        assert_eq!(
+            app.history_search.as_ref().unwrap().popup.candidates,
+            Vec::<String>::new()
+        );
+        for code in [KeyCode::Enter, KeyCode::Tab, KeyCode::Up, KeyCode::Down] {
+            app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        assert!(app.history_search.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(
+            app.history_search.as_ref().unwrap().popup.candidates,
+            ["GET café"]
+        );
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.history_search.as_ref().unwrap().query.line, "cf");
+        app.on_key(KeyEvent::new_with_kind(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(app.history_search.is_some());
+        assert!(executed.try_recv().is_err());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.line, "GET café");
+    }
+
+    #[test]
+    fn history_search_draws_safely_across_pushes_and_resizes() {
+        let (mut app, mut executed) = test_app();
+        app.editor.history.push_back("GET a\x1b[2J".into());
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_worker(Event::Push(vec!["-> invalidate: 'key'".into()]));
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 23 });
+        for size in [(80, 24), (20, 6), (4, 2), (1, 1), (80, 24)] {
+            let mut rendered = Vec::new();
+            app.draw(&mut screen, &mut rendered, size).unwrap();
+            let text = String::from_utf8(rendered).unwrap();
+            assert!(!text.contains("\x1b[2J"));
+            assert!(screen.row < size.1);
+            if size.0 == 80 {
+                assert!(text.contains("history> GET a"));
+                assert!(text.contains("1 matches"));
+                assert!(text.contains(r"GET a\u{1b}[2J"));
+            }
+        }
+        assert_eq!(app.editor.line, "GET a");
+        assert!(executed.try_recv().is_err());
     }
 
     #[test]

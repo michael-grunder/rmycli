@@ -72,6 +72,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Ctrl-R history search with fuzzy terms, apostrophe-prefixed exact substrings,
+  smart case, and newest-first deduplicated matches. Enter recalls without
+  executing; Esc/Ctrl-C restores the draft and cursor. Includes plain terminal
+  and isolated tmux coverage without requiring extended keyboard support.
 - GitHub Actions checks for formatting, Clippy, and the existing Rust/Redis
   tests on Linux and macOS, plus Linux terminal smoke tests.
 - Manual and version-tag distribution builds for static musl Linux x86-64

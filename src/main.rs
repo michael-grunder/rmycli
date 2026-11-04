@@ -8,6 +8,7 @@ mod config_cli;
 mod estimate;
 mod grammar;
 mod hints;
+mod history;
 mod input;
 mod metadata;
 mod output;

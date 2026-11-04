@@ -41,7 +41,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes redis-server redis-tools
+          sudo apt-get install --yes redis-server redis-tools tmux
       - name: Install Redis (macOS)
         if: runner.os == 'macOS'
         run: brew install redis

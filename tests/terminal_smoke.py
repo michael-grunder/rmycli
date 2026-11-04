@@ -14,6 +14,8 @@ import pty
 import re
 import select
 import signal
+import shlex
+import shutil
 import socket as sockets
 import struct
 import subprocess
@@ -245,6 +247,64 @@ def password_prompt(socket, cancel=False):
         os.close(master)
 
 
+def tmux_history(socket, directory, redis):
+    """Check ordinary Ctrl-R with a private tmux server and default key handling."""
+    if not shutil.which("tmux"):
+        print("Skipping tmux history check: tmux is not installed")
+        return
+    tmux = ["tmux", "-S", str(Path(directory) / "tmux.sock"), "-f", "/dev/null"]
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("REDIS_URL", "REDISCLI_AUTH", "TMUX")}
+
+    def run(*args):
+        return subprocess.check_output([*tmux, *args], env=env, text=True)
+
+    def expect(*texts):
+        deadline = time.monotonic() + 5
+        while True:
+            pane = run("capture-pane", "-p", "-t", "history:0.0")
+            if all(text in pane for text in texts):
+                return
+            assert time.monotonic() < deadline, f"Missing {texts!r} in tmux: {pane!r}"
+            time.sleep(0.02)
+
+    def keys(*names):
+        run("send-keys", "-t", "history:0.0", *names)
+
+    def text(value):
+        run("send-keys", "-t", "history:0.0", "-l", value)
+
+    try:
+        run("new-session", "-d", "-s", "history", "-x", "120", "-y", "35",
+            shlex.join([str(BINARY), "--no-config", "-s", socket]))
+        expect(f"{socket}>")
+        for suffix in ("user", "upper"):
+            text(f"INCR tmux-history:{suffix}")
+            keys("Enter")
+            expect("(integer) 1")
+        keys("C-r")
+        text("husr")
+        expect("history> husr", "1 matches", "INCR tmux-history:user")
+        keys("Home")
+        text("'")
+        expect("history> 'husr", "0 matches")
+        keys("Home", "Delete")
+        expect("history> husr", "1 matches")
+        keys("Enter")
+        expect(f"{socket}> INCR tmux-history:user")
+        assert redis("GET", "tmux-history:user") == "1", "recall executed in tmux"
+        keys("C-u")
+        text("GET draft")
+        keys("Left", "Left", "Left", "C-r", "C-u")
+        text("missing")
+        expect("history> missing", "0 matches")
+        keys("C-c")
+        text("!")
+        expect(f"{socket}> GET dr!aft")
+    finally:
+        subprocess.run([*tmux, "kill-server"], env=env, capture_output=True, check=False)
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="rmycli-terminal-") as directory:
         settings_path = Path(directory) / "preview.toml"
@@ -295,6 +355,34 @@ def main():
             redis("ACL", "SETUSER", "ask-test", "on", ">hidden-test-password", "~*", "+@all")
             password_prompt(socket)
             password_prompt(socket, cancel=True)
+
+            tmux_history(socket, directory, redis)
+
+            history = Terminal(socket)
+            terminals.append(history)
+            for suffix in ("user", "upper"):
+                history.send(f"INCR history:{suffix}\r".encode())
+                history.expect("(integer) 1")
+            history.send(b"\x12husr")  # Legacy Ctrl-R byte, no extended keyboard protocol.
+            history.expect_frame(lambda f: f.row(f.y) == "history> husr"
+                                 and "1 matches" in f.row(f.y + 1), "fuzzy history")
+            history.send(b"\x01'")
+            history.expect("0 matches")
+            history.send(b"\x7f")
+            history.expect("1 matches")
+            history.send(b"\r")
+            history.expect_frame(lambda f: f.row(f.y).startswith(f"{socket}> INCR history:user")
+                                 and not f.row(f.y + 1), "accepted history command")
+            assert redis("GET", "history:user") == "1", "history acceptance executed"
+            history.send(b"\r")
+            history.expect("(integer) 2")
+            history.send(b"GET draft\x1b[D\x1b[D\x1b[D\x12\x15missing")
+            history.expect("0 matches")
+            history.send(b"\x03!")
+            history.expect_frame(lambda f: f.row(f.y).startswith(f"{socket}> GET dr!aft"),
+                                 "history cancellation restored draft cursor")
+            history.close()
+            terminals.remove(history)
 
             tracking = Terminal(socket, "-3")
             terminals.append(tracking)
