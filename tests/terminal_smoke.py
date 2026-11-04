@@ -72,14 +72,14 @@ class Frame:
         return "".join(self.cells.get((row, x), " ") for x in range(width)).rstrip()
 
     def hint_is_inline(self, typed, hint, colors=("90", "38;5;8")):
-        prompt = self.row(self.y).split(">", 1)[0] + "> "
+        prompt = self.row(self.y).split("❯", 1)[0] + "❯ "
         return (self.row(self.y) == prompt + typed + hint
                 and self.x == len(prompt + typed)
                 and (not hint or self.colors.get((self.y, self.x)) in colors))
 
 
 class Terminal:
-    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None, endpoint=None, user="default"):
+    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None, endpoint=None, user="default", prompt_text=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         connection = ["-s", socket] if socket else []
@@ -98,7 +98,7 @@ class Terminal:
         self.height = 35
         self.start_row = start_row
         started = time.monotonic()
-        prompt = f"{user}@{endpoint or socket}>"
+        prompt = prompt_text or f"{user}@{endpoint or socket} ❯"
         self.expect(prompt)
         if b"Loading server command metadata" in self.screen_data:
             assert time.monotonic() - started >= 0.2, "startup status flashed"
@@ -138,7 +138,7 @@ class Terminal:
     def expect(self, text, timeout=5):
         deadline = time.monotonic() + timeout
         needle = text.encode()
-        while needle not in self.data:
+        while needle not in re.sub(rb"\x1b\[[0-9;]*m", b"", self.data):
             remaining = deadline - time.monotonic()
             assert remaining > 0, f"Missing {text!r}: {self.data[-6000:]!r}"
             ready, _, _ = select.select([self.master], [], [], remaining)
@@ -280,7 +280,7 @@ def tmux_history(socket, directory, redis):
     try:
         run("new-session", "-d", "-s", "history", "-x", "120", "-y", "35",
             shlex.join([str(BINARY), "--no-config", "-s", socket]))
-        expect(f"default@{socket}>")
+        expect(f"default@{socket} ❯")
         for suffix in ("user", "upper"):
             text(f"INCR tmux-history:{suffix}")
             keys("Enter")
@@ -294,7 +294,7 @@ def tmux_history(socket, directory, redis):
         keys("Home", "Delete")
         expect("history> husr", "1 matches")
         keys("Enter")
-        expect(f"default@{socket}> INCR tmux-history:user")
+        expect(f"default@{socket} ❯ INCR tmux-history:user")
         assert redis("GET", "tmux-history:user") == "1", "recall executed in tmux"
         keys("C-u")
         text("GET draft")
@@ -303,7 +303,7 @@ def tmux_history(socket, directory, redis):
         expect("history> missing", "0 matches")
         keys("C-c")
         text("!")
-        expect(f"default@{socket}> GET dr!aft")
+        expect(f"default@{socket} ❯ GET dr!aft")
     finally:
         subprocess.run([*tmux, "kill-server"], env=env, capture_output=True, check=False)
 
@@ -359,6 +359,28 @@ def main():
             password_prompt(socket)
             password_prompt(socket, cancel=True)
 
+            prompt_config = Path(directory) / "prompt.toml"
+            prompt_config.write_text(
+                'prompt = "{{cache}} {color:#12abef}{user}{reset} db={db} {color:green}{ctrl}❯ "\n'
+            )
+            custom = Terminal(socket, "--config", str(prompt_config),
+                              prompt_text="{cache} default db=0 ❯")
+            terminals.append(custom)
+            frame = custom.expect_frame(lambda f: f.row(f.y) == "{cache} default db=0 ❯",
+                                        "custom named prompt")
+            assert frame.colors[(frame.y, 8)] == "38;2;18;171;239"
+            assert frame.colors[(frame.y, 21)] in ("92", "38;5;10")
+            custom.send(b"SELECT 2\r")
+            custom.expect_frame(lambda f: f.row(f.y) == "{cache} default db=2 ❯"
+                                and f.row(f.y - 1) == "OK", "prompt follows SELECT")
+            custom.send(b"GET draft")
+            frame = custom.expect_frame(lambda f: f.hint_is_inline("GET draft", ""),
+                                        "custom prompt cursor and input")
+            assert frame.colors[(frame.y, len("{cache} default db=2 ❯ "))] in ("97", "38;5;15")
+            plain = Terminal(socket, env={"NO_COLOR": "1"})
+            terminals.append(plain)
+            assert not re.search(rb"\x1b\[(?:3[0-9]|9[0-7])(?:;[0-9]+)*m", plain.screen_data)
+
             tmux_history(socket, directory, redis)
 
             history = Terminal(socket)
@@ -374,7 +396,7 @@ def main():
             history.send(b"\x7f")
             history.expect("1 matches")
             history.send(b"\r")
-            history.expect_frame(lambda f: f.row(f.y).startswith(f"default@{socket}> INCR history:user")
+            history.expect_frame(lambda f: f.row(f.y).startswith(f"default@{socket} ❯ INCR history:user")
                                  and not f.row(f.y + 1), "accepted history command")
             assert redis("GET", "history:user") == "1", "history acceptance executed"
             history.send(b"\r")
@@ -382,7 +404,7 @@ def main():
             history.send(b"GET draft\x1b[D\x1b[D\x1b[D\x12\x15missing")
             history.expect("0 matches")
             history.send(b"\x03!")
-            history.expect_frame(lambda f: f.row(f.y).startswith(f"default@{socket}> GET dr!aft"),
+            history.expect_frame(lambda f: f.row(f.y).startswith(f"default@{socket} ❯ GET dr!aft"),
                                  "history cancellation restored draft cursor")
             history.close()
             terminals.remove(history)
@@ -391,7 +413,7 @@ def main():
             terminals.append(restored_history)
             restored_history.send(b"\x1b[A")
             restored_history.expect_frame(
-                lambda f: f.row(f.y).startswith(f"default@{socket}> INCR history:user"),
+                lambda f: f.row(f.y).startswith(f"default@{socket} ❯ INCR history:user"),
                 "Up recalls a command from the previous session",
             )
             assert redis("GET", "history:user") == "2", "restoring history executed"
@@ -399,7 +421,7 @@ def main():
             restored_history.expect("1 matches")
             restored_history.send(b"\r")
             restored_history.expect_frame(
-                lambda f: f.row(f.y).startswith(f"default@{socket}> INCR history:user"),
+                lambda f: f.row(f.y).startswith(f"default@{socket} ❯ INCR history:user"),
                 "Ctrl-R recalls persistent history",
             )
             restored_history.close()
@@ -420,7 +442,7 @@ def main():
             terminals.append(flat_history)
             flat_history.send(b"\x1b[A")
             flat_history.expect_frame(
-                lambda f: f.row(f.y).startswith(f"default@{other_socket}> INCR history:user"),
+                lambda f: f.row(f.y).startswith(f"default@{other_socket} ❯ INCR history:user"),
                 "flat history recalls another endpoint's command",
             )
             flat_history.send(b"\x15\x12husr")
@@ -439,15 +461,15 @@ def main():
                 tracking.expect(reply)
             tracking.send(b"GET draft\x1b[D")
             tracking.expect_frame(
-                lambda f: f.row(f.y) == f"default@{socket}> GET draft"
-                and f.x == len(f"default@{socket}> GET draf"), "draft before invalidation",
+                lambda f: f.row(f.y) == f"default@{socket} ❯ GET draft"
+                and f.x == len(f"default@{socket} ❯ GET draf"), "draft before invalidation",
             )
             tracking.data = b""
             redis("SET", "tracked", "changed")
             frame = tracking.expect_frame(
                 lambda f: any(f.row(y) == "-> invalidate: 'tracked'" for y in range(f.y))
-                and f.row(f.y) == f"default@{socket}> GET draft"
-                and f.x == len(f"default@{socket}> GET draf"), "idle push preserves input",
+                and f.row(f.y) == f"default@{socket} ❯ GET draft"
+                and f.x == len(f"default@{socket} ❯ GET draf"), "idle push preserves input",
             )
             row = next(y for y in range(frame.y) if frame.row(y) == "-> invalidate: 'tracked'")
             assert frame.colors[row, 0] == "1", "push was not bold"
@@ -466,14 +488,14 @@ def main():
             assert any("Connected" in frame.row(y) for y in range(frame.y + 1, 35))
             bottom.send(b"\x1b")
             bottom.expect_frame(
-                lambda f: f.row(f.y) == f"default@{socket}>"
+                lambda f: f.row(f.y) == f"default@{socket} ❯"
                 and all(not f.row(y) for y in range(f.y + 1, 35)),
                 "Escape removes help without leaving panel fragments",
             )
             for _ in range(20):
                 bottom.send(b"PING\r")
                 bottom.expect_frame(
-                    lambda f: f.row(f.y) == f"default@{socket}>" and f.row(f.y - 1) == "PONG"
+                    lambda f: f.row(f.y) == f"default@{socket} ❯" and f.row(f.y - 1) == "PONG"
                     and not f.row(f.y + 1),
                     "output scrolls naturally and keeps the prompt after the reply",
                 )
@@ -492,7 +514,7 @@ def main():
             bottom.expect_frame(lambda f: f.y < 10 and f.hint_is_inline("lrange", " key start stop"),
                                 "resizing preserves input within the new terminal bounds")
             bottom.send(b"\x15")
-            bottom.expect_frame(lambda f: f.row(f.y) == f"default@{socket}>", "clear the draft")
+            bottom.expect_frame(lambda f: f.row(f.y) == f"default@{socket} ❯", "clear the draft")
             bottom.send(b"\x1bOP")
             bottom.expect_frame(lambda f: "┌ Help" in f.row(f.y + 1),
                                 "help before exiting")
@@ -507,14 +529,14 @@ def main():
             terminals.append(terminal)
             terminal.send(b"PING\r")
             frame = terminal.expect_frame(
-                lambda f: f.row(f.y - 1) == "PONG" and f.row(f.y) == f"default@{socket}>",
+                lambda f: f.row(f.y - 1) == "PONG" and f.row(f.y) == f"default@{socket} ❯",
                 "reply followed immediately by the next prompt",
             )
             assert frame.y == 9
             assert frame.row(6) == "previous shell output"
             terminal.send(b"clear\r")
             terminal.expect_frame(
-                lambda f: f.row(f.y) == f"default@{socket}>"
+                lambda f: f.row(f.y) == f"default@{socket} ❯"
                 and all(not f.row(y) for y in range(f.y)),
                 "clear leaves an empty transcript and prompt",
             )
@@ -541,7 +563,7 @@ def main():
             frame = terminal.expect_frame(
                 lambda f: "┌ 1/2 " in f.row(f.y + 2), "bordered popup below input",
             )
-            assert frame.row(frame.y + 2).index("┌") == len(f"default@{socket}> LPOP ")
+            assert frame.row(frame.y + 2).index("┌") == len(f"default@{socket} ❯ LPOP ")
             assert "list:a" in frame.row(frame.y + 3)
             assert "list:b" in frame.row(frame.y + 4)
             terminal.send(b"\t\r")
@@ -556,7 +578,7 @@ def main():
             assert redis("LLEN", "list:b") == 2
 
             terminal.send(b"SELECT 1\r")
-            terminal.expect(f"default@{socket}[1]>")
+            terminal.expect(f"default@{socket}[1] ❯")
             terminal.send(b"LRANGE list:\t")
             terminal.expect("0 matches")
             terminal.send(b"\x15BLPOP missing 0\r")
@@ -564,7 +586,7 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("Connection lost")
             terminal.send(b"\\reconnect\r")
-            terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1]>" and not f.row(f.y + 1), "reconnected prompt")
+            terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1] ❯" and not f.row(f.y + 1), "reconnected prompt")
             terminal.send(b"SUBSCRIBE channel\r")
             terminal.expect("subscribe")
             time.sleep(0.3)  # A quiet stream must not skip the next message.
@@ -573,7 +595,7 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("Stream ended")
             terminal.send(b"\\reconnect\r")
-            terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1]>" and not f.row(f.y + 1), "reconnected prompt")
+            terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1] ❯" and not f.row(f.y + 1), "reconnected prompt")
 
             second = Terminal(socket, "--completion-threshold", "1")
             terminals.append(second)
@@ -625,7 +647,7 @@ def main():
             )
             configured.send(b"\x15xgroup create")
             configured.expect_frame(
-                lambda f: f.row(f.y).startswith(f"qa@127.0.0.1:{port}> xgroup create key group")
+                lambda f: f.row(f.y).startswith(f"qa@127.0.0.1:{port} ❯ xgroup create key group")
                 and f.colors.get((f.y, f.x)) in ("91", "38;5;9"),
                 "subcommand color overrides parent command",
             )
@@ -655,7 +677,7 @@ def main():
             assert not saved_auth.exists()
             unauthenticated.send(b"AUTH qa qa-test-secret\r")
             unauthenticated.expect_frame(
-                lambda f: f.row(f.y - 1) == "OK" and f.row(f.y) == f"qa@{socket}>",
+                lambda f: f.row(f.y - 1) == "OK" and f.row(f.y) == f"qa@{socket} ❯",
                 "successful authentication returns to the prompt",
             )
             assert saved_auth.exists()

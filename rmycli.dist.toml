@@ -12,7 +12,7 @@
 #
 # All settings are optional. Unknown fields and invalid values are errors.
 # Uncomment examples as needed; do not define the same setting twice.
-# Cluster detection, history, theme, instance, and auth-saving settings live here.
+# Cluster detection, history, prompt, theme, instance, and auth settings live here.
 # Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
 # command-line options. See README.md and rmycli --help.
 #
@@ -51,6 +51,85 @@ history-per-server = true
 # Automatic writes use owner-only permissions on Unix.
 #   rmycli config set save-auth local
 save-auth = false
+
+# ---------------------------------------------------------------------------
+# Interactive prompt
+# ---------------------------------------------------------------------------
+# A single-line template, with readable {name} placeholders. This is a top-level
+# setting: keep it ABOVE [theme] and all other table headings. The default shows
+# a cyan user and endpoint, an optional database suffix, and a green Unicode ❯:
+#
+#   default@127.0.0.1:6379 ❯
+#   alice@redis.example.com:6380[2] ❯
+#
+# No special icon font is needed, but your terminal/font must support Unicode.
+# Spaces are literal; keep a trailing space to separate the prompt from input.
+# Omit this setting (or `rmycli config unset prompt`) to use the built-in default.
+prompt = "{color:cyan}{user}@{address}{database}{reset} {color:green}{ctrl}❯{reset} "
+#
+# Connection placeholders (names are case sensitive):
+#   {user}       Session username, or "default" when none was supplied.
+#   {address}    Host:port as displayed by the connection, or Unix socket path.
+#   {host}       Host alone, or Unix socket path for Unix connections.
+#   {port}       TCP/TLS port; empty for Unix connections.
+#   {db}         Current database number, INCLUDING zero: 0, 1, 2, ...
+#   {database}   Optional bracketed suffix: empty for db 0, otherwise [1], [2]...
+#   {transport}  "redis" for TCP, "rediss" for TLS, or "unix" for sockets.
+#   {ctrl}       "[Ctrl]" while Ctrl is held, otherwise empty. Requires terminal
+#                modifier events; omit it to hide the indicator. It does not
+#                change Ctrl+Enter behavior. Command echoes omit the indicator.
+#
+# Values follow the active connection after successful AUTH, HELLO AUTH,
+# SELECT, RESET, reconnects, and redirects. There are no password/URL fields.
+# Connection values are inserted once, never interpreted as template syntax,
+# and terminal control characters in values are escaped before display.
+#
+# Foreground colors:
+#   {color:cyan}          Named terminal color (all names listed below).
+#   {color:#89b4fa}       RGB hex: exactly six hexadecimal digits.
+#   {color:rgb_(137,180,250)}  RGB decimal: each component from 0 through 255.
+#   {color:ansi_(117)}    Terminal palette index from 0 through 255.
+#   {reset}              Restore the terminal's default foreground color.
+#   {color:reset}        Same as {reset}.
+#
+# A color applies to following text/placeholders until another color or reset.
+# Styles automatically end before typed input; {reset} is still useful between
+# segments. Colors do not count toward cursor positions or scrolling width.
+# Named colors use your terminal palette; RGB colors need truecolor support.
+# Set NO_COLOR to a nonempty value to suppress colors (Unicode is unchanged).
+# Prompt styling applies to the live editor. Submitted commands and exit echoes
+# use the same expanded text without prompt colors. Ctrl-R keeps its dedicated
+# "history> " prompt. Batch commands and piped input do not display a prompt.
+#
+# Copy ONE of these recipes over the active prompt assignment above:
+#
+# Plain ASCII, matching the older prompt (no explicit colors):
+# prompt = "{user}@{address}{database}{ctrl}> "
+#
+# Minimal Unicode prompt, without connection details:
+# prompt = "{color:green}{ctrl}❯{reset} "
+#
+# Always show the database and transport, including database zero:
+# prompt = "{color:cyan}{transport} {address}{reset} db={db} {ctrl}❯ "
+#
+# Distinct colors for the user, address, and prompt marker:
+# prompt = "{color:magenta}{user}{reset}@{color:#89b4fa}{address}{database}{reset} {color:green}{ctrl}❯{reset} "
+#
+# Literal braces: {{ produces { and }} produces }. For example:
+# prompt = "{{redis}} {address}{database} {ctrl}> "
+#
+# Manage the template without connecting to Redis (quotes here are shell quotes;
+# `config set` adds the TOML quoting for you). Restart open shells after changes:
+#   rmycli config get prompt
+#   rmycli config set prompt '{color:cyan}{address}{reset} {ctrl}❯ '
+#   rmycli config unset prompt
+# `config get` prints the template itself, not a connected-session preview.
+#
+# Unknown placeholders/colors, unmatched braces, newlines, tabs, and raw ANSI
+# escapes are configuration errors detected before connecting. Empty templates
+# are allowed and hide the prompt entirely. Templates do not execute shell
+# commands or expand environment variables. Conditional expressions, background
+# colors, text attributes, multiline prompts, and theme packs are not supported.
 
 [theme]
 # Foreground color of inline argument hints. Default: "dark_grey".

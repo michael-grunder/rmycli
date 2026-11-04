@@ -208,6 +208,7 @@ impl SettingKey {
         let kind = match names.as_slice() {
             ["auto-cluster" | "history-per-server"] => Kind::Boolean,
             ["save-auth"] => Kind::SaveAuth,
+            ["prompt"] => Kind::String,
             ["theme", "inline-hint"] => Kind::Color,
             ["theme", "commands", name] if !name.trim().is_empty() => {
                 Kind::Color
@@ -306,6 +307,9 @@ impl SettingKey {
     }
 
     fn default_value(&self, settings: &Settings) -> Result<String> {
+        if self.parts == ["prompt"] {
+            return Ok(settings.prompt.source().to_owned());
+        }
         if self.parts == ["auto-cluster"] {
             return Ok(settings.auto_cluster.to_string());
         }

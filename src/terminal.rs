@@ -26,6 +26,7 @@ use crate::{
     config::Theme,
     estimate, hints, history, input,
     metadata::Catalog,
+    prompt::{Prompt, Rendered},
     scan::{Discovery, Limits},
     session::{Config, Session},
     worker::{Assistance, Event, Execution, Workers},
@@ -451,6 +452,7 @@ pub struct Options {
     pub reply_threshold: u64,
     pub yes: bool,
     pub history_per_server: bool,
+    pub prompt: Prompt,
     pub theme: Theme,
 }
 
@@ -575,7 +577,10 @@ fn run_app(app: &mut App) -> io::Result<()> {
                             [(
                                 format!(
                                     "{}{}",
-                                    prompt(&app.config.info),
+                                    app.options
+                                        .prompt
+                                        .render(&app.config.info, false)
+                                        .text,
                                     app.editor.line
                                 ),
                                 false,
@@ -1231,7 +1236,7 @@ impl App {
         self.editor.remember();
         self.log([format!(
             "{}{}",
-            prompt(&self.config.info),
+            self.options.prompt.render(&self.config.info, false).text,
             self.editor.line
         )]);
         self.editor.line.clear();
@@ -1308,16 +1313,15 @@ impl App {
         out.flush()
     }
 
-    fn input_prompt(&self) -> String {
-        let mut prompt = if self.history_search.is_some() {
-            "history> ".into()
-        } else {
-            prompt(&self.config.info)
-        };
-        if self.control_keys.contains(&true) {
-            prompt.insert_str(prompt.len() - 2, "[Ctrl]");
+    fn input_prompt(&self) -> Rendered {
+        let ctrl = self.control_keys.contains(&true);
+        if self.history_search.is_some() {
+            return Rendered {
+                text: if ctrl { "history[Ctrl]> " } else { "history> " }.into(),
+                ..Rendered::default()
+            };
         }
-        prompt
+        self.options.prompt.render(&self.config.info, ctrl)
     }
 
     fn hint_color(&self, line: &str) -> Color {
@@ -1369,7 +1373,7 @@ impl App {
             && popup.is_none()
             && self.help.is_none()
             && display_width(&safe(status_text))
-                <= width.saturating_sub(display_width(&safe(&prompt)));
+                <= width.saturating_sub(display_width(&prompt.text));
         let available = usize::from(height - 1);
         let status = if status_text.is_empty() || inline_status {
             Vec::new()
@@ -1394,12 +1398,12 @@ impl App {
         };
         screen.reserve(out, 1 + status.len() + panel_rows, height)?;
         let input_row = usize::from(screen.row);
-        let (line, column) = viewport(
-            &format!("{prompt}{}", editor.line),
-            prompt.len() + editor.cursor,
+        let (line, column, start) = viewport(
+            &format!("{}{}", prompt.text, editor.line),
+            prompt.text.len() + editor.cursor,
             width,
         );
-        draw_line(out, input_row, &line, Color::White)?;
+        draw_input(out, input_row, &line, start, &prompt)?;
         let hint = if search.is_some() {
             String::new()
         } else if inline_status {
@@ -1440,15 +1444,32 @@ impl App {
     }
 }
 
-fn prompt(info: &redis::ConnectionInfo) -> String {
-    let address = info.addr();
-    let user = info.redis_settings().username().unwrap_or("default");
-    let database = info.redis_settings().db();
-    if database == 0 {
-        format!("{user}@{address}> ")
-    } else {
-        format!("{user}@{address}[{database}]> ")
+fn draw_input(
+    out: &mut impl Write,
+    row: usize,
+    line: &str,
+    start: usize,
+    prompt: &Rendered,
+) -> io::Result<()> {
+    queue!(out, cursor::MoveTo(0, u16::try_from(row).unwrap_or(0)))?;
+    let mut printed = 0;
+    for (range, color) in &prompt.colors {
+        let end = range.end.saturating_sub(start).min(line.len());
+        if end > printed {
+            queue!(
+                out,
+                SetForegroundColor(*color),
+                Print(&line[printed..end])
+            )?;
+            printed = end;
+        }
     }
+    // Prompt styles must never leak into the command or its inline hint.
+    queue!(
+        out,
+        SetForegroundColor(Color::White),
+        Print(&line[printed..])
+    )
 }
 
 fn display_width(text: &str) -> usize {
@@ -1513,7 +1534,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     result
 }
 
-fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize) {
+fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize, usize) {
     let mut start = 0;
     let mut column: usize = display_width(&safe(&line[..cursor]));
     for (index, c) in line[..cursor].char_indices() {
@@ -1523,7 +1544,7 @@ fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize) {
         column = column.saturating_sub(display_width(&safe(&c.to_string())));
         start = index + c.len_utf8();
     }
-    (truncate(&line[start..], width), column)
+    (truncate(&line[start..], width), column, start)
 }
 
 #[cfg(test)]
@@ -1543,12 +1564,93 @@ mod tests {
                 "alice@redis.example:6380[2]> ",
             ),
         ] {
-            assert_eq!(prompt(&url.into_connection_info().unwrap()), expected);
+            assert_eq!(
+                Prompt::try_from("{user}@{address}{database}> ".to_owned())
+                    .unwrap()
+                    .render(&url.into_connection_info().unwrap(), false)
+                    .text,
+                expected
+            );
         }
         let socket = redis::ConnectionAddr::Unix("/tmp/redis.sock".into())
             .into_connection_info()
             .unwrap();
-        assert_eq!(prompt(&socket), "default@/tmp/redis.sock> ");
+        assert_eq!(
+            Prompt::try_from("{user}@{address}{database}> ".to_owned())
+                .unwrap()
+                .render(&socket, false)
+                .text,
+            "default@/tmp/redis.sock> "
+        );
+    }
+
+    #[test]
+    fn colored_prompt_clipping_keeps_width_and_resets_before_input() {
+        use redis::IntoConnectionInfo;
+        let info = "redis://localhost".into_connection_info().unwrap();
+        #[expect(
+            clippy::literal_string_with_formatting_args,
+            reason = "these placeholders are parsed by Prompt, not format!"
+        )]
+        let template = "{color:cyan}你{color:green}❯ ";
+        let prompt = Prompt::try_from(template.to_owned())
+            .unwrap()
+            .render(&info, false);
+        let text = format!("{}abcd", prompt.text);
+        for (width, expected, expected_column, expected_color) in [
+            (9, "你❯ abcd", 8, Color::Cyan),
+            (8, "❯ abcd", 6, Color::Green),
+            (6, " abcd", 5, Color::Green),
+            (4, "bcd", 3, Color::White),
+        ] {
+            let (line, column, start) = viewport(&text, text.len(), width);
+            assert_eq!(line, expected);
+            assert_eq!(column, expected_column);
+            let mut out = Vec::new();
+            draw_input(&mut out, 0, &line, start, &prompt).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.starts_with(&format!(
+                "{}{}",
+                cursor::MoveTo(0, 0),
+                SetForegroundColor(expected_color)
+            )));
+            assert!(out.ends_with(&format!(
+                "{}{}",
+                SetForegroundColor(Color::White),
+                if width == 4 { "bcd" } else { "abcd" }
+            )));
+        }
+    }
+
+    #[test]
+    fn empty_and_short_custom_prompts_handle_ctrl_and_transcript() {
+        for template in ["", "❯", "{ctrl}"] {
+            let (mut app, _executed) = test_app();
+            app.options.prompt = Prompt::try_from(template.to_owned()).unwrap();
+            app.control_keys = [true, false];
+            let expected = if template == "{ctrl}" {
+                "[Ctrl]"
+            } else {
+                template
+            };
+            assert_eq!(app.input_prompt().text, expected);
+            let mut screen = std::mem::ManuallyDrop::new(Screen { row: 0 });
+            for size in [(1, 1), (4, 2), (80, 24)] {
+                app.draw(&mut screen, &mut Vec::new(), size).unwrap();
+            }
+            app.start_execution(Execution::Run(vec![
+                b"GET".to_vec(),
+                b"a".to_vec(),
+            ]));
+            assert_eq!(
+                app.output.back().unwrap().0,
+                if template == "{ctrl}" {
+                    "GET a".into()
+                } else {
+                    format!("{template}GET a")
+                }
+            );
+        }
     }
 
     #[test]
@@ -1617,7 +1719,7 @@ mod tests {
         editor.left();
         editor.insert("é");
         assert_eq!(editor.line, "你好 keéy");
-        let (line, column) = viewport("你好abcdef", 12, 6);
+        let (line, column, _) = viewport("你好abcdef", 12, 6);
         assert!(column < 6);
         assert_ne!(line, "");
         assert!(!safe("a\x1b[2J").contains('\x1b'));
@@ -1676,6 +1778,10 @@ mod tests {
                 reply_threshold: 100,
                 yes: false,
                 history_per_server: true,
+                prompt: Prompt::try_from(
+                    "{user}@{address}{database}{ctrl}> ".to_owned(),
+                )
+                .unwrap(),
                 theme: Theme::default(),
             },
         };
@@ -1889,7 +1995,11 @@ mod tests {
                 } else {
                     "default@localhost:6379[Ctrl]> KEYS MixedCase:*"
                 };
-                assert!(text.contains(expected), "{text:?}");
+                let expected = expected.replace(
+                    "> KEYS",
+                    &format!("> {}KEYS", SetForegroundColor(Color::White)),
+                );
+                assert!(text.contains(&expected), "{text:?}");
                 assert_eq!(app.editor.cursor, 5);
                 assert!(app.popup.is_some());
                 assert_eq!(app.workers.current(), generation);
@@ -2183,11 +2293,10 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
-        assert!(
-            String::from_utf8(rendered)
-                .unwrap()
-                .contains("default@localhost:6379> x")
-        );
+        assert!(String::from_utf8(rendered).unwrap().contains(&format!(
+            "default@localhost:6379> {}x",
+            SetForegroundColor(Color::White)
+        )));
     }
 
     #[test]

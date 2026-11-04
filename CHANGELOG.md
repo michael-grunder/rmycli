@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Configurable interactive prompts with named connection placeholders, literal
+  brace escaping, and named, RGB, or indexed foreground colors. The default
+  uses cyan connection details and a green Unicode `❯`. Manage the template
+  with `config get/set/unset prompt`; the example config documents all fields,
+  color formats, limits, and copyable recipes, including the older ASCII prompt.
+
 ### Fixed
 
 - Synchronize the terminal authentication test with the metadata refresh so

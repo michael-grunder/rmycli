@@ -261,6 +261,52 @@ cannot be combined with `-u`/`REDIS_URL` or `-s`; unset `REDIS_URL` before
 selecting an instance. Without `--instance`, connection behavior is unchanged.
 Connection timeouts and discovery/reply limits remain command-line options.
 
+### Prompt customization
+
+The default prompt uses cyan connection details and a green Unicode `❯`, such
+as `alice@localhost:6379[2] ❯ `. Set the top-level `prompt` string **before any
+TOML table headings**, or use the configuration commands:
+
+```sh
+rmycli config set prompt '{color:cyan}{address}{reset} db={db} {ctrl}❯ '
+rmycli config get prompt
+rmycli config unset prompt
+```
+
+Restart an open shell to load changes. Named placeholders are case sensitive:
+
+| Placeholder | Value |
+| --- | --- |
+| `{user}` | Session username, or `default` |
+| `{address}` | Connection host:port or Unix socket path |
+| `{host}`, `{port}` | Separate host and port; Unix uses the path and an empty port |
+| `{db}` | Current database number, including zero |
+| `{database}` | `[N]` for a nonzero database, otherwise empty |
+| `{transport}` | `redis`, `rediss`, or `unix` |
+| `{ctrl}` | `[Ctrl]` while held on terminals supporting modifier events |
+| `{color:cyan}` | Set foreground color for following prompt text |
+| `{reset}` | Restore the terminal's default foreground color |
+
+Colors accept the same names, `#RRGGBB`, `rgb_(r,g,b)`, and `ansi_(n)` formats
+as theme settings. `NO_COLOR` suppresses colors when nonempty. Styles end before
+command input; command echoes retain the expanded prompt text without colors.
+Connection fields update with successful session changes and redirects, and
+never include passwords. Ctrl-R retains its dedicated history prompt.
+
+Use `{{` and `}}` for literal braces. Unknown placeholders, invalid colors,
+unmatched braces, and control characters (including newlines and ANSI escapes)
+are errors before connection. Templates are single-line; they do not execute
+shell commands or expand environment variables. An empty template hides the
+prompt. A plain ASCII alternative matching the older prompt is:
+
+```toml
+prompt = "{user}@{address}{database}{ctrl}> "
+```
+
+See the extensive **Interactive prompt** comments in
+[rmycli.dist.toml](rmycli.dist.toml) for copyable recipes, every placeholder,
+color formats, escaping rules, and limitations.
+
 ### Saved server authentication
 
 When a server requires authentication, the interactive shell says so and uses
@@ -557,7 +603,7 @@ yet. With a completion popup open, either Enter only accepts the candidate.
 Ctrl+Enter requires a terminal that distinguishes it from Enter. The editor
 requests the Kitty keyboard protocol, including modifier presses and releases.
 On supporting terminals, holding either Ctrl key changes
-`default@127.0.0.1:6379>` to `default@127.0.0.1:6379[Ctrl]>`; releasing it restores
+`default@127.0.0.1:6379 ❯` to `default@127.0.0.1:6379 [Ctrl]❯`; releasing it restores
 the prompt. Modifier events leave the input, completion popup, and confirmation
 unchanged. Shift remains available
 for typing case-sensitive keys. Ctrl+Enter with a popup open only accepts the
@@ -595,9 +641,9 @@ completion, and longer messages reserve space below the prompt only when
 visible, scrolling as needed at the bottom of the terminal.
 Closing a panel removes it and preserves the input. Errors, discovery progress,
 and confirmations still appear when needed. The prompt shows the session user,
-host, and port, such as `alice@127.0.0.1:6379>`. The username defaults to `default`
+host, and port, such as `alice@127.0.0.1:6379 ❯`. The username defaults to `default`
 when none is supplied and updates after successful AUTH or HELLO AUTH.
-Nonzero databases add a suffix, such as `alice@127.0.0.1:6379[2]>`; database zero
+Nonzero databases add a suffix, such as `alice@127.0.0.1:6379[2] ❯`; database zero
 has no suffix. Unix connections show the socket path instead of host and port.
 
 In-memory history is bounded to 500 commands. Pasting text never
@@ -609,7 +655,7 @@ settings; the application does not keep a separate transcript.
 For example:
 
 ```text
-default@127.0.0.1:6379> LRANGE list:<Tab>
+default@127.0.0.1:6379 ❯ LRANGE list:<Tab>
 ```
 
 starts discovery on an independent connection with:

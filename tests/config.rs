@@ -82,6 +82,38 @@ fn success(command: &mut Command) -> String {
 }
 
 #[test]
+fn prompt_settings_validate_round_trip_and_restore_the_default() {
+    let fixture = Fixture::new();
+    let default = success(&mut fixture.config(&["get", "prompt"]));
+    assert!(default.contains("❯"));
+    assert!(default.contains("{color:green}"));
+    let template = "{color:#89b4fa}{host} db={db}{reset} ❯ ";
+    assert_eq!(
+        success(&mut fixture.config(&["set", "prompt", template])),
+        format!("{template}\n")
+    );
+    assert_eq!(
+        success(&mut fixture.config(&["get", "prompt"])),
+        format!("{template}\n")
+    );
+    for invalid in ["{password}", "{host", "{color:unknown}", "a\nb"] {
+        error(&mut fixture.config(&["set", "prompt", invalid]));
+        assert_eq!(
+            success(&mut fixture.config(&["get", "prompt"])),
+            format!("{template}\n")
+        );
+    }
+    success(&mut fixture.config(&["unset", "prompt"]));
+    assert_eq!(success(&mut fixture.config(&["get", "prompt"])), default);
+    let path = fixture.write("invalid.toml", "prompt = '{password}'");
+    assert_path_error(
+        fixture.command().arg("--config").arg(path.clone()),
+        &path,
+        "unknown prompt placeholder",
+    );
+}
+
+#[test]
 fn boolean_settings_can_be_read_disabled_and_reset() {
     let fixture = Fixture::new();
     for key in ["auto-cluster", "history-per-server"] {

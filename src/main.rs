@@ -12,6 +12,7 @@ mod history;
 mod input;
 mod metadata;
 mod output;
+mod prompt;
 mod scan;
 mod session;
 mod terminal;
@@ -108,22 +109,7 @@ async fn run(
     } else if !args.is_empty() {
         batch::execute(&mut session, &args, options).await?;
     } else if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        terminal::run(
-            session,
-            terminal::Options {
-                limits: scan::Limits {
-                    threshold: options.completion_threshold,
-                    keys: options.scan_max_keys,
-                    bytes: options.scan_max_bytes,
-                    batches: options.scan_max_batches,
-                    time: Duration::from_millis(options.scan_ms),
-                },
-                reply_threshold: options.reply_threshold,
-                yes: options.yes,
-                history_per_server: settings.history_per_server,
-                theme: settings.theme,
-            },
-        )?;
+        terminal::run(session, terminal_options(options, settings))?;
     } else {
         loop {
             let mut line = String::new();
@@ -148,6 +134,26 @@ async fn run(
         }
     }
     Ok(())
+}
+
+fn terminal_options(
+    options: &Options,
+    settings: config::Settings,
+) -> terminal::Options {
+    terminal::Options {
+        limits: scan::Limits {
+            threshold: options.completion_threshold,
+            keys: options.scan_max_keys,
+            bytes: options.scan_max_bytes,
+            batches: options.scan_max_batches,
+            time: Duration::from_millis(options.scan_ms),
+        },
+        reply_threshold: options.reply_threshold,
+        yes: options.yes,
+        history_per_server: settings.history_per_server,
+        prompt: settings.prompt,
+        theme: settings.theme,
+    }
 }
 
 async fn batch_command(

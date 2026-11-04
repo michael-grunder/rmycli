@@ -11,6 +11,7 @@ use serde::{Deserialize, Deserializer, de::Error};
 pub struct Settings {
     pub auto_cluster: bool,
     pub history_per_server: bool,
+    pub prompt: crate::prompt::Prompt,
     pub save_auth: crate::auth::SaveAuth,
     pub theme: Theme,
     pub instances: BTreeMap<String, Instance>,
@@ -21,6 +22,7 @@ impl Default for Settings {
         Self {
             auto_cluster: true,
             history_per_server: true,
+            prompt: crate::prompt::Prompt::default(),
             save_auth: crate::auth::SaveAuth::default(),
             theme: Theme::default(),
             instances: BTreeMap::new(),
@@ -210,6 +212,13 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn example_config_uses_the_builtin_prompt() {
+        let settings =
+            Settings::parse(include_str!("../rmycli.dist.toml")).unwrap();
+        assert_eq!(settings.prompt.source(), crate::prompt::DEFAULT);
+    }
 
     #[test]
     fn defaults_and_partial_settings() {
