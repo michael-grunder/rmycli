@@ -1,0 +1,102 @@
+name: Distribution binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_TEST_THREADS: 4
+  TMPDIR: /tmp
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            platform: aarch64-unknown-linux-musl
+          - os: macos-15
+            platform: universal-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build and test static Linux binary
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.platform }}
+          TARGET_CC: musl-gcc
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools redis-server redis-tools
+          rustup target add "$TARGET"
+          cargo build --locked --release --target "$TARGET"
+          cargo test --locked --release --target "$TARGET" --all-targets --all-features
+          binary="target/$TARGET/release/rmycli"
+          readelf --program-headers "$binary" > target/program-headers.txt
+          readelf --dynamic "$binary" > target/dynamic.txt
+          if grep -q INTERP target/program-headers.txt || grep -q NEEDED target/dynamic.txt; then
+            echo 'Expected a static binary with no interpreter or shared libraries' >&2
+            exit 1
+          fi
+          RMYCLI_TEST_BINARY="$binary" python3 tests/terminal_smoke.py
+          mkdir -p target/dist/package
+          cp "$binary" target/dist/package/rmycli
+      - name: Build and test universal macOS binary
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          brew install redis
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          cargo test --locked --release --target aarch64-apple-darwin --all-targets --all-features
+          mkdir -p target/dist/package
+          lipo -create \
+            target/aarch64-apple-darwin/release/rmycli \
+            target/x86_64-apple-darwin/release/rmycli \
+            -output target/dist/package/rmycli
+          lipo -verify_arch arm64 x86_64 target/dist/package/rmycli
+          codesign --force --sign - target/dist/package/rmycli
+          codesign --verify target/dist/package/rmycli
+      - name: Package and checksum
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          target/dist/package/rmycli --version
+          target/dist/package/rmycli --help > /dev/null
+          cp README.md LICENSE rmycli.dist.toml target/dist/package/
+          cp data/REDIS-DOC-LICENSE target/dist/package/
+          archive="rmycli-$PLATFORM.tar.gz"
+          tar -czf "target/dist/$archive" -C target/dist/package .
+          cd target/dist
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rmycli-${{ matrix.platform }}
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0

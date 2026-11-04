@@ -662,6 +662,45 @@ Use the 80-column `rustfmt.toml` configuration and keep `Cargo.lock` tracked.
 See [AGENTS.md](AGENTS.md), [CHANGELOG.md](CHANGELOG.md), and the bundled help's
 [attribution and license](data/README.md).
 
+### GitHub Actions and distribution binaries
+
+[CI](.github/workflows/ci.yml) runs formatting, Clippy, and the existing unit,
+CLI, TLS, and isolated Redis integration tests on Linux and macOS for pushes
+and pull requests. Linux also runs the Python terminal smoke suite. Redis is
+installed by the workflows; each test starts its own disposable server.
+
+[Distribution binaries](.github/workflows/dist.yml) runs when a `v*` tag is
+pushed, or manually from the Actions tab. It produces these downloadable
+workflow artifacts:
+
+| Archive | Contents |
+| --- | --- |
+| `rmycli-x86_64-unknown-linux-musl.tar.gz` | Static Linux x86-64 binary |
+| `rmycli-aarch64-unknown-linux-musl.tar.gz` | Static Linux ARM64 binary |
+| `rmycli-universal-apple-darwin.tar.gz` | macOS 11+ Intel and Apple Silicon binary |
+
+Linux builds use musl on native runners for each architecture. The workflow
+runs the Rust and terminal suites against the release builds and rejects ELF
+binaries with a dynamic interpreter or shared-library dependencies. TLS still
+needs system CA certificates or an explicit `--cacert` file at runtime.
+
+The macOS build combines both architectures with `lipo`, verifies both slices,
+and applies an ad-hoc signature. Rust tests run on Apple Silicon; the Intel
+slice is compiled but not executed. The result is not Developer ID signed or
+notarized.
+
+Each artifact contains a tar archive and its SHA-256 checksum. The archive
+includes `rmycli`, the README, licenses, and the sample configuration. Extract
+it and put `rmycli` on your PATH. These workflows upload Actions artifacts;
+they do not publish GitHub Releases or crates.io packages.
+
+To run terminal tests against a specific binary locally:
+
+```sh
+RMYCLI_TEST_BINARY=target/x86_64-unknown-linux-musl/release/rmycli \
+  python3 tests/terminal_smoke.py
+```
+
 ### Publishing
 
 For your first release, sign in to [crates.io](https://crates.io), verify your

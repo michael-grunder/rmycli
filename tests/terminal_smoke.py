@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the real terminal and binary against an isolated Redis server.
 
-Run after cargo build. Requires Python 3, redis-server, redis-cli, and a Unix PTY.
+Run after cargo build, or set RMYCLI_TEST_BINARY to test a distribution binary.
+Requires Python 3, redis-server, redis-cli, and a Unix PTY.
 No third-party Python dependencies or existing Redis instance are needed.
 """
 import fcntl
@@ -21,7 +22,9 @@ import termios
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/debug/rmycli"
+BINARY = Path(os.environ.get(
+    "RMYCLI_TEST_BINARY", ROOT / "target/debug/rmycli",
+)).resolve()
 
 
 class Frame:
@@ -522,6 +525,12 @@ def main():
                 "successful authentication returns to the prompt",
             )
             assert saved_auth.exists()
+            # The worker refreshes metadata after AUTH and before the next command.
+            unauthenticated.send(b"PING\r")
+            unauthenticated.expect_frame(
+                lambda f: f.row(f.y - 1) == "PONG",
+                "authenticated command after metadata refresh",
+            )
             unauthenticated.send(b"LRANGE list:a\t")
             unauthenticated.expect("1 matches")
             restored = Terminal(socket, "--config", str(auth_settings),

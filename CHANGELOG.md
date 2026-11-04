@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Synchronize the terminal authentication test with the metadata refresh so
+  release builds do not race completion against the catalog update.
+
 - Explain when a server requires authentication, and reload completion and help
   metadata after successful AUTH or HELLO AUTH without disturbing MULTI/WATCH.
 - Parse HELLO options without mistaking passwords or client names for options.
@@ -64,6 +67,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Omit the database suffix from the prompt and transcript for database zero.
 
 ### Added
+
+- GitHub Actions checks for formatting, Clippy, and the existing Rust/Redis
+  tests on Linux and macOS, plus Linux terminal smoke tests.
+- Manual and version-tag distribution builds for static musl Linux x86-64
+  and ARM64 binaries and a universal macOS binary, with release-build tests,
+  architecture/linkage checks, packaged documentation, and SHA-256 checksums.
+- `RMYCLI_TEST_BINARY` selects a binary for the terminal smoke suite, allowing
+  the same tests to exercise distribution builds.
 
 - Detect Valkey and negotiate `CLIENT CAPA REDIRECT` to follow standalone
   primary redirects, including during `--scan`. Preserve connection settings,
