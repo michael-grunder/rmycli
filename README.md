@@ -444,7 +444,7 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Escape | Close the popup or cancel discovery/confirmation |
 | Left / Right, Home / End, Ctrl-A / Ctrl-E | Move the cursor |
 | Backspace / Delete, Ctrl-U / Ctrl-K | Delete characters or text before/after the cursor |
-| Up / Down | Browse in-memory command history |
+| Up / Down | Browse this server's command history |
 | Ctrl-R | Search command history with fuzzy matching |
 | F1 | Open or close command help, editor shortcuts, and connection details |
 | PageUp / PageDown, Up / Down with help open | Scroll the help panel |
@@ -461,8 +461,30 @@ Type to filter, use Ctrl-R / Down / Tab for the next match and Up / Shift-Tab
 for the previous match. Enter recalls the selection for editing; press Enter
 again to execute it. Esc or Ctrl-C closes search and restores the original
 input and cursor. An empty query shows all retained commands; no matches leaves
-the search open. Duplicate commands appear once, newest first. History remains
-in memory for this session, limited to the last 500 submitted entries.
+the search open. Duplicate commands appear once, newest first.
+
+Interactive history loads from `$XDG_CONFIG_HOME/rmycli_history`, normally
+`~/.config/rmycli_history`, and saves on exit. One JSON-lines file retains up to
+500 entries **total across all servers**, dropping the oldest saved entries.
+Only the initial connection endpoint's entries appear in Up/Down and Ctrl-R;
+databases and accounts on that endpoint share history. Endpoint matching uses
+the same transport, hostname, port, and socket-path rules as saved authentication.
+Redirects keep the initial endpoint's history. New commands from overlapping
+sessions merge with the latest file on exit, ordered by save time. Commands
+from another session become visible after restarting.
+
+History is independent of settings discovery, including `--no-config` and
+`--config`. Noninteractive commands are not recorded. Writes are atomic and
+owner-only on Unix; existing symlinks are followed. Invalid files are left
+untouched, and load/save failures warn without preventing shell use. A
+simultaneous save warns instead of overwriting another writer; after a crash,
+remove a stale `rmycli_history.lock` only when no process is saving. Commands
+from a killed or crashed session may be lost because saving happens on exit.
+
+History contains plaintext command arguments. `AUTH`, `HELLO`, `ACL SETUSER`,
+`CONFIG SET`, and `MIGRATE` with authentication are excluded from disk history;
+other commands can still contain sensitive keys or values. These exclusions
+do not change command execution or in-memory recall.
 
 Search supports fuzzy terms and the leading-apostrophe convention from
 [fzf](https://junegunn.github.io/fzf/search-syntax/): `gusr` matches
@@ -537,7 +559,7 @@ and port, such as `127.0.0.1:6379>` or `127.0.0.1:7000>`. Nonzero databases
 add a suffix, such as `127.0.0.1:6379[2]>`; database zero has no suffix. Unix
 connections show the socket path instead of host and port.
 
-History is bounded to 500 commands and is not saved to disk. Pasting text never
+In-memory history is bounded to 500 commands. Pasting text never
 submits a command. Output retention is controlled by your terminal's scrollback
 settings; the application does not keep a separate transcript.
 
@@ -651,8 +673,8 @@ Closing the socket cannot undo a command the server has already executed.
 - History is bounded and displayed output is released by the application, but
   command replies are decoded in memory before display. The `LRANGE` estimate
   is not a general reply-memory cap.
-- No persistent history, SSH tunnels, or full `redis-cli` option compatibility
-  is claimed by this version. See the option compatibility section above.
+- SSH tunnels and full `redis-cli` option compatibility are not implemented.
+  See the option compatibility section above.
 
 ## Development
 

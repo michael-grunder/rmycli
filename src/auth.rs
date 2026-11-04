@@ -82,7 +82,7 @@ struct Credentials {
     password: String,
 }
 
-fn endpoint(addr: &ConnectionAddr) -> io::Result<String> {
+pub fn endpoint(addr: &ConnectionAddr) -> io::Result<String> {
     match addr {
         ConnectionAddr::Unix(path) => path
             .to_str()

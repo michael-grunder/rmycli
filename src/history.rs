@@ -1,4 +1,159 @@
 use std::collections::{HashSet, VecDeque};
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Maximum entries in memory and across all servers in the history file.
+pub const LIMIT: usize = 500;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Entry {
+    server: String,
+    line: String,
+}
+
+pub struct Store {
+    path: PathBuf,
+    server: String,
+    pending: VecDeque<String>,
+}
+
+impl Store {
+    pub fn open(
+        path: PathBuf,
+        addr: &redis::ConnectionAddr,
+    ) -> io::Result<(Self, VecDeque<String>)> {
+        let server = crate::auth::endpoint(addr)?;
+        let history = read(&path)?
+            .into_iter()
+            .filter(|entry| entry.server == server)
+            .map(|entry| entry.line)
+            .collect();
+        Ok((
+            Self {
+                path,
+                server,
+                pending: VecDeque::new(),
+            },
+            history,
+        ))
+    }
+
+    pub fn remember(&mut self, line: &str) {
+        if !persistable(line) {
+            return;
+        }
+        self.pending.push_back(line.to_owned());
+        if self.pending.len() > LIMIT {
+            self.pending.pop_front();
+        }
+    }
+
+    pub fn save(&self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        // Follow managed dotfile links while replacing their target atomically.
+        let path = if self.path.try_exists()? {
+            self.path.canonicalize()?
+        } else {
+            self.path.clone()
+        };
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::other("history file has no parent directory")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let lock_path = path.with_extension("lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(error.kind(), format!(
+                        "history file is busy; check for a stale lock at {}",
+                        lock_path.display()
+                    ))
+                } else {
+                    error
+                }
+            })?;
+        let _lock = Lock(lock_path);
+        drop(lock_file);
+        // Merge only this session's new commands with the latest disk contents.
+        let mut entries = read(&path)?;
+        entries.extend(self.pending.iter().map(|line| Entry {
+            server: self.server.clone(),
+            line: line.clone(),
+        }));
+        entries.drain(..entries.len().saturating_sub(LIMIT));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        for entry in entries {
+            serde_json::to_writer(&mut temporary, &entry)?;
+            temporary.write_all(b"\n")?;
+        }
+        temporary.as_file().sync_all()?;
+        temporary.persist(path)?;
+        Ok(())
+    }
+}
+
+struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn read(path: &Path) -> io::Result<VecDeque<Entry>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(VecDeque::new());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut entries = VecDeque::new();
+    for line in io::BufReader::new(file).lines() {
+        let entry: Entry = serde_json::from_str(&line?).map_err(|_| {
+            // Parser errors can include sensitive command arguments.
+            io::Error::new(io::ErrorKind::InvalidData, "invalid history file")
+        })?;
+        entries.push_back(entry);
+        if entries.len() > LIMIT {
+            entries.pop_front();
+        }
+    }
+    Ok(entries)
+}
+
+fn persistable(line: &str) -> bool {
+    let parsed = crate::input::parse(line);
+    let Some(command) = parsed.words.first() else {
+        return false;
+    };
+    if parsed.error.is_some()
+        || command.bytes.eq_ignore_ascii_case(b"AUTH")
+        || command.bytes.eq_ignore_ascii_case(b"HELLO")
+    {
+        return false;
+    }
+    let subcommand = parsed.words.get(1).map(|word| word.bytes.as_slice());
+    !((command.bytes.eq_ignore_ascii_case(b"ACL")
+        && subcommand
+            .is_some_and(|word| word.eq_ignore_ascii_case(b"SETUSER")))
+        || (command.bytes.eq_ignore_ascii_case(b"CONFIG")
+            && subcommand
+                .is_some_and(|word| word.eq_ignore_ascii_case(b"SET")))
+        || (command.bytes.eq_ignore_ascii_case(b"MIGRATE")
+            && parsed.words.iter().skip(6).any(|word| {
+                word.bytes.eq_ignore_ascii_case(b"AUTH")
+                    || word.bytes.eq_ignore_ascii_case(b"AUTH2")
+            })))
+}
 
 /// Search recent commands using fuzzy terms or apostrophe-prefixed substrings.
 // shortcut: fuzzy/exact terms only; extend when more fzf operators are needed.
@@ -58,6 +213,160 @@ fn terms(query: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open(path: &Path, port: u16) -> (Store, VecDeque<String>) {
+        Store::open(
+            path.to_owned(),
+            &redis::ConnectionAddr::Tcp("localhost".into(), port),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn round_trip_preserves_commands_and_separates_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config/rmycli_history");
+        let (mut first, history) = open(&path, 6379);
+        assert!(history.is_empty());
+        first.save().unwrap();
+        assert!(!path.exists());
+        let lines = [r#"SET "a b" "\x00\xff""#, "SET café 'a\nb'", "PING"];
+        for line in lines {
+            first.remember(line);
+        }
+        first.save().unwrap();
+        assert_eq!(open(&path, 6379).1, lines);
+        assert!(open(&path, 6380).1.is_empty());
+        for addr in [
+            redis::ConnectionAddr::TcpTls {
+                host: "localhost".into(),
+                port: 6379,
+                insecure: false,
+                tls_params: None,
+            },
+            redis::ConnectionAddr::Unix("/tmp/redis.sock".into()),
+        ] {
+            assert!(Store::open(path.clone(), &addr).unwrap().1.is_empty());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn overlapping_sessions_merge_only_new_entries_and_bound_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rmycli_history");
+        let (mut seed, _) = open(&path, 6379);
+        seed.remember("PING");
+        seed.save().unwrap();
+        let (mut first, _) = open(&path, 6379);
+        let (mut second, _) = open(&path, 6379);
+        let (mut other, _) = open(&path, 6380);
+        first.remember("GET first");
+        second.remember("GET second");
+        other.remember("GET other");
+        first.save().unwrap();
+        other.save().unwrap();
+        second.save().unwrap();
+        assert_eq!(open(&path, 6379).1, ["PING", "GET first", "GET second"]);
+        assert_eq!(open(&path, 6380).1, ["GET other"]);
+        let (mut full, _) = open(&path, 6380);
+        for i in 0..LIMIT + 10 {
+            full.remember(&format!("GET {i}"));
+        }
+        assert_eq!(full.pending.len(), LIMIT);
+        full.save().unwrap();
+        let history = open(&path, 6380).1;
+        assert_eq!(history.len(), LIMIT);
+        assert_eq!(history.front().unwrap(), "GET 10");
+        assert_eq!(history.back().unwrap(), &format!("GET {}", LIMIT + 9));
+        assert!(open(&path, 6379).1.is_empty());
+        assert_eq!(read(&path).unwrap().len(), LIMIT);
+    }
+
+    #[test]
+    fn credential_commands_are_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rmycli_history");
+        let (mut store, _) = open(&path, 6379);
+        for line in [
+            "AUTH secret",
+            r"a\x75th user secret",
+            "'AUTH' secret",
+            "HELLO 3 AUTH user secret",
+            "hello 2",
+            "ACL SETUSER user >secret",
+            "config set requirepass secret",
+            "CONFIG SET masterauth secret",
+            "MIGRATE host 6379 key 0 100 AUTH secret",
+            "MIGRATE host 6379 key 0 100 AUTH2 user secret",
+            "",
+            "  ",
+            "SET 'unfinished",
+        ] {
+            store.remember(line);
+        }
+        assert!(store.pending.is_empty());
+        store.remember("GET auth");
+        store.remember("CONFIG GET maxmemory");
+        store.save().unwrap();
+        assert_eq!(open(&path, 6379).1, ["GET auth", "CONFIG GET maxmemory"]);
+        assert!(!std::fs::read_to_string(path).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn corrupt_or_locked_history_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rmycli_history");
+        let (mut store, _) = open(&path, 6379);
+        store.remember("PING");
+        let source = "{\"private-command\":\"secret\"}\n";
+        std::fs::write(&path, source).unwrap();
+        assert!(
+            Store::open(
+                path.clone(),
+                &redis::ConnectionAddr::Tcp("localhost".into(), 6379,)
+            )
+            .is_err()
+        );
+        let error = store.save().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("secret"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        assert!(!path.with_extension("lock").exists());
+        std::fs::write(&path, "").unwrap();
+        std::fs::write(path.with_extension("lock"), "").unwrap();
+        assert_eq!(
+            store.save().unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(path.with_extension("lock").exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_are_private_and_follow_existing_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("rmycli_history");
+        std::fs::write(&target, "").unwrap();
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        symlink(&target, &path).unwrap();
+        let (mut store, _) = open(&path, 6379);
+        store.remember("PING");
+        store.save().unwrap();
+        assert!(path.is_symlink());
+        assert_eq!(open(&target, 6379).1, ["PING"]);
+        assert_eq!(
+            std::fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn fuzzy_terms_and_exact_substrings_follow_fzf_conventions() {

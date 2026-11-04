@@ -72,6 +72,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Persistent interactive history in `~/.config/rmycli_history` (or the XDG
+  configuration directory), shared in one file capped at 500 entries across
+  servers. Recall and search load only the connected endpoint's history;
+  sessions merge new entries on exit using atomic, owner-only writes on Unix.
+  Common credential-bearing commands are excluded from disk history.
 - Ctrl-R history search with fuzzy terms, apostrophe-prefixed exact substrings,
   smart case, and newest-first deduplicated matches. Enter recalls without
   executing; Esc/Ctrl-C restores the draft and cursor. Includes plain terminal

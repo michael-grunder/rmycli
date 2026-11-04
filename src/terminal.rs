@@ -36,8 +36,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Quick replies replace the submitted line directly. Only commands that
 /// outlast this delay get an intermediate prompt with a busy status.
 const BUSY_PROMPT_DELAY: Duration = Duration::from_millis(200);
-/// Number of submitted lines kept for recall and search.
-const HISTORY_LIMIT: usize = 500;
 
 struct Screen {
     row: u16,
@@ -144,6 +142,7 @@ struct Editor {
     line: String,
     cursor: usize,
     history: VecDeque<String>,
+    history_store: Option<history::Store>,
     history_index: Option<usize>,
     draft: String,
 }
@@ -193,8 +192,11 @@ impl Editor {
     fn remember(&mut self) {
         if self.history.back() != Some(&self.line) {
             self.history.push_back(self.line.clone());
+            if let Some(store) = &mut self.history_store {
+                store.remember(&self.line);
+            }
         }
-        if self.history.len() > HISTORY_LIMIT {
+        if self.history.len() > history::LIMIT {
             self.history.pop_front();
         }
         self.history_index = None;
@@ -485,9 +487,22 @@ struct App {
 
 pub fn run(session: Session, options: Options) -> io::Result<()> {
     let config = session.config.clone();
+    let mut editor = Editor::default();
+    if let Some(dir) = xdg::BaseDirectories::new().get_config_home() {
+        match history::Store::open(
+            dir.join("rmycli_history"),
+            config.info.addr(),
+        ) {
+            Ok((store, history)) => {
+                editor.history = history;
+                editor.history_store = Some(store);
+            }
+            Err(error) => eprintln!("Warning: cannot load history: {error}"),
+        }
+    }
     let workers = Workers::start(session);
     let mut app = App {
-        editor: Editor::default(),
+        editor,
         catalog: Catalog::bundled(),
         workers,
         config,
@@ -507,6 +522,17 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         busy_until: Some(Instant::now() + BUSY_PROMPT_DELAY),
         options,
     };
+    let result = run_app(&mut app);
+    // shortcut: save on exit; add checkpoints if crash recovery is needed.
+    if let Some(store) = &app.editor.history_store
+        && let Err(error) = store.save()
+    {
+        eprintln!("Warning: cannot save history: {error}");
+    }
+    result
+}
+
+fn run_app(app: &mut App) -> io::Result<()> {
     let mut screen = Screen::enter()?;
     let mut dirty = true;
     loop {

@@ -88,7 +88,9 @@ class Terminal:
             [str(BINARY), *connection, *config, *options], stdin=slave, stdout=slave,
             stderr=slave, env={**{k: v for k, v in os.environ.items()
                                  if k not in ("NO_COLOR", "REDIS_URL", "REDISCLI_AUTH")},
-                 "TERM": "xterm-256color", **(env or {})},
+                 "TERM": "xterm-256color",
+                 **({"XDG_CONFIG_HOME": str(Path(socket).parent)} if socket else {}),
+                 **(env or {})},
         )
         os.close(slave)
         self.data = b""
@@ -255,6 +257,7 @@ def tmux_history(socket, directory, redis):
     tmux = ["tmux", "-S", str(Path(directory) / "tmux.sock"), "-f", "/dev/null"]
     env = {k: v for k, v in os.environ.items()
            if k not in ("REDIS_URL", "REDISCLI_AUTH", "TMUX")}
+    env["XDG_CONFIG_HOME"] = str(Path(directory) / "tmux-config")
 
     def run(*args):
         return subprocess.check_output([*tmux, *args], env=env, text=True)
@@ -383,6 +386,33 @@ def main():
                                  "history cancellation restored draft cursor")
             history.close()
             terminals.remove(history)
+
+            restored_history = Terminal(socket)
+            terminals.append(restored_history)
+            restored_history.send(b"\x1b[A")
+            restored_history.expect_frame(
+                lambda f: f.row(f.y).startswith(f"{socket}> INCR history:user"),
+                "Up recalls a command from the previous session",
+            )
+            assert redis("GET", "history:user") == "2", "restoring history executed"
+            restored_history.send(b"\x15\x12husr")
+            restored_history.expect("1 matches")
+            restored_history.send(b"\r")
+            restored_history.expect_frame(
+                lambda f: f.row(f.y).startswith(f"{socket}> INCR history:user"),
+                "Ctrl-R recalls persistent history",
+            )
+            restored_history.close()
+            terminals.remove(restored_history)
+            other_socket = str(Path(directory) / "other.sock")
+            Path(other_socket).symlink_to(socket)
+            other_history = Terminal(other_socket)
+            terminals.append(other_history)
+            other_history.send(b"\x12husr")
+            other_history.expect("0 matches")
+            other_history.send(b"\x03")
+            other_history.close()
+            terminals.remove(other_history)
 
             tracking = Terminal(socket, "-3")
             terminals.append(tracking)
