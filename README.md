@@ -17,10 +17,18 @@ See **Compatibility and limits** below for metadata and streaming limitations.
 
 ## Install and connect
 
-Use Rust with edition 2024 support (the current toolchain is recommended):
+Use Rust 1.88 or newer (the current stable toolchain is recommended).
+
+Once version 0.1.0 is published to crates.io, install it with:
 
 ```sh
-cargo install --path . --locked
+cargo install rmycli --locked
+```
+
+To install from a source checkout instead, run `cargo install --path . --locked`
+in the project directory. Then connect to Redis:
+
+```sh
 rmycli
 rmycli -3
 rmycli -h localhost -p 6379 -n 2
@@ -560,6 +568,37 @@ python3 tests/terminal_smoke.py
 Use the 80-column `rustfmt.toml` configuration and keep `Cargo.lock` tracked.
 See [AGENTS.md](AGENTS.md), [CHANGELOG.md](CHANGELOG.md), and the bundled help's
 [attribution and license](data/README.md).
+
+### Publishing
+
+For your first release, sign in to [crates.io](https://crates.io), verify your
+email address, create an API token with permission to publish, and run
+`cargo login`. Paste the token at Cargo's prompt.
+
+Before publishing, move the release's changelog entries from `Unreleased` into
+a version heading dated `YYYY-MM-DD`, retaining an `Unreleased` section. Run the
+formatting, Clippy, and test checks above and commit the release changes. Then:
+
+```sh
+cargo package --list
+cargo publish --dry-run --locked
+cargo publish --locked
+```
+
+Review the package file list before uploading. The manifest explicitly includes
+source, bundled help and its license, tests, and project documentation; local
+recordings are excluded. The dry run builds the packaged source without
+uploading it. After a successful publish, tag the release commit (for example,
+`git tag v0.1.0`). A published version cannot be overwritten; corrections need
+a new version. See the [Cargo publishing guide][publishing] for details.
+
+## License
+
+The application source code is licensed under the [MIT License](LICENSE).
+The bundled Redis command documentation in `data/commands.json` is separately
+licensed under CC BY-SA 4.0; see its [attribution and license](data/README.md).
+
+[publishing]: https://doc.rust-lang.org/cargo/reference/publishing.html
 
 [command]: https://redis.io/docs/latest/commands/command/
 [command-docs]: https://redis.io/docs/latest/commands/command-docs/

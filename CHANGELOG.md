@@ -55,6 +55,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- License the application source code under MIT, retaining the bundled Redis
+  documentation's separate CC BY-SA 4.0 license and attribution.
+- Add crates.io discovery metadata, a verified Rust 1.88 minimum, an explicit
+  package file list that excludes local recordings, and installation and
+  first-release publishing instructions.
 - Experimental Ctrl+Enter on `KEYS <pattern>` streams matching keys through
   SCAN. Ctrl-C stops iterations without exiting or disconnecting; normal Enter
   retains ordinary KEYS behavior. Requires a terminal that reports Ctrl+Enter.

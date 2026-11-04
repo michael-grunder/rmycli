@@ -2,6 +2,24 @@
 name = "rmycli"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A Redis shell with live command help and type-aware completion"
+license = "MIT"
+readme = "README.md"
+keywords = ["redis", "cli", "repl", "completion"]
+categories = ["command-line-utilities", "database"]
+include = [
+    "/src/",
+    "/data/",
+    "/tests/",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE*",
+    "/rmycli.dist.toml",
+    "/rustfmt.toml",
+    "/AGENTS.md",
+]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive", "env"] }
