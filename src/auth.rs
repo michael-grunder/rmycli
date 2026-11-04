@@ -192,20 +192,10 @@ impl Store {
             let accounts = saved.credentials();
             let selected =
                 settings.username().or(saved.default_user.as_deref());
-            let account = if let Some(user) = selected {
-                accounts.get(user)
-            } else if accounts.len() > 1 {
-                let users = accounts
-                    .keys()
-                    .map(|user| format!("'{}'", user.escape_default()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(io::Error::other(format!(
-                    "which user: {users}? Select with --user USER or set a default with --set-default-user USER"
-                )));
-            } else {
-                accounts.values().next()
-            };
+            let account = selected.map_or_else(
+                || accounts.values().next(),
+                |user| accounts.get(user),
+            );
             let Some((user, password)) = account else {
                 return Ok(());
             };
@@ -572,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn accounts_are_selected_explicitly_singly_or_by_default() {
+    fn accounts_are_selected_explicitly_first_or_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store {
             path: dir.path().join("auth.toml"),
@@ -584,26 +574,20 @@ mod tests {
                 connection.redis_settings().clone().set_username(user);
             connection.set_redis_settings(settings)
         };
-        store.save(&account("alice", Some("alice-secret"))).unwrap();
+        store.save(&account("bob", Some("bob-secret"))).unwrap();
         let mut single = info("localhost", None);
         store.apply(&mut single).unwrap();
-        assert_eq!(single.redis_settings().username(), Some("alice"));
-        assert_eq!(single.redis_settings().password(), Some("alice-secret"));
+        assert_eq!(single.redis_settings().username(), Some("bob"));
+        assert_eq!(single.redis_settings().password(), Some("bob-secret"));
 
-        store.save(&account("bob", Some("bob-secret"))).unwrap();
+        store.save(&account("alice", Some("alice-secret"))).unwrap();
         store
             .save(&info("localhost", Some("default-secret")))
             .unwrap();
-        let error = store
-            .apply(&mut info("localhost", None))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("which user: 'alice', 'bob', 'default'"),
-            "{error}"
-        );
-        assert!(error.contains("--user"));
-        assert!(!error.contains("secret"));
+        let mut first = info("localhost", None);
+        store.apply(&mut first).unwrap();
+        assert_eq!(first.redis_settings().username(), Some("alice"));
+        assert_eq!(first.redis_settings().password(), Some("alice-secret"));
         for (user, password) in [
             ("alice", "alice-secret"),
             ("bob", "bob-secret"),

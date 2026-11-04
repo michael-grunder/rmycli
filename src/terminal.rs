@@ -1442,11 +1442,12 @@ impl App {
 
 fn prompt(info: &redis::ConnectionInfo) -> String {
     let address = info.addr();
+    let user = info.redis_settings().username().unwrap_or("default");
     let database = info.redis_settings().db();
     if database == 0 {
-        format!("{address}> ")
+        format!("{user}@{address}> ")
     } else {
-        format!("{address}[{database}]> ")
+        format!("{user}@{address}[{database}]> ")
     }
 }
 
@@ -1529,16 +1530,17 @@ fn viewport(line: &str, cursor: usize, width: usize) -> (String, usize) {
 mod tests {
     use super::*;
     #[test]
-    fn prompt_uses_endpoint_and_nonzero_database_without_credentials() {
+    fn prompt_uses_user_endpoint_and_nonzero_database_without_password() {
         use redis::IntoConnectionInfo;
 
         for (url, expected) in [
-            ("redis://127.0.0.1", "127.0.0.1:6379> "),
-            ("redis://127.0.0.1:7000", "127.0.0.1:7000> "),
-            ("redis://localhost:7000/12", "localhost:7000[12]> "),
+            ("redis://127.0.0.1", "default@127.0.0.1:6379> "),
+            ("redis://127.0.0.1:7000", "default@127.0.0.1:7000> "),
+            ("redis://localhost:7000/12", "default@localhost:7000[12]> "),
+            ("redis://:secret@localhost", "default@localhost:6379> "),
             (
                 "rediss://alice:secret@redis.example:6380/2",
-                "redis.example:6380[2]> ",
+                "alice@redis.example:6380[2]> ",
             ),
         ] {
             assert_eq!(prompt(&url.into_connection_info().unwrap()), expected);
@@ -1546,7 +1548,7 @@ mod tests {
         let socket = redis::ConnectionAddr::Unix("/tmp/redis.sock".into())
             .into_connection_info()
             .unwrap();
-        assert_eq!(prompt(&socket), "/tmp/redis.sock> ");
+        assert_eq!(prompt(&socket), "default@/tmp/redis.sock> ");
     }
 
     #[test]
@@ -1883,9 +1885,9 @@ mod tests {
                 app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
                 let text = String::from_utf8(rendered).unwrap();
                 let expected = if kind == KeyEventKind::Release {
-                    "localhost:6379> KEYS MixedCase:*"
+                    "default@localhost:6379> KEYS MixedCase:*"
                 } else {
-                    "localhost:6379[Ctrl]> KEYS MixedCase:*"
+                    "default@localhost:6379[Ctrl]> KEYS MixedCase:*"
                 };
                 assert!(text.contains(expected), "{text:?}");
                 assert_eq!(app.editor.cursor, 5);
@@ -2033,7 +2035,7 @@ mod tests {
         assert!(!text.contains("Connected"));
         assert!(!text.contains("F1"));
 
-        app.log(["localhost:6379> PING".into(), "PONG".into()]);
+        app.log(["default@localhost:6379> PING".into(), "PONG".into()]);
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         assert_eq!(screen.row, 9);
@@ -2117,10 +2119,13 @@ mod tests {
             app.draw(&mut screen, &mut out, (80, 24)).unwrap();
             let submitted = &out.frames[1];
             assert!(!submitted.contains(&hint));
-            let echoed = submitted.find("localhost:6379> PING\r\n").unwrap();
+            let echoed =
+                submitted.find("default@localhost:6379> PING\r\n").unwrap();
             assert!(submitted.find("\x1b[J").unwrap() < echoed);
             // A quick reply must not follow a transient prompt or status.
-            assert!(!submitted[echoed + 1..].contains("localhost:6379> "));
+            assert!(
+                !submitted[echoed + 1..].contains("default@localhost:6379> ")
+            );
             assert!(!submitted.contains("Executing"));
             assert!(!app.tick(Instant::now()));
 
@@ -2136,7 +2141,7 @@ mod tests {
             let reply = &out.frames[2];
             assert!(
                 reply.find("PONG\r\n").unwrap()
-                    < reply.find("localhost:6379> ").unwrap()
+                    < reply.find("default@localhost:6379> ").unwrap()
             );
             assert!(!reply.contains(&hint));
             assert!(!reply.contains("Executing"));
@@ -2165,7 +2170,7 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(text.contains("localhost:6379> "));
+        assert!(text.contains("default@localhost:6379> "));
         assert!(text.contains("Executing"));
         assert!(app.mode == Mode::Busy);
     }
@@ -2181,7 +2186,7 @@ mod tests {
         assert!(
             String::from_utf8(rendered)
                 .unwrap()
-                .contains("localhost:6379> x")
+                .contains("default@localhost:6379> x")
         );
     }
 
@@ -2197,7 +2202,7 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(!text.contains("localhost:6379>"));
+        assert!(!text.contains("default@localhost:6379>"));
         assert!(!text.contains("Loading"));
 
         app.on_worker(Event::Connected {
@@ -2210,7 +2215,7 @@ mod tests {
         let mut rendered = Vec::new();
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
-        assert!(text.contains("localhost:6379>"));
+        assert!(text.contains("default@localhost:6379>"));
         assert!(!text.contains("Loading"));
 
         app.mode = Mode::Busy;

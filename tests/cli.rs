@@ -553,12 +553,7 @@ fn saved_acl_accounts_can_be_selected_and_defaulted() {
             assert_eq!(success(&["ACL", "WHOAMI"]), b"alice\n");
         }
     }
-    let ambiguous = run(&["PING"]);
-    assert!(!ambiguous.status.success());
-    assert!(
-        String::from_utf8_lossy(&ambiguous.stderr)
-            .contains("which user: 'alice', 'bob'")
-    );
+    assert_eq!(success(&["ACL", "WHOAMI"]), b"alice\n");
     assert_eq!(success(&["--user", "bob", "ACL", "WHOAMI"]), b"bob\n");
     success(&["--set-default-user", "alice"]);
     for protocol in ["-2", "-3"] {

@@ -28,6 +28,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Automatically select the first saved account in alphabetical username order
+  when no user or saved default is specified. Explicit users and saved defaults
+  retain precedence.
+- Include the session username in the prompt and command transcript, such as
+  `alice@127.0.0.1:6379>`, using `default` when no username is supplied.
+
 - Save credentials for successfully authenticated MOVED, ASK, and Valkey REDIRECT
   destinations when permitted by `save-auth`, so later direct connections to
   those nodes can authenticate automatically.
@@ -73,9 +79,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - Keep multiple saved ACL accounts per server, preserving existing credentials.
-  A sole account is selected automatically; multiple accounts require `--user`
-  or a saved default, with available usernames listed when the choice is
-  ambiguous. `--set-default-user USER` selects an existing saved account without
+  Accounts can be selected with `--user` or a saved default.
+  `--set-default-user USER` selects an existing saved account without
   connecting, including `default` for password-only authentication.
 - `history-per-server` setting (default: `true`); set it to `false` for flat
   history recall and search across servers while retaining stored server tags.

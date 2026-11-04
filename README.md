@@ -307,8 +307,9 @@ entry represents Redis's `default` user; it can coexist with other users in the
 `users` table. Do not repeat the same account in both forms.
 
 A sole saved password or username/password pair is selected automatically.
-With multiple accounts and no saved default, startup stops with a message such
-as `which user: 'alice', 'bob'?` and instructions for selecting an account:
+With multiple accounts and no requested user or saved default, the first
+account in alphabetical username order is selected automatically. Use `--user`
+to choose another account or set a saved default:
 
 ```sh
 rmycli -h redis.example.com --tls --user bob
@@ -321,7 +322,7 @@ It requires an already saved account, works even when automatic saving is off,
 and accepts the usual endpoint selectors (`-h`/`-p`, `-u`, `-s`, `--instance`,
 and `--tls`). Use `--set-default-user default` for a saved password-only account
 or an ACL account named `default`. You can also edit `default-user` in the auth
-file; remove it to return to automatic single-account selection. Saving or
+file; remove it to return to automatic first-account selection. Saving or
 updating other accounts does not change the selected default.
 
 Existing URL, instance, CLI, environment, and `--askpass` passwords take
@@ -555,9 +556,10 @@ yet. With a completion popup open, either Enter only accepts the candidate.
 
 Ctrl+Enter requires a terminal that distinguishes it from Enter. The editor
 requests the Kitty keyboard protocol, including modifier presses and releases.
-On supporting terminals, holding either Ctrl key changes `127.0.0.1:6379>` to
-`127.0.0.1:6379[Ctrl]>`; releasing it restores the prompt. Modifier events leave the
-input, completion popup, and confirmation unchanged. Shift remains available
+On supporting terminals, holding either Ctrl key changes
+`default@127.0.0.1:6379>` to `default@127.0.0.1:6379[Ctrl]>`; releasing it restores
+the prompt. Modifier events leave the input, completion popup, and confirmation
+unchanged. Shift remains available
 for typing case-sensitive keys. Ctrl+Enter with a popup open only accepts the
 candidate; release events never submit commands.
 
@@ -592,10 +594,11 @@ them. Short status messages share the input line when it is empty. Help,
 completion, and longer messages reserve space below the prompt only when
 visible, scrolling as needed at the bottom of the terminal.
 Closing a panel removes it and preserves the input. Errors, discovery progress,
-and confirmations still appear when needed. The prompt shows the current host
-and port, such as `127.0.0.1:6379>` or `127.0.0.1:7000>`. Nonzero databases
-add a suffix, such as `127.0.0.1:6379[2]>`; database zero has no suffix. Unix
-connections show the socket path instead of host and port.
+and confirmations still appear when needed. The prompt shows the session user,
+host, and port, such as `alice@127.0.0.1:6379>`. The username defaults to `default`
+when none is supplied and updates after successful AUTH or HELLO AUTH.
+Nonzero databases add a suffix, such as `alice@127.0.0.1:6379[2]>`; database zero
+has no suffix. Unix connections show the socket path instead of host and port.
 
 In-memory history is bounded to 500 commands. Pasting text never
 submits a command. Output retention is controlled by your terminal's scrollback
@@ -606,7 +609,7 @@ settings; the application does not keep a separate transcript.
 For example:
 
 ```text
-127.0.0.1:6379> LRANGE list:<Tab>
+default@127.0.0.1:6379> LRANGE list:<Tab>
 ```
 
 starts discovery on an independent connection with:
