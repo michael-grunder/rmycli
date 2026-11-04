@@ -72,6 +72,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `history-per-server` setting (default: `true`); set it to `false` for flat
+  history recall and search across servers while retaining stored server tags.
 - Persistent interactive history in `~/.config/rmycli_history` (or the XDG
   configuration directory), shared in one file capped at 500 entries across
   servers. Recall and search load only the connected endpoint's history;

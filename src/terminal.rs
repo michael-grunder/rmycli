@@ -450,6 +450,7 @@ pub struct Options {
     pub limits: Limits,
     pub reply_threshold: u64,
     pub yes: bool,
+    pub history_per_server: bool,
     pub theme: Theme,
 }
 
@@ -492,6 +493,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         match history::Store::open(
             dir.join("rmycli_history"),
             config.info.addr(),
+            options.history_per_server,
         ) {
             Ok((store, history)) => {
                 editor.history = history;
@@ -1671,6 +1673,7 @@ mod tests {
                 limits: Limits::default(),
                 reply_threshold: 100,
                 yes: false,
+                history_per_server: true,
                 theme: Theme::default(),
             },
         };

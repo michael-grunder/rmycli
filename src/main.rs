@@ -113,6 +113,7 @@ async fn run(
                 },
                 reply_threshold: options.reply_threshold,
                 yes: options.yes,
+                history_per_server: settings.history_per_server,
                 theme: settings.theme,
             },
         )?;

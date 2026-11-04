@@ -12,7 +12,7 @@
 #
 # All settings are optional. Unknown fields and invalid values are errors.
 # Uncomment examples as needed; do not define the same setting twice.
-# Cluster detection, theme, named-instance, and auth-saving settings live here.
+# Cluster detection, history, theme, instance, and auth-saving settings live here.
 # Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
 # command-line options. See README.md and rmycli --help.
 #
@@ -29,6 +29,12 @@
 # Valkey standalone CLIENT CAPA REDIRECT support is independent of this setting.
 #   rmycli config set auto-cluster false
 auto-cluster = true
+
+# Recall only the initial connection endpoint's history (default: true).
+# false shows all servers' entries in Up/Down and Ctrl-R, in saved order.
+# Entries still retain their server tags in the shared rmycli_history file.
+#   rmycli config set history-per-server false
+history-per-server = true
 
 # Automatic credential saving, after successful authentication only.
 # false (default): never save automatically; still read manually saved entries.

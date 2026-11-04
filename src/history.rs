@@ -24,11 +24,12 @@ impl Store {
     pub fn open(
         path: PathBuf,
         addr: &redis::ConnectionAddr,
+        per_server: bool,
     ) -> io::Result<(Self, VecDeque<String>)> {
         let server = crate::auth::endpoint(addr)?;
         let history = read(&path)?
             .into_iter()
-            .filter(|entry| entry.server == server)
+            .filter(|entry| !per_server || entry.server == server)
             .map(|entry| entry.line)
             .collect();
         Ok((
@@ -218,6 +219,7 @@ mod tests {
         Store::open(
             path.to_owned(),
             &redis::ConnectionAddr::Tcp("localhost".into(), port),
+            true,
         )
         .unwrap()
     }
@@ -246,9 +248,38 @@ mod tests {
             },
             redis::ConnectionAddr::Unix("/tmp/redis.sock".into()),
         ] {
-            assert!(Store::open(path.clone(), &addr).unwrap().1.is_empty());
+            assert!(
+                Store::open(path.clone(), &addr, true).unwrap().1.is_empty()
+            );
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn flat_history_keeps_order_and_server_tags_when_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rmycli_history");
+        let (mut first, _) = open(&path, 6379);
+        first.remember("GET first");
+        first.save().unwrap();
+        let (mut second, _) = open(&path, 6380);
+        second.remember("GET second");
+        second.save().unwrap();
+
+        let before = std::fs::read(&path).unwrap();
+        let (mut flat, history) = Store::open(
+            path.clone(),
+            &redis::ConnectionAddr::Tcp("localhost".into(), 6380),
+            false,
+        )
+        .unwrap();
+        assert_eq!(history, ["GET first", "GET second"]);
+        flat.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        flat.remember("GET third");
+        flat.save().unwrap();
+        assert_eq!(open(&path, 6379).1, ["GET first"]);
+        assert_eq!(open(&path, 6380).1, ["GET second", "GET third"]);
     }
 
     #[test]
@@ -324,7 +355,8 @@ mod tests {
         assert!(
             Store::open(
                 path.clone(),
-                &redis::ConnectionAddr::Tcp("localhost".into(), 6379,)
+                &redis::ConnectionAddr::Tcp("localhost".into(), 6379),
+                true,
             )
             .is_err()
         );

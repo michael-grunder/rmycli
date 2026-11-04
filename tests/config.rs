@@ -82,29 +82,22 @@ fn success(command: &mut Command) -> String {
 }
 
 #[test]
-fn automatic_cluster_setting_can_be_read_disabled_and_reset() {
+fn boolean_settings_can_be_read_disabled_and_reset() {
     let fixture = Fixture::new();
-    assert_eq!(
-        success(&mut fixture.config(&["get", "auto-cluster"])),
-        "true\n"
-    );
-    assert_eq!(
-        success(&mut fixture.config(&["set", "auto-cluster", "false"])),
-        "false\n"
-    );
-    assert_eq!(
-        success(&mut fixture.config(&["get", "auto-cluster"])),
-        "false\n"
-    );
-    assert!(
-        error(&mut fixture.config(&["set", "auto-cluster", "no"]))
-            .contains("true or false")
-    );
-    success(&mut fixture.config(&["unset", "auto-cluster"]));
-    assert_eq!(
-        success(&mut fixture.config(&["get", "auto-cluster"])),
-        "true\n"
-    );
+    for key in ["auto-cluster", "history-per-server"] {
+        assert_eq!(success(&mut fixture.config(&["get", key])), "true\n");
+        assert_eq!(
+            success(&mut fixture.config(&["set", key, "false"])),
+            "false\n"
+        );
+        assert_eq!(success(&mut fixture.config(&["get", key])), "false\n");
+        assert!(
+            error(&mut fixture.config(&["set", key, "no"]))
+                .contains("true or false")
+        );
+        success(&mut fixture.config(&["unset", key]));
+        assert_eq!(success(&mut fixture.config(&["get", key])), "true\n");
+    }
 }
 
 fn assert_path_error(command: &mut Command, path: &Path, expected: &str) {

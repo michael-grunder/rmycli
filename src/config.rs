@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, de::Error};
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Settings {
     pub auto_cluster: bool,
+    pub history_per_server: bool,
     pub save_auth: crate::auth::SaveAuth,
     pub theme: Theme,
     pub instances: BTreeMap<String, Instance>,
@@ -19,6 +20,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             auto_cluster: true,
+            history_per_server: true,
             save_auth: crate::auth::SaveAuth::default(),
             theme: Theme::default(),
             instances: BTreeMap::new(),
@@ -213,6 +215,12 @@ mod tests {
     fn defaults_and_partial_settings() {
         let settings = Settings::parse("").unwrap();
         assert!(settings.auto_cluster);
+        assert!(settings.history_per_server);
+        assert!(
+            !Settings::parse("history-per-server = false")
+                .unwrap()
+                .history_per_server
+        );
         assert!(
             !Settings::parse("auto-cluster = false")
                 .unwrap()
@@ -251,6 +259,8 @@ mod tests {
             "unknown = true",
             "auto-cluster = 'false'",
             "auto-cluster = 1",
+            "history-per-server = 'false'",
+            "history-per-server = 1",
             "[theme]\ninline-hnit = 'red'",
             "[theme]\ninline-hint = 'invisible'",
             "[theme]\ninline-hint = '#12345g'",

@@ -444,7 +444,7 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Escape | Close the popup or cancel discovery/confirmation |
 | Left / Right, Home / End, Ctrl-A / Ctrl-E | Move the cursor |
 | Backspace / Delete, Ctrl-U / Ctrl-K | Delete characters or text before/after the cursor |
-| Up / Down | Browse this server's command history |
+| Up / Down | Browse command history (per-server by default) |
 | Ctrl-R | Search command history with fuzzy matching |
 | F1 | Open or close command help, editor shortcuts, and connection details |
 | PageUp / PageDown, Up / Down with help open | Scroll the help panel |
@@ -466,15 +466,22 @@ the search open. Duplicate commands appear once, newest first.
 Interactive history loads from `$XDG_CONFIG_HOME/rmycli_history`, normally
 `~/.config/rmycli_history`, and saves on exit. One JSON-lines file retains up to
 500 entries **total across all servers**, dropping the oldest saved entries.
-Only the initial connection endpoint's entries appear in Up/Down and Ctrl-R;
+By default, only the initial endpoint's entries appear in Up/Down and Ctrl-R;
 databases and accounts on that endpoint share history. Endpoint matching uses
 the same transport, hostname, port, and socket-path rules as saved authentication.
 Redirects keep the initial endpoint's history. New commands from overlapping
 sessions merge with the latest file on exit, ordered by save time. Commands
 from another session become visible after restarting.
 
-History is independent of settings discovery, including `--no-config` and
-`--config`. Noninteractive commands are not recorded. Writes are atomic and
+Set top-level `history-per-server = false` in `rmycli.toml` to show all servers'
+entries together in Up/Down and Ctrl-R, in saved order. The default is `true`.
+You can also run `rmycli config set history-per-server false`, then restart the
+shell. Entries still store their server tags, so switching back restores
+per-server filtering without changing the history file format.
+
+The history file location is independent of settings discovery, including
+`--no-config` and `--config`. `--no-config` uses the default per-server filtering.
+Noninteractive commands are not recorded. Writes are atomic and
 owner-only on Unix; existing symlinks are followed. Invalid files are left
 untouched, and load/save failures warn without preventing shell use. A
 simultaneous save warns instead of overwriting another writer; after a crash,

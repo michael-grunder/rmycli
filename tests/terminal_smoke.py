@@ -414,6 +414,22 @@ def main():
             other_history.close()
             terminals.remove(other_history)
 
+            flat_config = Path(directory) / "flat-history.toml"
+            flat_config.write_text("history-per-server = false\n")
+            flat_history = Terminal(other_socket, "--config", str(flat_config))
+            terminals.append(flat_history)
+            flat_history.send(b"\x1b[A")
+            flat_history.expect_frame(
+                lambda f: f.row(f.y).startswith(f"{other_socket}> INCR history:user"),
+                "flat history recalls another endpoint's command",
+            )
+            flat_history.send(b"\x15\x12husr")
+            flat_history.expect("1 matches")
+            flat_history.send(b"\x03")
+            flat_history.close()
+            terminals.remove(flat_history)
+            assert redis("GET", "history:user") == "2", "flat history executed"
+
             tracking = Terminal(socket, "-3")
             terminals.append(tracking)
             for command, reply in [(b"SET tracked original\r", "OK"),

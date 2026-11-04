@@ -206,7 +206,7 @@ impl SettingKey {
             .iter().map(|part| part.get().to_owned()).collect::<Vec<_>>();
         let names = parts.iter().map(String::as_str).collect::<Vec<_>>();
         let kind = match names.as_slice() {
-            ["auto-cluster"] => Kind::Boolean,
+            ["auto-cluster" | "history-per-server"] => Kind::Boolean,
             ["save-auth"] => Kind::SaveAuth,
             ["theme", "inline-hint"] => Kind::Color,
             ["theme", "commands", name] if !name.trim().is_empty() => {
@@ -308,6 +308,9 @@ impl SettingKey {
     fn default_value(&self, settings: &Settings) -> Result<String> {
         if self.parts == ["auto-cluster"] {
             return Ok(settings.auto_cluster.to_string());
+        }
+        if self.parts == ["history-per-server"] {
+            return Ok(settings.history_per_server.to_string());
         }
         if matches!(self.kind, Kind::SaveAuth) {
             return Ok("false".into());
