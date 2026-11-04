@@ -7,6 +7,7 @@ Examples:
   rmycli -u redis://localhost:6379/2   Connect using a URI
   REDISCLI_AUTH=secret rmycli --user alice
   rmycli --askpass --user alice        Prompt without echoing the password
+  rmycli --set-default-user alice      Choose a saved default without connecting
   rmycli --tls --cacert ca.pem -h redis.example.com
   rmycli -c -h cluster.example.com GET greeting
   rmycli --json HGETALL account:1

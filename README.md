@@ -283,8 +283,12 @@ user = "default"
 password = "replace-me"
 
 [servers."rediss://redis.example.com:6379"]
-user = "alice"
-password = "replace-me-too"
+# Optional when several accounts are saved; must name a saved account.
+default-user = "alice"
+
+[servers."rediss://redis.example.com:6379".users]
+alice = "alice-password"
+bob = "bob-password"
 
 # Other endpoint forms:
 # [servers."redis://[::1]:6379"]
@@ -297,9 +301,35 @@ Entries match the transport, hostname, and port (or socket path) exactly, with
 no wildcard or DNS alias matching. Use lowercase hostnames without a trailing
 dot and include the port; databases share credentials. `localhost` and
 `127.0.0.1` are separate entries, as are TLS and plain TCP. Socket paths match
-as supplied. Each endpoint stores one account. Existing URL, instance, CLI,
-environment, and `--askpass` passwords take precedence over saved credentials.
-An explicit username uses the saved password only if the account matches.
+as supplied. Each endpoint can store multiple accounts, with one password per
+username. Existing `user`/`password` entries remain supported. A password-only
+entry represents Redis's `default` user; it can coexist with other users in the
+`users` table. Do not repeat the same account in both forms.
+
+A sole saved password or username/password pair is selected automatically.
+With multiple accounts and no saved default, startup stops with a message such
+as `which user: 'alice', 'bob'?` and instructions for selecting an account:
+
+```sh
+rmycli -h redis.example.com --tls --user bob
+rmycli -h redis.example.com --tls --set-default-user alice
+rmycli -h redis.example.com --tls
+```
+
+`--set-default-user USER` updates the saved choice and exits without connecting.
+It requires an already saved account, works even when automatic saving is off,
+and accepts the usual endpoint selectors (`-h`/`-p`, `-u`, `-s`, `--instance`,
+and `--tls`). Use `--set-default-user default` for a saved password-only account
+or an ACL account named `default`. You can also edit `default-user` in the auth
+file; remove it to return to automatic single-account selection. Saving or
+updating other accounts does not change the selected default.
+
+Existing URL, instance, CLI, environment, and `--askpass` passwords take
+precedence over saved credentials.
+An explicit username (including one from a URL or instance) overrides the saved
+default and uses a saved password only if that account matches. An unknown
+username does not fall back to another account's password; you can still
+authenticate manually.
 `--no-config` disables both reading and writing this file.
 
 Automatic saving is **disabled by default**. Set the top-level `save-auth` in
@@ -316,12 +346,13 @@ to select the other policies, or `rmycli config unset save-auth` to restore the
 default. TOML requires quotes around `"local"` and `"always"`.
 
 Saving applies after successful connection-time authentication and successful
-AUTH/HELLO AUTH commands, including stdin commands. It updates that endpoint's
-credentials while retaining other server entries. `local` recognizes
-`localhost`, IPv4/IPv6 loopback addresses, and Unix sockets; it does not resolve
-arbitrary hostnames or include private network addresses. Changing the policy
-to `false` stops future saves but still reads existing entries. Delete an entry
-to forget it; RESET does not delete saved credentials.
+AUTH/HELLO AUTH commands, including stdin commands. It updates that account's
+password while retaining other accounts, defaults, and server entries. `local`
+recognizes `localhost`, IPv4/IPv6 loopback addresses, and Unix sockets; it does
+not resolve arbitrary hostnames or include private network addresses. Changing the policy
+to `false` stops future automatic saves but still reads existing entries. Delete
+an account to forget it (and remove `default-user` if it names that account);
+RESET does not delete saved credentials.
 
 MOVED, ASK, and Valkey REDIRECT connections reuse the session's credentials.
 After a successful redirected connection, those credentials are also saved for

@@ -66,8 +66,15 @@ async fn run(
         options.settings.config.as_deref(),
         options.settings.no_config,
     )?;
-    let args = batch::stdin_command(options)?;
     let mut config = options.config(&settings)?;
+    if let Some(user) = &options.set_default_user {
+        let store = auth::Store::discover(settings.save_auth)
+            .ok_or("cannot locate the user config directory")?;
+        store.set_default_user(config.info.addr(), user)?;
+        println!("Default user set to '{}'", user.escape_default());
+        return Ok(());
+    }
+    let args = batch::stdin_command(options)?;
     if !options.settings.no_config {
         config.auth_store = auth::Store::discover(settings.save_auth);
         if let Some(store) = &config.auth_store {

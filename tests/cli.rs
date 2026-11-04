@@ -494,3 +494,86 @@ fn saved_auth_is_opt_in_reused_and_overridden_by_explicit_credentials() {
     );
     assert_eq!(std::fs::read_to_string(&auth).unwrap(), saved);
 }
+
+#[test]
+fn saved_acl_accounts_can_be_selected_and_defaulted() {
+    let fixture = Fixture::new();
+    for user in ["alice", "bob"] {
+        fixture.success(
+            &[
+                "ACL",
+                "SETUSER",
+                user,
+                "on",
+                &format!(">{user}-secret"),
+                "~*",
+                "+@all",
+            ],
+            b"",
+        );
+    }
+    std::fs::write(
+        fixture.dir.path().join("rmycli.toml"),
+        "save-auth = 'local'\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rmycli"))
+            .env_remove("REDIS_URL")
+            .env_remove("REDISCLI_AUTH")
+            .env("XDG_CONFIG_HOME", fixture.dir.path())
+            .arg("-s")
+            .arg(&fixture.socket)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let success = |args: &[&str]| {
+        let output = run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    for user in ["alice", "bob"] {
+        assert_eq!(
+            success(&[
+                "--user",
+                user,
+                "-a",
+                &format!("{user}-secret"),
+                "ACL",
+                "WHOAMI"
+            ]),
+            format!("{user}\n").as_bytes()
+        );
+        if user == "alice" {
+            assert_eq!(success(&["ACL", "WHOAMI"]), b"alice\n");
+        }
+    }
+    let ambiguous = run(&["PING"]);
+    assert!(!ambiguous.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr)
+            .contains("which user: 'alice', 'bob'")
+    );
+    assert_eq!(success(&["--user", "bob", "ACL", "WHOAMI"]), b"bob\n");
+    success(&["--set-default-user", "alice"]);
+    for protocol in ["-2", "-3"] {
+        assert_eq!(success(&[protocol, "ACL", "WHOAMI"]), b"alice\n");
+        assert_eq!(
+            success(&[protocol, "--user", "bob", "ACL", "WHOAMI"]),
+            b"bob\n"
+        );
+    }
+    assert!(
+        !run(&["--user", "bob", "-a", "wrong", "PING"])
+            .status
+            .success()
+    );
+    assert_eq!(success(&["--user", "bob", "ACL", "WHOAMI"]), b"bob\n");
+    success(&["--set-default-user", "bob"]);
+    assert_eq!(success(&["ACL", "WHOAMI"]), b"bob\n");
+}

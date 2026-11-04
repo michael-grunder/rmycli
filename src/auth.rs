@@ -72,14 +72,46 @@ pub struct Store {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AuthFile {
-    servers: BTreeMap<String, Credentials>,
+    servers: BTreeMap<String, Server>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Credentials {
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+struct Server {
     user: Option<String>,
-    password: String,
+    password: Option<String>,
+    users: BTreeMap<String, String>,
+    default_user: Option<String>,
+}
+
+impl Server {
+    fn credentials(&self) -> BTreeMap<&str, (Option<&str>, &str)> {
+        let mut accounts = self
+            .users
+            .iter()
+            .map(|(user, password)| {
+                (user.as_str(), (Some(user.as_str()), password.as_str()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if let Some(password) = &self.password {
+            accounts.insert(
+                self.user.as_deref().unwrap_or("default"),
+                (self.user.as_deref(), password),
+            );
+        }
+        accounts
+    }
+
+    fn valid(&self) -> bool {
+        (self.user.is_none() || self.password.is_some())
+            && !(self.password.is_some()
+                && self
+                    .users
+                    .contains_key(self.user.as_deref().unwrap_or("default")))
+            && self.default_user.as_ref().is_none_or(|user| {
+                self.credentials().contains_key(user.as_str())
+            })
+    }
 }
 
 pub fn endpoint(addr: &ConnectionAddr) -> io::Result<String> {
@@ -131,12 +163,16 @@ impl Store {
         let invalid = || {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid auth file; expected [servers.\"redis://host:port\"] with user (optional) and password",
+                "invalid auth file; expected server tables with password and optional user, a users password table, and an optional default-user naming a saved account; duplicate accounts are not allowed",
             )
         };
         let parsed: AuthFile =
             toml::from_str(&source).map_err(|_| invalid())?;
-        if parsed.servers.keys().any(|key| key.trim().is_empty()) {
+        if parsed
+            .servers
+            .iter()
+            .any(|(key, server)| key.trim().is_empty() || !server.valid())
+        {
             return Err(invalid());
         }
         let document = source.parse().map_err(|_| invalid())?;
@@ -153,13 +189,28 @@ impl Store {
             return Ok(());
         };
         if let Some(saved) = file.servers.get(&key) {
-            if settings.username().is_some_and(|user| {
-                user != saved.user.as_deref().unwrap_or("default")
-            }) {
+            let accounts = saved.credentials();
+            let selected =
+                settings.username().or(saved.default_user.as_deref());
+            let account = if let Some(user) = selected {
+                accounts.get(user)
+            } else if accounts.len() > 1 {
+                let users = accounts
+                    .keys()
+                    .map(|user| format!("'{}'", user.escape_default()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(io::Error::other(format!(
+                    "which user: {users}? Select with --user USER or set a default with --set-default-user USER"
+                )));
+            } else {
+                accounts.values().next()
+            };
+            let Some((user, password)) = account else {
                 return Ok(());
-            }
-            let mut settings = settings.clone().set_password(&saved.password);
-            if let Some(user) = &saved.user {
+            };
+            let mut settings = settings.clone().set_password(*password);
+            if let Some(user) = user {
                 settings = settings.set_username(user);
             }
             *info = info.clone().set_redis_settings(settings);
@@ -175,6 +226,89 @@ impl Store {
         let Some(password) = settings.password() else {
             return Ok(());
         };
+        let key = endpoint(info.addr())?;
+        let user = settings.username().unwrap_or("default");
+        self.update(|file, document| {
+            let saved = file.servers.get(&key);
+            if saved.is_some_and(|saved| {
+                saved.credentials().get(user).is_some_and(|account| {
+                    *account == (settings.username(), password)
+                })
+            }) {
+                return Ok(false);
+            }
+            if !document.contains_key("servers") {
+                document["servers"] = Item::Table(Table::new());
+            }
+            let servers = document["servers"]
+                .as_table_like_mut()
+                .ok_or_else(|| io::Error::other("servers must be a table"))?;
+            if !servers.contains_key(&key) {
+                servers.insert(&key, Item::Table(Table::new()));
+            }
+            let entry = servers
+                .get_mut(&key)
+                .and_then(Item::as_table_like_mut)
+                .ok_or_else(|| io::Error::other("server must be a table"))?;
+            // Keep legacy entries intact when updating the same account.
+            if settings.username().is_none()
+                || saved.is_some_and(|saved| {
+                    saved.password.is_some()
+                        && saved.user.as_deref().unwrap_or("default") == user
+                })
+            {
+                if let Some(users) =
+                    entry.get_mut("users").and_then(Item::as_table_like_mut)
+                {
+                    users.remove(user);
+                }
+                if let Some(saved) = saved
+                    && let (Some(old_user), Some(old_password)) =
+                        (&saved.user, &saved.password)
+                    && old_user != user
+                {
+                    insert_user(entry, old_user, old_password)?;
+                }
+                if let Some(user) = settings.username() {
+                    entry.insert("user", value(user));
+                } else {
+                    entry.remove("user");
+                }
+                entry.insert("password", value(password));
+            } else {
+                insert_user(entry, user, password)?;
+            }
+            Ok(true)
+        })
+    }
+
+    pub fn set_default_user(
+        &self,
+        addr: &ConnectionAddr,
+        user: &str,
+    ) -> io::Result<()> {
+        let key = endpoint(addr)?;
+        self.update(|file, document| {
+            if !file
+                .servers
+                .get(&key)
+                .is_some_and(|server| server.credentials().contains_key(user))
+            {
+                return Err(io::Error::other(format!(
+                    "no saved credentials for user '{}' at {}",
+                    user.escape_default(),
+                    key.escape_default()
+                )));
+            }
+            document["servers"][&key]["default-user"] = value(user);
+            Ok(true)
+        })
+    }
+
+    fn update(
+        &self,
+        edit: impl FnOnce(&AuthFile, &mut DocumentMut) -> io::Result<bool>,
+    ) -> io::Result<()> {
         // Follow managed dotfile links while replacing their target atomically.
         let path = if self.path.try_exists()? {
             self.path.canonicalize()?
@@ -206,32 +340,9 @@ impl Store {
         let _lock = Lock(lock_path);
         drop(lock_file);
         let (file, mut document) = self.read()?;
-        let key = endpoint(info.addr())?;
-        if file.servers.get(&key).is_some_and(|saved| {
-            saved.user.as_deref() == settings.username()
-                && saved.password == password
-        }) {
+        if !edit(&file, &mut document)? {
             return Ok(());
         }
-        if !document.contains_key("servers") {
-            document["servers"] = Item::Table(Table::new());
-        }
-        let servers = document["servers"]
-            .as_table_like_mut()
-            .ok_or_else(|| io::Error::other("servers must be a table"))?;
-        if !servers.contains_key(&key) {
-            servers.insert(&key, Item::Table(Table::new()));
-        }
-        let entry = servers
-            .get_mut(&key)
-            .and_then(Item::as_table_like_mut)
-            .ok_or_else(|| io::Error::other("server must be a table"))?;
-        if let Some(user) = settings.username() {
-            entry.insert("user", value(user));
-        } else {
-            entry.remove("user");
-        }
-        entry.insert("password", value(password));
         // NamedTempFile starts owner-only on Unix, including replacements.
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         temporary.write_all(document.to_string().as_bytes())?;
@@ -239,6 +350,22 @@ impl Store {
         temporary.persist(path)?;
         Ok(())
     }
+}
+
+fn insert_user(
+    entry: &mut dyn toml_edit::TableLike,
+    user: &str,
+    password: &str,
+) -> io::Result<()> {
+    if !entry.contains_key("users") {
+        entry.insert("users", Item::Table(Table::new()));
+    }
+    entry
+        .get_mut("users")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| io::Error::other("users must be a table"))?
+        .insert(user, value(password));
+    Ok(())
 }
 
 struct Lock(PathBuf);
@@ -442,5 +569,135 @@ mod tests {
         assert!(store.save(&info("localhost", Some("new"))).is_err());
         assert_eq!(std::fs::read_to_string(&store.path).unwrap(), "");
         assert!(store.path.with_extension("toml.lock").exists());
+    }
+
+    #[test]
+    fn accounts_are_selected_explicitly_singly_or_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: dir.path().join("auth.toml"),
+            policy: SaveAuth::Always,
+        };
+        let account = |user: &str, password: Option<&str>| {
+            let connection = info("localhost", password);
+            let settings =
+                connection.redis_settings().clone().set_username(user);
+            connection.set_redis_settings(settings)
+        };
+        store.save(&account("alice", Some("alice-secret"))).unwrap();
+        let mut single = info("localhost", None);
+        store.apply(&mut single).unwrap();
+        assert_eq!(single.redis_settings().username(), Some("alice"));
+        assert_eq!(single.redis_settings().password(), Some("alice-secret"));
+
+        store.save(&account("bob", Some("bob-secret"))).unwrap();
+        store
+            .save(&info("localhost", Some("default-secret")))
+            .unwrap();
+        let error = store
+            .apply(&mut info("localhost", None))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("which user: 'alice', 'bob', 'default'"),
+            "{error}"
+        );
+        assert!(error.contains("--user"));
+        assert!(!error.contains("secret"));
+        for (user, password) in [
+            ("alice", "alice-secret"),
+            ("bob", "bob-secret"),
+            ("default", "default-secret"),
+        ] {
+            let mut selected = account(user, None);
+            store.apply(&mut selected).unwrap();
+            assert_eq!(selected.redis_settings().password(), Some(password));
+        }
+        store.set_default_user(single.addr(), "bob").unwrap();
+        store.save(&account("bob", Some("updated"))).unwrap();
+        let mut selected = info("localhost", None);
+        store.apply(&mut selected).unwrap();
+        assert_eq!(selected.redis_settings().username(), Some("bob"));
+        assert_eq!(selected.redis_settings().password(), Some("updated"));
+        let mut explicit = account("alice", None);
+        store.apply(&mut explicit).unwrap();
+        assert_eq!(explicit.redis_settings().password(), Some("alice-secret"));
+        let mut explicit = info("localhost", Some("explicit"));
+        store.apply(&mut explicit).unwrap();
+        assert!(explicit.redis_settings().username().is_none());
+        assert_eq!(explicit.redis_settings().password(), Some("explicit"));
+
+        store.set_default_user(single.addr(), "default").unwrap();
+        let mut selected = info("localhost", None);
+        store.apply(&mut selected).unwrap();
+        assert!(selected.redis_settings().username().is_none());
+        assert_eq!(
+            selected.redis_settings().password(),
+            Some("default-secret")
+        );
+        let before = std::fs::read_to_string(&store.path).unwrap();
+        assert!(store.set_default_user(single.addr(), "missing").is_err());
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_acl_account_survives_saving_password_only_and_named_users() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: dir.path().join("auth.toml"),
+            policy: SaveAuth::Always,
+        };
+        std::fs::write(&store.path, "[servers.\"redis://localhost:7000\"]\nuser = 'alice'\npassword = 'old'\ndefault-user = 'alice'\n").unwrap();
+        store
+            .save(&info("localhost", Some("password-only")))
+            .unwrap();
+        let mut selected = info("localhost", None);
+        store.apply(&mut selected).unwrap();
+        assert_eq!(selected.redis_settings().username(), Some("alice"));
+        assert_eq!(selected.redis_settings().password(), Some("old"));
+        store
+            .save(
+                &selected.set_redis_settings(
+                    redis::RedisConnectionInfo::default()
+                        .set_username("alice")
+                        .set_password("new"),
+                ),
+            )
+            .unwrap();
+        let (file, _) = store.read().unwrap();
+        let accounts = file.servers["redis://localhost:7000"].credentials();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts["alice"], (Some("alice"), "new"));
+        assert_eq!(accounts["default"], (None, "password-only"));
+    }
+
+    #[test]
+    fn invalid_accounts_and_defaults_are_rejected_without_leaking_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: dir.path().join("auth.toml"),
+            policy: SaveAuth::Always,
+        };
+        for fields in [
+            "user = 'secret'",
+            "password = 'secret'\ndefault-user = 'missing'",
+            "password = 'secret'\nusers = {default = 'secret'}",
+            "user = 'alice'\npassword = 'secret'\nusers = {alice = 'secret'}",
+            "users = {alice = 123}",
+        ] {
+            let source =
+                format!("[servers.\"redis://localhost:7000\"]\n{fields}\n");
+            std::fs::write(&store.path, &source).unwrap();
+            assert!(store.apply(&mut info("localhost", None)).is_err());
+            let error =
+                store.save(&info("localhost", Some("new"))).unwrap_err();
+            assert!(!error.to_string().contains("secret"));
+            assert!(
+                store
+                    .set_default_user(info("localhost", None).addr(), "alice")
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&store.path).unwrap(), source);
+        }
     }
 }

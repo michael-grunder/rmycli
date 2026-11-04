@@ -508,3 +508,37 @@ fn auth_saving_policy_can_be_read_set_and_unset() {
         "false\n"
     );
 }
+
+#[test]
+fn saved_default_is_set_offline_without_automatic_saving() {
+    let fixture = Fixture::new();
+    let path = fixture.write("user/rmycli-auth.toml", "# keep\n[servers.\"redis://unreachable.invalid:6379\"]\npassword = 'secret'\nusers = {alice = 'other'}\n");
+    let command = || {
+        let mut command = fixture.base_command();
+        command.args(["-h", "unreachable.invalid", "--set-default-user"]);
+        command
+    };
+    for user in ["alice", "default"] {
+        assert!(success(command().arg(user)).contains(user));
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(source.starts_with("# keep\n"));
+        let parsed: toml::Value = toml::from_str(&source).unwrap();
+        let server = &parsed["servers"]["redis://unreachable.invalid:6379"];
+        assert_eq!(server["default-user"].as_str(), Some(user));
+        assert_eq!(server["password"].as_str(), Some("secret"));
+        assert_eq!(server["users"]["alice"].as_str(), Some("other"));
+    }
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(error(command().arg("missing")).contains("no saved credentials"));
+    for args in [
+        vec!["alice", "PING"],
+        vec!["alice", "--no-config"],
+        vec!["alice", "--askpass"],
+        vec!["alice", "--scan"],
+        vec!["alice", "-x"],
+        vec!["alice", "--eval", "missing.lua"],
+    ] {
+        assert!(error(command().args(args)).contains("cannot be used with"));
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}

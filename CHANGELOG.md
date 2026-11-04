@@ -72,6 +72,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Keep multiple saved ACL accounts per server, preserving existing credentials.
+  A sole account is selected automatically; multiple accounts require `--user`
+  or a saved default, with available usernames listed when the choice is
+  ambiguous. `--set-default-user USER` selects an existing saved account without
+  connecting, including `default` for password-only authentication.
 - `history-per-server` setting (default: `true`); set it to `false` for flat
   history recall and search across servers while retaining stored server tags.
 - Persistent interactive history in `~/.config/rmycli_history` (or the XDG

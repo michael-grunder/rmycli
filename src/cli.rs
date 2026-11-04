@@ -57,6 +57,10 @@ pub struct Options {
     /// ACL username
     #[arg(long, help_heading = "Connection")]
     pub user: Option<String>,
+    /// Choose a saved default user for this server and exit without connecting
+    #[arg(long, value_name = "USER", help_heading = "Local settings",
+        conflicts_with_all = ["no_config", "command", "BatchOptions", "askpass"])]
+    pub set_default_user: Option<String>,
     /// Prefer `REDISCLI_AUTH` to putting a password in shell history
     #[arg(
         short = 'a',
