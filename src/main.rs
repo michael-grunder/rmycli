@@ -17,6 +17,7 @@ mod prompt;
 mod scan;
 mod secret;
 mod session;
+mod shell_completion;
 mod terminal;
 mod transport;
 mod worker;
@@ -31,8 +32,14 @@ use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
 use cli::Options;
 use session::Session;
 
+fn main() {
+    // CompleteEnv changes the environment before any runtime threads exist.
+    clap_complete::CompleteEnv::with_factory(Options::command).complete();
+    async_main();
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 1)]
-async fn main() {
+async fn async_main() {
     let matches = Options::command().get_matches();
     let options = Options::from_arg_matches(&matches)
         .unwrap_or_else(|error| error.exit());

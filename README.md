@@ -71,6 +71,71 @@ Server errors show the server's message without the Redis library's preamble
 (for example, `(error) syntax error` in the editor). Errors without a message
 show their server error code. Client and connection errors retain their context.
 
+## Shell completions
+
+Dynamic completions cover command-line options, fixed values, file paths,
+configured `--instance` names, and saved usernames for `--user` and
+`--set-default-user`. Add the appropriate line to your shell's startup file
+after installing `rmycli` on `PATH`:
+
+```bash
+# Bash: ~/.bashrc
+source <(COMPLETE=bash rmycli)
+```
+
+```zsh
+# Zsh: ~/.zshrc, after compinit (your shell framework may already run it)
+autoload -Uz compinit; compinit
+source <(COMPLETE=zsh rmycli)
+```
+
+```fish
+# Fish: ~/.config/fish/completions/rmycli.fish
+COMPLETE=fish rmycli | source
+```
+
+```powershell
+# PowerShell: $PROFILE
+$env:COMPLETE = 'powershell'
+rmycli | Out-String | Invoke-Expression
+Remove-Item Env:\COMPLETE
+```
+
+```elvish
+# Elvish: your rc.elv startup file
+eval (E:COMPLETE=elvish rmycli | slurp)
+```
+
+These use [clap's dynamic completion engine][clap-complete]. Keep the generation
+command in your startup file so each new shell picks up changes after an
+upgrade. Run the same command in an existing shell to refresh its completions.
+The shell controls how Tab displays, cycles, or accepts matching candidates.
+
+For example, if `alice` and `mike` are saved for `redis://127.0.0.1:7000`:
+
+```text
+rmycli -p 7000 --user <Tab>     # alice, mike
+rmycli -p 7000 --user m<Tab>    # mike
+```
+
+Usernames come from the local plaintext credential store and the selected
+instance's configured user; `--set-default-user` suggests only saved accounts.
+Endpoint selection follows `-h`/`-p`, `-u` or
+`REDIS_URL`, `-s`, `--tls`, and `--instance`, including explicit overrides.
+Transport, host, and port must match the saved endpoint; `localhost` and
+`127.0.0.1` remain distinct. `--config` selects the settings file as usual;
+`--no-config` disables local username and instance suggestions.
+
+Completion never connects to Redis, lists server ACLs, prompts for a password,
+or writes settings. Encrypted credential stores are not unlocked for completion
+and their usernames are not suggested, even if a legacy plaintext file remains.
+Missing or invalid local files quietly omit their suggestions. Names containing
+control characters are omitted because shells use those characters as completion
+delimiters. Arbitrary usernames can still be entered manually. Redis command and
+key completion remain features of the interactive editor.
+
+[clap-complete]: https://docs.rs/clap_complete/latest/clap_complete/env/index.html
+
 ## Familiar redis-cli options
 
 `rmycli --help` groups options by purpose and includes connection, scripting,

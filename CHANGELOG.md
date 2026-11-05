@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Dynamic shell completions for Bash, Zsh, Fish, PowerShell, and Elvish using
+  clap's command-line definitions. Complete configured instance names and local
+  saved usernames for the selected endpoint, including partial names. Completion
+  never connects or prompts; encrypted credential stores remain locked.
+
 - Optional encrypted credential storage using libsodium Argon2id and
   XChaCha20-Poly1305. Enable `encrypt-auth` for new saves, or migrate with
   `rmycli auth encrypt`, which retains the original plaintext file and prints

@@ -32,6 +32,14 @@ Usage notes:
   REDISCLI_AUTH supplies a password; --pass/-a overrides it, --askpass wins.
   REDIS_URL supplies a URI. --help and --version never load configuration.
 
+Shell completions:
+  Bash: source <(COMPLETE=bash rmycli)
+  Zsh:  source <(COMPLETE=zsh rmycli)    (after compinit)
+  Fish: COMPLETE=fish rmycli | source
+  Also supports COMPLETE=powershell and COMPLETE=elvish; see README for setup.
+  Completes flags, instances, and saved --user/--set-default-user names for the
+  selected endpoint. No connections or prompts; encrypted usernames are omitted.
+
 Compatibility:
   This is an interactive shell, not a replacement for redis-cli's administration
   suite. Cluster management (--cluster), replication/RDB transfer, --pipe,

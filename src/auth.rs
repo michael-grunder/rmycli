@@ -301,6 +301,25 @@ impl Store {
         Ok((file, document))
     }
 
+    pub fn usernames(&self, addr: &ConnectionAddr) -> io::Result<Vec<String>> {
+        // Shell completion must never unlock the vault or prompt for secrets.
+        if self.vault.is_some() {
+            return Ok(Vec::new());
+        }
+        let (file, _) = self.read_file()?;
+        Ok(file
+            .servers
+            .get(&endpoint(addr)?)
+            .map(|server| {
+                server
+                    .credentials()
+                    .keys()
+                    .map(|user| (*user).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub fn apply(&self, info: &mut ConnectionInfo) -> io::Result<()> {
         if info.redis_settings().password().is_some() {
             return Ok(());

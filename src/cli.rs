@@ -55,10 +55,12 @@ pub struct Options {
     #[arg(short = 'n', long, help_heading = "Connection")]
     pub db: Option<i64>,
     /// ACL username
-    #[arg(long, help_heading = "Connection")]
+    #[arg(long, help_heading = "Connection",
+        add = clap_complete::ArgValueCompleter::new(crate::shell_completion::users))]
     pub user: Option<String>,
     /// Choose a saved default user for this server and exit without connecting
     #[arg(long, value_name = "USER", help_heading = "Local settings",
+        add = clap_complete::ArgValueCompleter::new(crate::shell_completion::users),
         conflicts_with_all = ["no_config", "command", "BatchOptions", "askpass"])]
     pub set_default_user: Option<String>,
     /// Prefer `REDISCLI_AUTH` to putting a password in shell history
@@ -152,15 +154,16 @@ pub struct ConfigOptions {
     #[arg(long)]
     pub no_config: bool,
     /// Connect using a named instance from the config file
-    #[arg(long, value_name = "NAME", conflicts_with_all = ["uri", "socket"])]
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["uri", "socket"],
+        add = clap_complete::ArgValueCompleter::new(crate::shell_completion::instances))]
     pub instance: Option<String>,
 }
 
 impl Options {
-    pub fn config(
+    pub fn connection_info(
         &self,
         settings: &config::Settings,
-    ) -> Result<Config, Box<dyn std::error::Error>> {
+    ) -> Result<redis::ConnectionInfo, Box<dyn std::error::Error>> {
         let default_instance = config::Instance::default();
         let instance = if let Some(name) = &self.settings.instance {
             settings
@@ -196,6 +199,21 @@ impl Options {
                 return Err("TLS cannot be used with a Unix socket".into());
             }
         }
+        Ok(info)
+    }
+
+    pub fn config(
+        &self,
+        settings: &config::Settings,
+    ) -> Result<Config, Box<dyn std::error::Error>> {
+        let mut info = self.connection_info(settings)?;
+        let default_instance = config::Instance::default();
+        let instance = self
+            .settings
+            .instance
+            .as_ref()
+            .and_then(|name| settings.instances.get(name))
+            .unwrap_or(&default_instance);
         let tls = self.certificates.apply(&mut info)?;
         let mut redis = info.redis_settings().clone();
         if self.resp2 {
