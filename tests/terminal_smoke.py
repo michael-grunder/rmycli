@@ -79,7 +79,7 @@ class Frame:
 
 
 class Terminal:
-    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None, endpoint=None, user="default", prompt_text=None):
+    def __init__(self, socket, *options, env=None, start_row=7, startup_notice=None, endpoint=None, user="default", prompt_text=None, prompts=()):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 35, 120, 0, 0))
         connection = ["-s", socket] if socket else []
@@ -97,6 +97,9 @@ class Terminal:
         self.screen_data = b""
         self.height = 35
         self.start_row = start_row
+        for label, secret in prompts:
+            self.expect(label)
+            self.send(secret + b"\r")
         started = time.monotonic()
         prompt = prompt_text or f"{user}@{endpoint or socket} ❯"
         self.expect(prompt)
@@ -112,7 +115,7 @@ class Terminal:
             self.expect(startup_notice)
             assert b"COMMAND unavailable" not in self.screen_data
         else:
-            assert frame.y == start_row
+            assert frame.y == start_row + len(prompts), (frame.y, start_row, len(prompts))
         assert frame.row(start_row - 1) == "previous shell output"
 
     def read(self):
@@ -175,6 +178,132 @@ class Terminal:
                 break
         os.close(self.master)
         assert self.process.returncode == 0
+
+
+def auth_command(directory, action, prompts=(), success=True):
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [str(BINARY), "auth", action], stdin=slave, stdout=slave, stderr=slave,
+        env={**{k: v for k, v in os.environ.items()
+                if k not in ("REDIS_URL", "REDISCLI_AUTH")},
+             "XDG_CONFIG_HOME": str(directory), "XDG_CONFIG_DIRS": str(directory)},
+    )
+    os.close(slave)
+    data = b""
+    try:
+        for label, secret in prompts:
+            deadline = time.monotonic() + 5
+            while label.encode() not in data:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0, f"Missing {label!r}: {data!r}"
+                if select.select([master], [], [], remaining)[0]:
+                    data += os.read(master, 65536)
+            # Hidden prompts must disable kernel echo before accepting input.
+            assert not termios.tcgetattr(master)[3] & termios.ECHO
+            os.write(master, secret + b"\r")
+        process.wait(timeout=5)
+        while select.select([master], [], [], 0)[0]:
+            try:
+                data += os.read(master, 65536)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
+        assert (process.returncode == 0) == success, data
+        for _, secret in prompts:
+            if secret:
+                assert secret not in data, "master passphrase was echoed"
+        return data
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+
+
+def encrypted_auth_smoke(directory, socket, settings, terminals):
+    plaintext = Path(directory) / "rmycli-auth.toml"
+    original = plaintext.read_bytes()
+    encrypted = Path(directory) / "rmycli/auth.enc"
+    auth_command(directory, "encrypt", [
+        ("New master passphrase: ", b"wrong-confirmation"),
+        ("Confirm master passphrase: ", b"different-confirmation"),
+    ], success=False)
+    assert not encrypted.exists()
+    result = auth_command(directory, "encrypt", [
+        ("New master passphrase: ", b"first-master-secret"),
+        ("Confirm master passphrase: ", b"first-master-secret"),
+    ])
+    assert str(plaintext).encode() in result and b"unencrypted" in result
+    assert plaintext.read_bytes() == original
+    assert encrypted.stat().st_mode & 0o777 == 0o600
+    assert encrypted.parent.stat().st_mode & 0o777 == 0o700
+    assert b"qa-test-secret" not in encrypted.read_bytes()
+    auth_command(directory, "encrypt", success=False)
+    auth_command(directory, "passwd", [("Master passphrase: ", b"wrong-master")], success=False)
+
+    # Detection works with encrypt-auth unset and the plaintext copy present.
+    shell = Terminal(socket, "--config", str(settings), user="qa", prompts=[
+        ("Master passphrase: ", b"first-master-secret"),
+    ])
+    terminals.append(shell)
+    shell.send(b"\\auth lock\r")
+    shell.expect("Credential store locked")
+    shell.send(b"PING\r")
+    shell.expect("PONG")
+    shell.send(b"\\auth unlock\r")
+    shell.expect("Master passphrase: ")
+    shell.send(b"\x03")
+    shell.expect("passphrase entry cancelled")
+    shell.send(b"\\auth unlock\r")
+    shell.expect("Master passphrase: ")
+    shell.send(b"first-master-secret\r")
+    shell.expect("Credential store unlocked")
+    shell.send(b"\\auth passwd\r")
+    shell.expect("New master passphrase: ")
+    shell.send(b"second-master-secret\r")
+    shell.expect("Confirm master passphrase: ")
+    shell.send(b"second-master-secret\r")
+    shell.expect("Master passphrase changed")
+    assert b"first-master-secret" not in shell.screen_data
+    assert b"second-master-secret" not in shell.screen_data
+    restored = Terminal(socket, "--config", str(settings), user="qa", prompts=[
+        ("Master passphrase: ", b"second-master-secret"),
+    ])
+    terminals.append(restored)
+    restored.send(b"ACL WHOAMI\r")
+    restored.expect_frame(lambda f: f.row(f.y - 1) == "qa", "encrypted auth reused")
+    auth_command(directory, "passwd", [("Master passphrase: ", b"first-master-secret")], success=False)
+    auth_command(directory, "passwd", [
+        ("Master passphrase: ", b"second-master-secret"),
+        ("New master passphrase: ", b"third-master-secret"),
+        ("Confirm master passphrase: ", b"third-master-secret"),
+    ])
+    assert plaintext.read_bytes() == original
+
+    # Encrypt from the start, prompting only after a successful manual AUTH.
+    fresh = Path(directory) / "fresh"
+    fresh.mkdir()
+    fresh_settings = fresh / "rmycli.toml"
+    fresh_settings.write_text('encrypt-auth = true\nsave-auth = "local"\n')
+    new_shell = Terminal(socket, "--config", str(fresh_settings),
+                         env={"XDG_CONFIG_HOME": str(fresh)},
+                         startup_notice="Authentication required")
+    terminals.append(new_shell)
+    new_shell.send(b"AUTH qa wrong\r")
+    new_shell.expect("invalid username-password")
+    assert not (fresh / "rmycli/auth.enc").exists()
+    new_shell.send(b"AUTH qa qa-test-secret\r")
+    new_shell.expect("New master passphrase: ")
+    new_shell.send(b"fresh-master-secret\r")
+    new_shell.expect("Confirm master passphrase: ")
+    new_shell.send(b"fresh-master-secret\r")
+    new_shell.expect_frame(lambda f: f.row(f.y - 1) == "OK", "encrypted credentials saved after AUTH")
+    assert (fresh / "rmycli/auth.enc").exists()
+    assert not (fresh / "rmycli-auth.toml").exists()
+    assert b"fresh-master-secret" not in new_shell.screen_data
+    new_shell.send(b"PING\r")
+    new_shell.expect("PONG")
 
 
 def config_terminal_output(path, *args, no_color=None):
@@ -694,6 +823,7 @@ def main():
             terminals.append(restored)
             restored.send(b"ACL WHOAMI\r")
             restored.expect_frame(lambda f: f.row(f.y - 1) == "qa", "saved auth reused")
+            encrypted_auth_smoke(directory, socket, auth_settings, terminals)
             print("Terminal and CLI smoke tests passed")
         finally:
             for terminal in terminals:

@@ -12,6 +12,7 @@ pub struct Settings {
     pub auto_cluster: bool,
     pub history_per_server: bool,
     pub prompt: crate::prompt::Prompt,
+    pub encrypt_auth: bool,
     pub save_auth: crate::auth::SaveAuth,
     pub theme: Theme,
     pub instances: BTreeMap<String, Instance>,
@@ -23,6 +24,7 @@ impl Default for Settings {
             auto_cluster: true,
             history_per_server: true,
             prompt: crate::prompt::Prompt::default(),
+            encrypt_auth: false,
             save_auth: crate::auth::SaveAuth::default(),
             theme: Theme::default(),
             instances: BTreeMap::new(),
@@ -223,6 +225,8 @@ mod tests {
     #[test]
     fn defaults_and_partial_settings() {
         let settings = Settings::parse("").unwrap();
+        assert!(!settings.encrypt_auth);
+        assert!(Settings::parse("encrypt-auth = true").unwrap().encrypt_auth);
         assert!(settings.auto_cluster);
         assert!(settings.history_per_server);
         assert!(
@@ -266,6 +270,7 @@ mod tests {
     fn invalid_settings_are_rejected() {
         for source in [
             "unknown = true",
+            "encrypt-auth = 'yes'",
             "auto-cluster = 'false'",
             "auto-cluster = 1",
             "history-per-server = 'false'",

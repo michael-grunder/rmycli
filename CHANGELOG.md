@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Optional encrypted credential storage using libsodium Argon2id and
+  XChaCha20-Poly1305. Enable `encrypt-auth` for new saves, or migrate with
+  `rmycli auth encrypt`, which retains the original plaintext file and prints
+  its path. Encrypted files are automatically detected. Hidden master-passphrase
+  prompts, `auth passwd`, and interactive `\auth lock|unlock|passwd` manage the
+  store. Private atomic writes reject stale updates from concurrent sessions.
+
 - Configurable interactive prompts with named connection placeholders, literal
   brace escaping, and named, RGB, or indexed foreground colors. The default
   uses cyan connection details and a green Unicode `❯`. Manage the template
@@ -15,6 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   color formats, limits, and copyable recipes, including the older ASCII prompt.
 
 ### Fixed
+
+- Exclude credential-bearing Redis URLs from saved history, and omit sensitive
+  commands from recalled history and submitted-command transcripts.
 
 - Synchronize the terminal authentication test with the metadata refresh so
   release builds do not race completion against the catalog update.

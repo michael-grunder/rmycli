@@ -789,10 +789,7 @@ async fn only_successful_authentication_is_saved_including_exec_and_hello() {
         .unwrap();
     let path = fixture.path.join("auth.toml");
     let mut config = fixture.config.clone();
-    config.auth_store = Some(Store {
-        path: path.clone(),
-        policy: SaveAuth::Local,
-    });
+    config.auth_store = Some(Store::plaintext(path.clone(), SaveAuth::Local));
     let mut session = Session::open(config).await.unwrap();
     assert!(!path.exists());
     let args = input::parse("AUTH alice wrong")
@@ -846,10 +843,7 @@ async fn failed_saves_and_binary_credentials_do_not_break_authentication() {
     let path = fixture.path.join("auth.toml");
     std::fs::write(&path, "[broken").unwrap();
     let mut config = fixture.config.clone();
-    config.auth_store = Some(Store {
-        path: path.clone(),
-        policy: SaveAuth::Always,
-    });
+    config.auth_store = Some(Store::plaintext(path.clone(), SaveAuth::Always));
     let mut session = Session::open(config).await.unwrap();
     execute(&mut session, "AUTH alice secret").await;
     assert!(

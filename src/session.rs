@@ -918,10 +918,8 @@ mod tests {
                     }
                 });
                 let dir = tempfile::tempdir().unwrap();
-                let store = Store {
-                    path: dir.path().join("auth.toml"),
-                    policy,
-                };
+                let store =
+                    Store::plaintext(dir.path().join("auth.toml"), policy);
                 let mut source_config = config(source_port);
                 source_config.auth_store = Some(store.clone());
                 source_config.info =

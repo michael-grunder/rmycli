@@ -17,6 +17,7 @@ pub enum Execution {
         cancelled: Arc<AtomicBool>,
     },
     Reconnect,
+    Auth(crate::auth::Action),
 }
 
 pub enum Assistance {
@@ -313,7 +314,7 @@ async fn execution_loop(
                     )
                     .await
                     .map(|()| Vec::new()),
-                    Execution::Reconnect => unreachable!(),
+                    Execution::Reconnect | Execution::Auth(_) => unreachable!(),
                 };
                 if previous_addr != *session.config.info.addr() {
                     id = client_id(&mut session).await;
@@ -351,6 +352,9 @@ async fn execution_loop(
                     auth_revision = session.auth_revision;
                 }
             }
+            Execution::Auth(action) => {
+                credential_action(&session, action, events, id, listening);
+            }
             Execution::Reconnect => {
                 match Session::open(session.config.clone()).await {
                     Ok(fresh) => {
@@ -368,6 +372,34 @@ async fn execution_loop(
             }
         }
     }
+}
+
+fn credential_action(
+    session: &Session,
+    action: crate::auth::Action,
+    events: &SyncSender<Event>,
+    id: Option<i64>,
+    listening: bool,
+) {
+    let result = session
+        .config
+        .auth_store
+        .as_ref()
+        .ok_or_else(|| {
+            std::io::Error::other("saved authentication is disabled")
+        })
+        .and_then(|store| action.run(store));
+    let lines = vec![
+        result.map_or_else(|error| format!("(error) {error}"), str::to_owned),
+    ];
+    let _ = events.send(Event::Executed {
+        lines,
+        config: session.config.clone(),
+        allowed: session.assistance_allowed() && listening,
+        streaming: session.streaming,
+        client_id: id,
+        connected: listening,
+    });
 }
 
 async fn scan_keys(

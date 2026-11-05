@@ -4,9 +4,12 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use crate::auth_vault::Vault;
 use redis::{ConnectionAddr, ConnectionInfo};
-use serde::{Deserialize, Deserializer, de::Error};
+use serde::{Deserialize, Deserializer, Serialize, de::Error};
+use std::sync::{Arc, Mutex};
 use toml_edit::{DocumentMut, Item, Table, value};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SaveAuth {
@@ -67,21 +70,39 @@ impl SaveAuth {
 pub struct Store {
     pub path: PathBuf,
     pub policy: SaveAuth,
+    vault: Option<Arc<Mutex<Vault>>>,
+    prompt: Arc<Mutex<Option<std::sync::mpsc::Sender<crate::secret::Request>>>>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-struct AuthFile {
+pub struct AuthFile {
     servers: BTreeMap<String, Server>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 struct Server {
     user: Option<String>,
-    password: Option<String>,
-    users: BTreeMap<String, String>,
+    password: Option<Zeroizing<String>>,
+    users: BTreeMap<String, Zeroizing<String>>,
     default_user: Option<String>,
+}
+
+impl AuthFile {
+    pub fn validate(&self) -> io::Result<()> {
+        if self
+            .servers
+            .iter()
+            .any(|(key, server)| key.trim().is_empty() || !server.valid())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid saved credential accounts or default user",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Server {
@@ -142,23 +163,123 @@ pub fn endpoint(addr: &ConnectionAddr) -> io::Result<String> {
 }
 
 impl Store {
-    pub fn discover(policy: SaveAuth) -> Option<Self> {
-        xdg::BaseDirectories::new()
-            .get_config_home()
-            .map(|dir| Self {
-                path: dir.join("rmycli-auth.toml"),
-                policy,
-            })
+    pub fn plaintext(path: PathBuf, policy: SaveAuth) -> Self {
+        Self {
+            path,
+            policy,
+            vault: None,
+            prompt: Arc::default(),
+        }
     }
 
-    fn read(&self) -> io::Result<(AuthFile, DocumentMut)> {
-        let source = match std::fs::read_to_string(&self.path) {
-            Ok(source) => source,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                String::new()
-            }
+    pub fn encrypted(path: PathBuf, policy: SaveAuth) -> Self {
+        Self {
+            path,
+            policy,
+            vault: Some(Arc::new(Mutex::new(Vault::default()))),
+            prompt: Arc::default(),
+        }
+    }
+
+    pub fn discover(
+        policy: SaveAuth,
+        encrypted: bool,
+    ) -> io::Result<Option<Self>> {
+        let Some(dir) = xdg::BaseDirectories::new().get_config_home() else {
+            return Ok(None);
+        };
+        let path = dir.join("rmycli/auth.enc");
+        let exists = match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
+        Ok(Some(if encrypted || exists {
+            Self::encrypted(path, policy)
+        } else {
+            Self::plaintext(dir.join("rmycli-auth.toml"), policy)
+        }))
+    }
+
+    pub fn prompt_channel(
+        &self,
+    ) -> io::Result<std::sync::mpsc::Receiver<crate::secret::Request>> {
+        let (sender, receiver) = crate::secret::channel();
+        *self
+            .prompt
+            .lock()
+            .map_err(|_| io::Error::other("credential prompt unavailable"))? =
+            Some(sender);
+        Ok(receiver)
+    }
+
+    fn prompt(&self, create: bool) -> io::Result<Zeroizing<String>> {
+        let sender = self
+            .prompt
+            .lock()
+            .map_err(|_| io::Error::other("credential prompt unavailable"))?
+            .clone();
+        crate::secret::request(sender.as_ref(), create)
+    }
+
+    pub fn unlock(&self) -> io::Result<()> {
+        if let Some(vault) = &self.vault {
+            vault
+                .lock()
+                .map_err(|_| io::Error::other("credential store unavailable"))?
+                .unlock(&self.path, |create| self.prompt(create))?;
+        }
+        Ok(())
+    }
+
+    pub fn lock(&self) -> io::Result<()> {
+        let vault = self.vault.as_ref().ok_or_else(|| {
+            io::Error::other("credential storage is not encrypted")
+        })?;
+        vault
+            .lock()
+            .map_err(|_| io::Error::other("credential store unavailable"))?
+            .lock();
+        Ok(())
+    }
+
+    pub fn change_passphrase(&self) -> io::Result<()> {
+        let vault = self.vault.as_ref().ok_or_else(|| {
+            io::Error::other("credential storage is not encrypted")
+        })?;
+        self.unlock()?;
+        let passphrase = self.prompt(true)?;
+        vault
+            .lock()
+            .map_err(|_| io::Error::other("credential store unavailable"))?
+            .change_passphrase(&self.path, passphrase.as_bytes())
+    }
+
+    pub fn migrate(&self, source: &Self) -> io::Result<()> {
+        if self.path.try_exists()? {
+            return Err(io::Error::other(
+                "encrypted auth file already exists; refusing to overwrite it",
+            ));
+        }
+        let (file, _) = source.read_file()?;
+        self.unlock()?;
+        self.vault
+            .as_ref()
+            .ok_or_else(|| io::Error::other("destination is not encrypted"))?
+            .lock()
+            .map_err(|_| io::Error::other("credential store unavailable"))?
+            .import(&self.path, file)
+    }
+
+    fn read_file(&self) -> io::Result<(AuthFile, Zeroizing<String>)> {
+        let source =
+            Zeroizing::new(match std::fs::read_to_string(&self.path) {
+                Ok(source) => source,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    String::new()
+                }
+                Err(error) => return Err(error),
+            });
         // Parser excerpts and field errors may contain passwords.
         let invalid = || {
             io::Error::new(
@@ -168,25 +289,48 @@ impl Store {
         };
         let parsed: AuthFile =
             toml::from_str(&source).map_err(|_| invalid())?;
-        if parsed
-            .servers
-            .iter()
-            .any(|(key, server)| key.trim().is_empty() || !server.valid())
-        {
-            return Err(invalid());
-        }
-        let document = source.parse().map_err(|_| invalid())?;
-        Ok((parsed, document))
+        parsed.validate()?;
+        Ok((parsed, source))
+    }
+
+    fn read(&self) -> io::Result<(AuthFile, DocumentMut)> {
+        let (file, source) = self.read_file()?;
+        let document = source.parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid auth file")
+        })?;
+        Ok((file, document))
     }
 
     pub fn apply(&self, info: &mut ConnectionInfo) -> io::Result<()> {
-        let (file, _) = self.read()?;
-        let settings = info.redis_settings();
-        if settings.password().is_some() {
+        if info.redis_settings().password().is_some() {
             return Ok(());
         }
-        let Ok(key) = endpoint(info.addr()) else {
+        if let Some(vault) = &self.vault {
+            // A missing encrypted file has no credentials to unlock yet.
+            match std::fs::symlink_metadata(&self.path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+            self.unlock()?;
+            let vault = vault.lock().map_err(|_| {
+                io::Error::other("credential store unavailable")
+            })?;
+            Self::apply_file(vault.file()?, info);
+            drop(vault);
             return Ok(());
+        }
+        let (file, _) = self.read_file()?;
+        Self::apply_file(&file, info);
+        Ok(())
+    }
+
+    fn apply_file(file: &AuthFile, info: &mut ConnectionInfo) {
+        let settings = info.redis_settings();
+        let Ok(key) = endpoint(info.addr()) else {
+            return;
         };
         if let Some(saved) = file.servers.get(&key) {
             let accounts = saved.credentials();
@@ -197,7 +341,7 @@ impl Store {
                 |user| accounts.get(user),
             );
             let Some((user, password)) = account else {
-                return Ok(());
+                return;
             };
             let mut settings = settings.clone().set_password(*password);
             if let Some(user) = user {
@@ -205,7 +349,6 @@ impl Store {
             }
             *info = info.clone().set_redis_settings(settings);
         }
-        Ok(())
     }
 
     pub fn save(&self, info: &ConnectionInfo) -> io::Result<()> {
@@ -218,6 +361,37 @@ impl Store {
         };
         let key = endpoint(info.addr())?;
         let user = settings.username().unwrap_or("default");
+        if let Some(vault) = &self.vault {
+            self.unlock()?;
+            let mut vault = vault.lock().map_err(|_| {
+                io::Error::other("credential store unavailable")
+            })?;
+            if vault.file()?.servers.get(&key).is_some_and(|server| {
+                server.credentials().get(user).is_some_and(|account| {
+                    *account == (settings.username(), password)
+                })
+            }) {
+                return Ok(());
+            }
+            return vault.update(&self.path, |file| {
+                let server = file.servers.entry(key).or_default();
+                if let Some(old_password) = server.password.take() {
+                    let old_user =
+                        server.user.take().unwrap_or_else(|| "default".into());
+                    server.users.insert(old_user, old_password);
+                }
+                if settings.username().is_none() {
+                    server.users.remove("default");
+                    server.password = Some(Zeroizing::new(password.to_owned()));
+                } else {
+                    server.users.insert(
+                        user.to_owned(),
+                        Zeroizing::new(password.to_owned()),
+                    );
+                }
+                Ok(())
+            });
+        }
         self.update(|file, document| {
             let saved = file.servers.get(&key);
             if saved.is_some_and(|saved| {
@@ -278,6 +452,17 @@ impl Store {
         user: &str,
     ) -> io::Result<()> {
         let key = endpoint(addr)?;
+        if let Some(vault) = &self.vault {
+            self.unlock()?;
+            return vault.lock().map_err(|_| io::Error::other("credential store unavailable"))?
+                .update(&self.path, |file| {
+                    let server = file.servers.get_mut(&key)
+                        .filter(|server| server.credentials().contains_key(user))
+                        .ok_or_else(|| io::Error::other("no saved credentials for that user at this endpoint"))?;
+                    server.default_user = Some(user.to_owned());
+                    Ok(())
+                });
+        }
         self.update(|file, document| {
             if !file
                 .servers
@@ -342,6 +527,78 @@ impl Store {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum Action {
+    Lock,
+    Unlock,
+    Passwd,
+}
+
+impl Action {
+    pub fn run(self, store: &Store) -> io::Result<&'static str> {
+        if store.vault.is_none() {
+            return Err(io::Error::other(
+                "credential storage is not encrypted",
+            ));
+        }
+        match self {
+            Self::Lock => {
+                store.lock()?;
+                Ok(
+                    "Credential store locked; active Redis connections retain their credentials",
+                )
+            }
+            Self::Unlock => {
+                store.unlock()?;
+                Ok("Credential store unlocked")
+            }
+            Self::Passwd => {
+                store.change_passphrase()?;
+                Ok("Master passphrase changed")
+            }
+        }
+    }
+}
+
+pub fn run(
+    args: &[std::ffi::OsString],
+    disabled: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() != 2
+        || !matches!(args[1].to_str(), Some("encrypt" | "passwd"))
+    {
+        return Err("usage: rmycli auth encrypt | rmycli auth passwd".into());
+    }
+    if disabled {
+        return Err("auth commands cannot be used with --no-config".into());
+    }
+    let dir = xdg::BaseDirectories::new()
+        .get_config_home()
+        .ok_or("cannot locate the user config directory")?;
+    let target = Store::encrypted(dir.join("rmycli/auth.enc"), SaveAuth::Never);
+    if args[1] == "encrypt" {
+        let source =
+            Store::plaintext(dir.join("rmycli-auth.toml"), SaveAuth::Never);
+        target.migrate(&source)?;
+        println!("Encrypted credentials saved to {}", target.path.display());
+        if source.path.try_exists()? {
+            eprintln!(
+                "Warning: the unencrypted auth file is still at {}. Delete it after verifying encrypted authentication works.",
+                source.path.display()
+            );
+        }
+    } else {
+        if !target.path.try_exists()? {
+            return Err(
+                "no encrypted auth file exists; use auth encrypt first".into(),
+            );
+        }
+        target.change_passphrase()?;
+        println!("Master passphrase changed");
+    }
+    Ok(())
+}
+
 fn insert_user(
     entry: &mut dyn toml_edit::TableLike,
     user: &str,
@@ -379,6 +636,50 @@ mod tests {
             );
         }
         info
+    }
+
+    #[test]
+    fn encrypted_backend_preserves_accounts_defaults_and_shared_lock_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let source =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Never);
+        let text = "[servers.'redis://localhost:7000']\nuser = 'alice'\npassword = 'alice-secret'\ndefault-user = 'alice'\n";
+        std::fs::write(&source.path, text).unwrap();
+        let store = Store::encrypted(
+            dir.path().join("private/auth.enc"),
+            SaveAuth::Always,
+        );
+        store
+            .vault
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .unlock(&store.path, |_| Ok(Zeroizing::new("master".into())))
+            .unwrap();
+        store.migrate(&source).unwrap();
+        assert_eq!(std::fs::read_to_string(&source.path).unwrap(), text);
+        store
+            .save(&info("localhost", Some("default-secret")))
+            .unwrap();
+        let mut selected = info("localhost", None);
+        store.apply(&mut selected).unwrap();
+        assert_eq!(selected.redis_settings().username(), Some("alice"));
+        assert_eq!(selected.redis_settings().password(), Some("alice-secret"));
+        store.set_default_user(selected.addr(), "default").unwrap();
+        selected = info("localhost", None);
+        store.apply(&mut selected).unwrap();
+        assert_eq!(
+            selected.redis_settings().password(),
+            Some("default-secret")
+        );
+        let before = std::fs::read(&store.path).unwrap();
+        store.save(&selected).unwrap();
+        assert_eq!(before, std::fs::read(&store.path).unwrap());
+        assert!(store.set_default_user(selected.addr(), "missing").is_err());
+        assert_eq!(before, std::fs::read(&store.path).unwrap());
+        store.clone().lock().unwrap();
+        assert!(!store.vault.as_ref().unwrap().lock().unwrap().is_unlocked());
     }
 
     #[test]
@@ -436,10 +737,10 @@ mod tests {
     #[test]
     fn disabled_and_remote_local_saves_create_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store {
-            path: dir.path().join("nested/auth.toml"),
-            policy: SaveAuth::Never,
-        };
+        let mut store = Store::plaintext(
+            dir.path().join("nested/auth.toml"),
+            SaveAuth::Never,
+        );
         store.save(&info("localhost", Some("secret"))).unwrap();
         store.policy = SaveAuth::Local;
         store.save(&info("remote.example", Some("secret"))).unwrap();
@@ -451,10 +752,8 @@ mod tests {
     #[test]
     fn exact_endpoint_and_user_matching_respect_explicit_credentials() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store {
-            path: dir.path().join("auth.toml"),
-            policy: SaveAuth::Never,
-        };
+        let store =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Never);
         std::fs::write(&store.path, "[servers.\"redis://localhost:7000\"]\nuser = 'alice'\npassword = 'stored'").unwrap();
         let mut connection = info("localhost", None);
         store.apply(&mut connection).unwrap();
@@ -493,10 +792,8 @@ mod tests {
     #[test]
     fn saves_round_trip_and_preserve_other_servers_and_comments() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store {
-            path: dir.path().join("auth.toml"),
-            policy: SaveAuth::Always,
-        };
+        let store =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Always);
         let source = "# my servers\n[servers.\"redis://remote:7000\"]\npassword = 'remote-secret' # keep\n";
         std::fs::write(&store.path, source).unwrap();
         let password = "spaces \"quotes\" \\ slash\nnewline\0nul";
@@ -537,10 +834,8 @@ mod tests {
     #[test]
     fn corrupt_or_locked_files_are_not_overwritten_or_echoed() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store {
-            path: dir.path().join("auth.toml"),
-            policy: SaveAuth::Always,
-        };
+        let store =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Always);
         for source in [
             "password = 'do-not-echo'",
             "[servers.\"redis://localhost:7000\"]\npassword = do-not-echo",
@@ -564,10 +859,8 @@ mod tests {
     #[test]
     fn accounts_are_selected_explicitly_first_or_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store {
-            path: dir.path().join("auth.toml"),
-            policy: SaveAuth::Always,
-        };
+        let store =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Always);
         let account = |user: &str, password: Option<&str>| {
             let connection = info("localhost", password);
             let settings =
@@ -627,10 +920,8 @@ mod tests {
     #[test]
     fn legacy_acl_account_survives_saving_password_only_and_named_users() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store {
-            path: dir.path().join("auth.toml"),
-            policy: SaveAuth::Always,
-        };
+        let store =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Always);
         std::fs::write(&store.path, "[servers.\"redis://localhost:7000\"]\nuser = 'alice'\npassword = 'old'\ndefault-user = 'alice'\n").unwrap();
         store
             .save(&info("localhost", Some("password-only")))
@@ -658,10 +949,8 @@ mod tests {
     #[test]
     fn invalid_accounts_and_defaults_are_rejected_without_leaking_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store {
-            path: dir.path().join("auth.toml"),
-            policy: SaveAuth::Always,
-        };
+        let store =
+            Store::plaintext(dir.path().join("auth.toml"), SaveAuth::Always);
         for fields in [
             "user = 'secret'",
             "password = 'secret'\ndefault-user = 'missing'",

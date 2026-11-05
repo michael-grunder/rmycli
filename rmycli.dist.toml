@@ -36,10 +36,20 @@ auto-cluster = true
 #   rmycli config set history-per-server false
 history-per-server = true
 
+# Encrypt saved credentials in ~/.config/rmycli/auth.enc (under XDG_CONFIG_HOME).
+# Prompts for a master passphrase when needed; requires terminal stdin.
+# Existing encrypted files are detected even when this is false.
+# Migrate an existing plaintext auth file with: rmycli auth encrypt
+# Migration retains the original file and warns you to delete it after testing.
+# Change the master passphrase with: rmycli auth passwd
+# In the shell: \auth lock, \auth unlock, \auth passwd.
+# This setting does not enable saving or encrypt passwords in [instances].
+encrypt-auth = false
+
 # Automatic credential saving, after successful authentication only.
 # false (default): never save automatically; still read manually saved entries.
 # "local": save for localhost, loopback IP addresses, and Unix sockets.
-# "always": save for every server. Passwords are stored in plaintext.
+# "always": save for every server. Plaintext unless encrypt-auth is enabled.
 # The file is $XDG_CONFIG_HOME/rmycli-auth.toml (normally
 # ~/.config/rmycli-auth.toml); --no-config disables reading and writing it.
 # Use [servers."redis://127.0.0.1:7000"] with password and optional user in

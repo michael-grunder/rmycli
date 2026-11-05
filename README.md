@@ -18,6 +18,8 @@ See **Compatibility and limits** below for metadata and streaming limitations.
 ## Install and connect
 
 Use Rust 1.88 or newer (the current stable toolchain is recommended).
+Building from source also requires a C compiler and `make` for the bundled
+libsodium cryptography library.
 
 Once version 0.1.0 is published to crates.io, install it with:
 
@@ -407,7 +409,7 @@ the destination endpoint if `save-auth` permits it. Later direct connections to
 that node can then use its saved credentials. Failed authentication never saves
 credentials for the destination.
 
-Passwords are stored as **plaintext**. Protect manually created auth files with
+By default, saved passwords are stored as **plaintext**. Protect manually created auth files with
 `chmod 600 ~/.config/rmycli-auth.toml`. Automatic writes replace files atomically
 with owner-only permissions on Unix and follow existing symlinks. Invalid files
 are reported without echoing their contents and are never overwritten. A save
@@ -417,6 +419,108 @@ instead of overwriting another writer. If a process crashes during a save,
 remove its stale lock after ensuring no other process is saving. Binary,
 non-UTF-8 credentials execute unchanged but cannot be saved or reused by
 background connections or reconnects.
+
+### Encrypted saved authentication
+
+To encrypt credentials from the first save, put this before any table headings
+in `rmycli.toml` (or use `rmycli config set encrypt-auth true`):
+
+```toml
+encrypt-auth = true
+save-auth = "local" # Or "always"; encryption does not enable automatic saving.
+```
+
+The encrypted store is `$XDG_CONFIG_HOME/rmycli/auth.enc`, normally
+`~/.config/rmycli/auth.enc`. The first successful authentication that needs to
+save credentials asks for a new master passphrase twice, with terminal echo
+disabled. Later sessions prompt when saved credentials are first needed.
+An existing encrypted file takes precedence even if `encrypt-auth` is false;
+its magic, version, and algorithms are validated before unlocking. A malformed
+file or failed unlock never falls back to plaintext. `--no-config` disables
+both stores. Explicit connection passwords bypass saved-password lookup.
+
+To migrate all accounts and saved default-user choices from the existing
+plaintext auth file, run:
+
+```sh
+rmycli auth encrypt
+```
+
+This creates a new encrypted file and refuses to overwrite an existing one.
+It asks for and confirms a master passphrase, then prints a warning naming the
+plaintext file that remains. Verify a new connection works, then delete that
+plaintext file yourself. Existing shells should be restarted after migration.
+Setting `encrypt-auth = true` alone starts a separate store; it does not import
+or delete plaintext credentials. Migration does not move passwords stored in
+`[instances]` in `rmycli.toml`; use environment variables for those passwords.
+
+Change the master passphrase without connecting to Redis:
+
+```sh
+rmycli auth passwd
+```
+
+In the interactive shell, use `\auth lock`, `\auth unlock`, or `\auth passwd`.
+Locking discards the shared store's key and cached credentials. The next store
+access requires unlocking again. It does **not** close Redis connections or
+clear credentials already copied into connection settings for reconnects and
+background assistance. Exit the CLI to discard that session as well.
+`--set-default-user` works with either storage backend.
+
+Master passphrases are accepted only through hidden terminal prompts, never
+command-line options or environment variables. Escape or Ctrl-C cancels a
+prompt. Passphrases may contain up to 1,024 UTF-8 bytes. A mismatch or empty
+new passphrase is rejected without writing. Piped stdin cannot unlock or create
+a store: use explicit connection credentials and disable automatic saving for
+unattended commands. If saving fails after
+Redis authentication succeeds, the connection stays usable and reports the
+failure; no plaintext fallback is written.
+
+The backend uses libsodium through [Alkali](https://docs.rs/alkali/0.3.0/).
+Argon2id 1.3 derives a 256-bit key with a random 16-byte salt, initially using
+64 MiB and two passes (one lane). XChaCha20-Poly1305-IETF encrypts the complete
+JSON credential payload with a fresh random 24-byte nonce on every write.
+The exact header is authenticated as associated data; the 16-byte tag follows
+the ciphertext. Authentication failures report `wrong passphrase or damaged
+file`. Passphrase changes generate a new salt, key, and nonce.
+
+Version 1 has a fixed 60-byte header; integers are unsigned, big-endian:
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 8 | Magic: `RMYAUTH` followed by a NUL byte |
+| 8 | 2 | Format version: 1 |
+| 10 | 1 | KDF: 1 = libsodium Argon2id 1.3, one lane |
+| 11 | 1 | Encryption: 1 = XChaCha20-Poly1305-IETF |
+| 12 | 4 | KDF memory limit in bytes |
+| 16 | 4 | KDF operation limit |
+| 20 | 16 | Random salt |
+| 36 | 24 | Random nonce |
+| 60 | variable | Encrypted JSON payload followed by authentication tag |
+
+Readers reject files larger than 8 MiB, unsupported formats, and KDF costs
+outside 64–256 MiB or 2–6 passes before deriving a key. Writes use a private
+0700 application directory and exclusive 0600 temporary files containing only
+encrypted data. File operations reject symlinks, hard links, wrong ownership,
+and unsafe permissions. Writes fsync the temporary file, rename it, and fsync
+the directory. A stable `auth.lock` file serializes writers; do not delete it.
+A session whose snapshot changed refuses to overwrite another session's work;
+lock and unlock again to reload, then retry the update.
+
+Passphrase and plaintext buffers and cached passwords are zeroed on drop;
+keys use libsodium's protected allocation with best-effort memory locking.
+Redis and serialization libraries can hold additional copies; complete removal
+of secrets from process memory or crash dumps is not guaranteed. Credential
+commands and credential-bearing Redis URLs are excluded from saved history,
+recalled history, and submitted-command transcripts. Text typed into the
+ordinary Redis command editor remains visible while editing.
+
+The encrypted file is portable between supported Unix machines: copy it into
+a directory owned by the destination user with mode 0700, and keep the file
+mode 0600. Losing the master passphrase loses access to its credentials.
+Encryption protects stored data, not an unlocked process on a compromised
+account or machine. Retained plaintext files, backups, and configuration
+passwords remain plaintext. An OS keychain backend is not implemented.
 
 The theme controls the foreground color of inline argument hints. Command
 names are case insensitive, with whitespace normalized; a subcommand's color
@@ -567,9 +671,11 @@ remove a stale `rmycli_history.lock` only when no process is saving. Commands
 from a killed or crashed session may be lost because saving happens on exit.
 
 History contains plaintext command arguments. `AUTH`, `HELLO`, `ACL SETUSER`,
-`CONFIG SET`, and `MIGRATE` with authentication are excluded from disk history;
-other commands can still contain sensitive keys or values. These exclusions
-do not change command execution or in-memory recall.
+`CONFIG SET`, `MIGRATE` with authentication, and credential-bearing Redis URLs
+are excluded from disk history, in-memory recall, and submitted-command
+transcripts. Existing sensitive history entries are skipped on load and omitted
+on the next history save. Other commands can still contain sensitive keys or
+values. These exclusions do not change command execution.
 
 Search supports fuzzy terms and the leading-apostrophe convention from
 [fzf](https://junegunn.github.io/fzf/search-syntax/): `gusr` matches

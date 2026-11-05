@@ -116,8 +116,12 @@ fn prompt_settings_validate_round_trip_and_restore_the_default() {
 #[test]
 fn boolean_settings_can_be_read_disabled_and_reset() {
     let fixture = Fixture::new();
-    for key in ["auto-cluster", "history-per-server"] {
-        assert_eq!(success(&mut fixture.config(&["get", key])), "true\n");
+    for (key, default) in [
+        ("auto-cluster", "true\n"),
+        ("history-per-server", "true\n"),
+        ("encrypt-auth", "false\n"),
+    ] {
+        assert_eq!(success(&mut fixture.config(&["get", key])), default);
         assert_eq!(
             success(&mut fixture.config(&["set", key, "false"])),
             "false\n"
@@ -128,7 +132,7 @@ fn boolean_settings_can_be_read_disabled_and_reset() {
                 .contains("true or false")
         );
         success(&mut fixture.config(&["unset", key]));
-        assert_eq!(success(&mut fixture.config(&["get", key])), "true\n");
+        assert_eq!(success(&mut fixture.config(&["get", key])), default);
     }
 }
 
@@ -573,4 +577,77 @@ fn saved_default_is_set_offline_without_automatic_saving() {
         assert!(error(command().args(args)).contains("cannot be used with"));
     }
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+}
+
+#[test]
+fn encrypted_auth_commands_require_hidden_terminal_prompts() {
+    let fixture = Fixture::new();
+    let source = fixture.write(
+        "user/rmycli-auth.toml",
+        "[servers.'redis://localhost:6379']\npassword = 'keep-secret'\n",
+    );
+    let before = std::fs::read(&source).unwrap();
+    assert!(
+        error(fixture.base_command().args(["auth", "encrypt"]))
+            .contains("requires a terminal")
+    );
+    assert_eq!(before, std::fs::read(&source).unwrap());
+    assert!(!fixture.0.join("user/rmycli/auth.enc").exists());
+    assert!(
+        error(fixture.base_command().args(["auth", "passwd"]))
+            .contains("no encrypted auth file")
+    );
+    assert!(
+        error(fixture.base_command().args([
+            "auth",
+            "encrypt",
+            "never-accept-master-argument"
+        ]))
+        .contains("usage:")
+    );
+    assert!(
+        error(
+            fixture
+                .base_command()
+                .args(["--no-config", "auth", "encrypt"])
+        )
+        .contains("--no-config")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn encrypted_file_detection_never_falls_back_to_plaintext() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let fixture = Fixture::new();
+    let source = fixture.write(
+        "user/rmycli-auth.toml",
+        "[servers.'redis://127.0.0.1:6379']\npassword = 'keep-secret'\n",
+    );
+    let directory = fixture.0.join("user/rmycli");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(
+        &directory,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let encrypted = directory.join("auth.enc");
+    std::fs::write(&encrypted, b"broken envelope").unwrap();
+    std::fs::set_permissions(
+        &encrypted,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let message = error(&mut fixture.base_command());
+    assert!(
+        message.contains("invalid encrypted auth file size"),
+        "{message}"
+    );
+    assert!(!message.contains("keep-secret"));
+    std::fs::remove_file(&encrypted).unwrap();
+    symlink(directory.join("missing"), &encrypted).unwrap();
+    let message = error(&mut fixture.base_command());
+    assert!(message.contains("cannot load auth file"));
+    assert!(message.contains("auth.enc"));
+    assert!(source.exists());
 }

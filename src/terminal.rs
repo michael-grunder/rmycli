@@ -191,7 +191,9 @@ impl Editor {
     }
 
     fn remember(&mut self) {
-        if self.history.back() != Some(&self.line) {
+        if history::persistable(&self.line)
+            && self.history.back() != Some(&self.line)
+        {
             self.history.push_back(self.line.clone());
             if let Some(store) = &mut self.history_store {
                 store.remember(&self.line);
@@ -537,9 +539,26 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
 }
 
 fn run_app(app: &mut App) -> io::Result<()> {
+    let prompts = app
+        .config
+        .auth_store
+        .as_ref()
+        .map(crate::auth::Store::prompt_channel)
+        .transpose()?;
     let mut screen = Screen::enter()?;
     let mut dirty = true;
     loop {
+        if let Some(request) = prompts
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            screen.clear_input(&mut io::stdout())?;
+            io::stdout().flush()?;
+            let answer = crate::secret::master_passphrase(request.create);
+            screen.row = cursor::position()?.1;
+            let _ = request.reply.send(answer);
+            dirty = true;
+        }
         for _ in 0..64 {
             let Ok(event) = app.workers.events.try_recv() else {
                 break;
@@ -1171,6 +1190,10 @@ impl App {
             return false;
         }
         self.invalidate();
+        if args[0] == b"\\auth" {
+            self.auth_command(&args);
+            return false;
+        }
         if args[0] == b"\\reconnect" {
             self.mode = Mode::Busy;
             self.status = "Reconnecting…".into();
@@ -1228,6 +1251,19 @@ impl App {
         false
     }
 
+    fn auth_command(&mut self, args: &[Vec<u8>]) {
+        let action = match args.get(1).map(Vec::as_slice) {
+            Some(b"lock") if args.len() == 2 => crate::auth::Action::Lock,
+            Some(b"unlock") if args.len() == 2 => crate::auth::Action::Unlock,
+            Some(b"passwd") if args.len() == 2 => crate::auth::Action::Passwd,
+            _ => {
+                self.status = "Usage: \\auth lock|unlock|passwd".into();
+                return;
+            }
+        };
+        self.start_execution(Execution::Auth(action));
+    }
+
     fn execute(&mut self, args: Vec<Vec<u8>>) {
         self.start_execution(Execution::Run(args));
     }
@@ -1237,7 +1273,11 @@ impl App {
         self.log([format!(
             "{}{}",
             self.options.prompt.render(&self.config.info, false).text,
-            self.editor.line
+            if history::persistable(&self.editor.line) {
+                self.editor.line.as_str()
+            } else {
+                "[credential command omitted]"
+            }
         )]);
         self.editor.line.clear();
         self.editor.cursor = 0;
@@ -1292,6 +1332,7 @@ impl App {
             "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
             "F1: command and editor help; PgUp/PgDn: scroll help; Ctrl-D or \\quit: exit".into(),
             "CLEAR or Ctrl-L: clear the screen; terminal scrollback retains output".into(),
+            "\\auth lock|unlock|passwd: manage the encrypted credential store".into(),
             "\\reconnect: new connection and refreshed metadata; Ctrl-C: cancel input or close active connection".into(),
         ]
     }

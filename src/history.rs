@@ -123,6 +123,9 @@ fn read(path: &Path) -> io::Result<VecDeque<Entry>> {
             // Parser errors can include sensitive command arguments.
             io::Error::new(io::ErrorKind::InvalidData, "invalid history file")
         })?;
+        if !persistable(&entry.line) {
+            continue;
+        }
         entries.push_back(entry);
         if entries.len() > LIMIT {
             entries.pop_front();
@@ -131,7 +134,7 @@ fn read(path: &Path) -> io::Result<VecDeque<Entry>> {
     Ok(entries)
 }
 
-fn persistable(line: &str) -> bool {
+pub fn persistable(line: &str) -> bool {
     let parsed = crate::input::parse(line);
     let Some(command) = parsed.words.first() else {
         return false;
@@ -140,6 +143,20 @@ fn persistable(line: &str) -> bool {
         || command.bytes.eq_ignore_ascii_case(b"AUTH")
         || command.bytes.eq_ignore_ascii_case(b"HELLO")
     {
+        return false;
+    }
+    if parsed.words.iter().any(|word| {
+        [b"redis://".as_slice(), b"rediss://".as_slice()]
+            .iter()
+            .any(|scheme| {
+                word.bytes
+                    .windows(scheme.len())
+                    .position(|part| part.eq_ignore_ascii_case(scheme))
+                    .is_some_and(|start| {
+                        word.bytes[start + scheme.len()..].contains(&b'@')
+                    })
+            })
+    }) {
         return false;
     }
     let subcommand = parsed.words.get(1).map(|word| word.bytes.as_slice());
@@ -321,6 +338,8 @@ mod tests {
         let (mut store, _) = open(&path, 6379);
         for line in [
             "AUTH secret",
+            "SET endpoint redis://alice:secret@host:6379",
+            "SET endpoint REDISS://:secret@host",
             r"a\x75th user secret",
             "'AUTH' secret",
             "HELLO 3 AUTH user secret",
@@ -342,6 +361,22 @@ mod tests {
         store.save().unwrap();
         assert_eq!(open(&path, 6379).1, ["GET auth", "CONFIG GET maxmemory"]);
         assert!(!std::fs::read_to_string(path).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn old_sensitive_history_is_not_recalled_or_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        std::fs::write(&path, "{\"server\":\"redis://localhost:6379\",\"line\":\"AUTH old-secret\"}\n{\"server\":\"redis://localhost:6379\",\"line\":\"SET url redis://:old-secret@host\"}\n").unwrap();
+        let (mut store, history) = open(&path, 6379);
+        assert!(history.is_empty());
+        store.remember("PING");
+        store.save().unwrap();
+        assert!(
+            !std::fs::read_to_string(path)
+                .unwrap()
+                .contains("old-secret")
+        );
     }
 
     #[test]
