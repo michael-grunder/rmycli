@@ -239,7 +239,8 @@ impl Options {
             redis = redis.set_password(password);
         }
         if self.askpass {
-            redis = redis.set_password(read_password()?);
+            redis =
+                redis.set_password(crate::secret::read("Password: ")?.as_str());
         }
         info = info.set_redis_settings(redis);
         Ok(Config {
@@ -507,51 +508,4 @@ impl TlsOptions {
         }
         Ok(Some(crate::transport::tls_config(&certificates, insecure)?))
     }
-}
-
-fn read_password() -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::{IsTerminal, Write};
-    struct RawMode;
-    impl Drop for RawMode {
-        fn drop(&mut self) {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-    }
-    if !std::io::stdin().is_terminal() {
-        return Err("--askpass requires a terminal on stdin; use REDISCLI_AUTH for pipes".into());
-    }
-    eprint!("Password: ");
-    std::io::stderr().flush()?;
-    crossterm::terminal::enable_raw_mode()?;
-    let guard = RawMode;
-    let mut password = String::new();
-    let result = loop {
-        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-        if let Event::Key(key) = crossterm::event::read()? {
-            if key.kind == KeyEventKind::Release {
-                continue;
-            }
-            match key.code {
-                KeyCode::Enter => break Ok(password),
-                KeyCode::Esc => break Err("password entry cancelled".into()),
-                KeyCode::Char('c' | 'd')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    break Err("password entry cancelled".into());
-                }
-                KeyCode::Backspace => {
-                    password.pop();
-                }
-                KeyCode::Char(ch)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    password.push(ch);
-                }
-                _ => {}
-            }
-        }
-    };
-    drop(guard);
-    eprintln!();
-    result
 }

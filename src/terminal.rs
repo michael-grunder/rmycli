@@ -9,7 +9,7 @@ use crossterm::{
     cursor,
     event::{
         self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, ModifierKeyCode,
+        KeyEventState, KeyModifiers, ModifierKeyCode,
     },
     execute, queue,
     style::{
@@ -64,6 +64,9 @@ impl Screen {
             event::PushKeyboardEnhancementFlags(
                 event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    // All-keys mode reports base keys; without alternates,
+                    // Shift+a would arrive as `a` and Shift+2 as `2`.
+                    | event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                     | event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
         )?;
@@ -559,8 +562,10 @@ fn run_app(app: &mut App) -> io::Result<()> {
             let _ = request.reply.send(answer);
             dirty = true;
         }
+        let mut backlog = true;
         for _ in 0..64 {
             let Ok(event) = app.workers.events.try_recv() else {
+                backlog = false;
                 break;
             };
             let batch = matches!(event, Event::Output(_));
@@ -581,11 +586,16 @@ fn run_app(app: &mut App) -> io::Result<()> {
             app.draw(&mut screen, &mut io::stdout(), terminal::size()?)?;
             dirty = false;
         }
-        let timeout = app.busy_until.map_or(POLL_INTERVAL, |deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(POLL_INTERVAL)
-        });
+        // Queued events only need input checked, not a full poll interval.
+        let timeout = if backlog {
+            Duration::ZERO
+        } else {
+            app.busy_until.map_or(POLL_INTERVAL, |deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(POLL_INTERVAL)
+            })
+        };
         if event::poll(timeout)? {
             match event::read()? {
                 TerminalEvent::Key(key) => {
@@ -757,6 +767,7 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        let key = apply_caps_lock(key);
         self.update_control(key);
         if key.kind == KeyEventKind::Release
             || matches!(key.code, KeyCode::Modifier(_))
@@ -1159,12 +1170,11 @@ impl App {
             return false;
         }
         // Local backslash commands are editor controls, not Redis arguments.
-        if let Some(local) = self
-            .editor
-            .line
-            .split_whitespace()
-            .next()
-            .filter(|word| word.starts_with('\\'))
+        // A leading \xHH is byte-escaped input; parsing already validated it.
+        if let Some(local) =
+            self.editor.line.split_whitespace().next().filter(|word| {
+                word.starts_with('\\') && !word.starts_with("\\x")
+            })
         {
             args[0] = local.as_bytes().to_vec();
         }
@@ -1233,11 +1243,11 @@ impl App {
             self.status = "Scanning keys… Ctrl-C stops the scan".into();
             return false;
         }
-        self.pending.args = Some(args.clone());
         if self.mode == Mode::Ready
             && !self.options.yes
             && args[0].eq_ignore_ascii_case(b"LRANGE")
         {
+            self.pending.args = Some(args.clone());
             self.status = "Estimating reply size… Esc cancels".into();
             let _ = self.workers.assistance.send(Assistance::Estimate {
                 generation: self.workers.current(),
@@ -1245,7 +1255,6 @@ impl App {
                 args,
             });
         } else {
-            self.pending.args = None;
             self.execute(args);
         }
         false
@@ -1294,12 +1303,13 @@ impl App {
                 offset: 0,
             });
         } else if args[1].starts_with(b"@") {
-            let group = String::from_utf8_lossy(&args[1][1..]);
+            let group =
+                String::from_utf8_lossy(&args[1][1..]).to_ascii_lowercase();
             let lines = self
                 .catalog
                 .commands
                 .values()
-                .filter(|c| c.docs["group"].as_str() == Some(group.as_ref()))
+                .filter(|c| c.docs["group"].as_str() == Some(group.as_str()))
                 .map(|c| format!("{} {}", c.name, c.grammar.syntax))
                 .collect::<Vec<_>>();
             self.log(lines);
@@ -1483,6 +1493,18 @@ impl App {
             EndSynchronizedUpdate
         )
     }
+}
+
+/// With all keys reported as escape codes, the terminal sends the base key and
+/// a Caps Lock flag rather than the typed character.
+fn apply_caps_lock(mut key: KeyEvent) -> KeyEvent {
+    if key.state.contains(KeyEventState::CAPS_LOCK)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && let KeyCode::Char(c) = key.code
+    {
+        key.code = KeyCode::Char(c.to_uppercase().next().unwrap_or(c));
+    }
+    key
 }
 
 fn draw_input(
@@ -2093,6 +2115,37 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert_eq!(app.control_keys, [false; 2]);
         assert_eq!(app.editor.cursor, 0);
+    }
+
+    #[test]
+    fn caps_lock_uppercases_typed_text_but_not_control_chords() {
+        let (mut app, _) = test_app();
+        app.editor = Editor::default();
+        let mut key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        key.state = KeyEventState::CAPS_LOCK;
+        app.on_key(key);
+        assert_eq!(app.editor.line, "G");
+        key.code = KeyCode::Char('u');
+        key.modifiers = KeyModifiers::CONTROL;
+        app.on_key(key);
+        assert_eq!(app.editor.line, "");
+    }
+
+    #[test]
+    fn leading_byte_escapes_are_commands_not_local_controls() {
+        for (line, command) in [
+            (r"\x47ET key", b"GET".to_vec()),
+            (r"\unknown key", br"\unknown".to_vec()),
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.editor.line = line.into();
+            app.editor.cursor = line.len();
+            assert!(!app.submit(false));
+            let Execution::Run(args) = executed.try_recv().unwrap() else {
+                panic!("expected a Redis command");
+            };
+            assert_eq!(args, [command, b"key".to_vec()]);
+        }
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub fn master_passphrase(create: bool) -> io::Result<Zeroizing<String>> {
 }
 
 fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "passphrase entry cancelled")
+    io::Error::new(io::ErrorKind::Interrupted, "hidden input cancelled")
 }
 
 pub fn read(label: &str) -> io::Result<Zeroizing<String>> {
@@ -57,7 +57,7 @@ pub fn read(label: &str) -> io::Result<Zeroizing<String>> {
     }
     if !io::stdin().is_terminal() {
         return Err(io::Error::other(
-            "passphrase entry requires a terminal on stdin",
+            "hidden input requires a terminal on stdin; use REDISCLI_AUTH for pipes",
         ));
     }
     let guard = RawMode(crossterm::terminal::is_raw_mode_enabled()?);

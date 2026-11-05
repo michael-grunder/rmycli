@@ -4,7 +4,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::{cli, input, session::Session};
+use crate::{cli, estimate, input, session::Session};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -119,6 +119,51 @@ impl Options {
     }
 }
 
+async fn run_once(
+    session: &mut Session,
+    args: &[Vec<u8>],
+    options: &cli::Options,
+) -> Result<(), Error> {
+    if session.assistance_allowed()
+        && !options.yes
+        && args[0].eq_ignore_ascii_case(b"LRANGE")
+    {
+        let estimate = session.config.connect_auxiliary().ok().and_then(
+            |mut connection| estimate::estimate(&mut connection, args),
+        );
+        if estimate::needs_confirmation(
+            estimate,
+            options.reply_threshold,
+            false,
+        ) {
+            return Err(format!("reply estimated at {} elements; not executed. Use --yes to allow it in noninteractive mode",
+                estimate.unwrap_or_default()).into());
+        }
+    }
+    let show_pushes = session.config.show_pushes;
+    let mut output_error = None;
+    let reply = session
+        .execute_with_push(args, |reply| {
+            if show_pushes && output_error.is_none() {
+                output_error = options.output.print(reply).err();
+            }
+        })
+        .await?;
+    for notice in session.notices.drain(..) {
+        eprintln!("{notice}");
+    }
+    if let Some(error) = output_error {
+        return Err(error.into());
+    }
+    options.output.print(&reply)?;
+    while session.streaming {
+        options
+            .output
+            .print(&session.connection.recv_response().await?)?;
+    }
+    Ok(())
+}
+
 pub async fn execute(
     session: &mut Session,
     args: &[Vec<u8>],
@@ -126,7 +171,7 @@ pub async fn execute(
 ) -> Result<(), Error> {
     let mut remaining = options.batch.repeat;
     while remaining != 0 {
-        crate::batch_command(session, args, options).await?;
+        run_once(session, args, options).await?;
         if remaining > 0 {
             remaining -= 1;
         }

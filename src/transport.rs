@@ -21,6 +21,12 @@ pub struct Connection {
     write_timeout: Duration,
 }
 
+async fn tcp(host: &str, port: u16) -> io::Result<tokio::net::TcpStream> {
+    let stream = tokio::net::TcpStream::connect((host, port)).await?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
 fn closed() -> redis::RedisError {
     io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed").into()
 }
@@ -31,17 +37,10 @@ impl Connection {
         let connect = async {
             let stream: Stream = match config.info.addr() {
                 ConnectionAddr::Tcp(host, port) => {
-                    let stream =
-                        tokio::net::TcpStream::connect((host.as_str(), *port))
-                            .await?;
-                    stream.set_nodelay(true)?;
-                    Box::new(stream)
+                    Box::new(tcp(host, *port).await?)
                 }
                 ConnectionAddr::TcpTls { host, port, .. } => {
-                    let stream =
-                        tokio::net::TcpStream::connect((host.as_str(), *port))
-                            .await?;
-                    stream.set_nodelay(true)?;
+                    let stream = tcp(host, *port).await?;
                     let tls = config.tls.clone().ok_or_else(|| {
                         io::Error::other("missing TLS configuration")
                     })?;
@@ -284,12 +283,14 @@ pub fn tls_config(
             return Err("CA file contains no certificates".into());
         }
     } else {
+        // One unreadable or unsupported system entry must not disable TLS.
         let native = rustls_native_certs::load_native_certs();
-        if let Some(error) = native.errors.first() {
-            return Err(error.to_string().into());
-        }
-        for certificate in native.certs {
-            roots.add(certificate)?;
+        roots.add_parsable_certificates(native.certs);
+        if roots.is_empty() && !insecure {
+            return Err(native.errors.first().map_or_else(
+                || "no usable system CA certificates".into(),
+                |error| error.to_string().into(),
+            ));
         }
     }
     let builder = rustls::ClientConfig::builder().with_root_certificates(roots);

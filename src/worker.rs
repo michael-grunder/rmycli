@@ -115,8 +115,8 @@ impl Workers {
         }
     }
 
-    pub fn invalidate(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::Relaxed) + 1
+    pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn current(&self) -> u64 {

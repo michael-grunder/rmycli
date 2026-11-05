@@ -579,6 +579,35 @@ async fn authentication_changes_and_resp3_subscription_acknowledgment() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn unsubscribe_acknowledgments_stay_aligned_with_later_replies() {
+    let fixture = RedisFixture::new();
+    for protocol in ["HELLO 2", "HELLO 3"] {
+        let mut session = Session::open(fixture.config.clone()).await.unwrap();
+        execute(&mut session, protocol).await;
+        for line in [
+            "UNSUBSCRIBE",
+            "PUNSUBSCRIBE",
+            "SUNSUBSCRIBE",
+            "UNSUBSCRIBE a b c",
+        ] {
+            // A RESP3 acknowledgment is a push, but it is still this reply.
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                execute(&mut session, line),
+            )
+            .await
+            .expect("unsubscribe must not wait for another reply");
+            assert_eq!(
+                execute(&mut session, "ECHO next").await,
+                Value::BulkString(b"next".to_vec()),
+                "{protocol}: {line}"
+            );
+        }
+        assert!(session.assistance_allowed());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn subscriptions_keep_the_session_and_all_replies() {
     let fixture = RedisFixture::new();
     let mut publisher = fixture.connection();

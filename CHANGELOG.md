@@ -28,6 +28,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Type shifted characters correctly on Kitty keyboard protocol terminals, where
+  Shift+a produced `a` and Shift+; produced `;`. Caps Lock now applies as well.
+- Stop hanging on RESP3 `UNSUBSCRIBE`, `PUNSUBSCRIBE`, and `SUNSUBSCRIBE`, whose
+  acknowledgments are pushes, and read one acknowledgment per named channel so
+  later commands no longer receive the previous command's reply.
+- Recognize the `multiple_token` flag from live `COMMAND DOCS`, so hints and
+  completion follow repeated tokens such as `SORT key GET a GET b` on real
+  servers instead of only with bundled metadata.
+- Keep tracking `WATCH` after a failed `EXEC` without `MULTI`, which leaves the
+  server's watch in place, and ignore `QUEUED` replies outside a transaction.
+- Send commands whose first word starts with a `\xHH` escape as decoded bytes
+  rather than as a literal backslash command name.
+- Reject `\x+1` and similar sign-prefixed input instead of decoding it as hex.
+- Show `(empty hash)` and `(empty set)` for empty RESP3 replies. Empty maps
+  previously printed nothing. Align nested replies under indexes of 10 or more.
+- Keep inline hints for exclusive score bounds such as `ZCOUNT key (1 5`.
+- Accept any case in `HELP @group`.
+- Tolerate unreadable or unsupported entries in the system certificate store,
+  and do not require system certificates with `--insecure`.
+
 - Exclude credential-bearing Redis URLs from saved history, and omit sensitive
   commands from recalled history and submitted-command transcripts.
 
@@ -51,6 +71,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Render queued streaming output without waiting for the input poll interval.
+  An interactive `KEYS` scan of 300,000 keys dropped from about 95 seconds to
+  about 1 second, and MONITOR and Pub/Sub output is no longer limited to 64
+  messages per 40 ms poll.
+- `--askpass` shares the hidden prompt used for master passphrases, adding
+  paste support, a 1024-byte limit, and zeroizing of the entered text.
 - Automatically select the first saved account in alphabetical username order
   when no user or saved default is specified. Explicit users and saved defaults
   retain precedence.

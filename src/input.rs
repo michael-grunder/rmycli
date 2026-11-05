@@ -43,11 +43,12 @@ pub fn parse(line: &str) -> Parsed {
                     bytes.push(b'\\');
                     bytes.push(escaped);
                 } else if escaped == b'x' {
-                    let hex = input.get(i + 1..i + 3).and_then(|s| {
-                        std::str::from_utf8(s)
-                            .ok()
-                            .and_then(|s| u8::from_str_radix(s, 16).ok())
-                    });
+                    // from_str_radix alone would also accept a leading `+`.
+                    let hex = input
+                        .get(i + 1..i + 3)
+                        .filter(|s| s.iter().all(u8::is_ascii_hexdigit))
+                        .and_then(|s| std::str::from_utf8(s).ok())
+                        .and_then(|s| u8::from_str_radix(s, 16).ok());
                     if let Some(value) = hex {
                         bytes.push(value);
                         i += 2;
@@ -109,7 +110,7 @@ pub fn context(line: &str, cursor: usize) -> Context {
         .map_or(cursor, |w| w.span.end);
     let prefix = active.map_or_else(Vec::new, |w| w.bytes.clone());
     let mut args: Vec<_> = parsed.words.into_iter().map(|w| w.bytes).collect();
-    if active_is_missing(index, args.len()) {
+    if index == args.len() {
         args.push(Vec::new());
     }
     args.extend(
@@ -124,10 +125,6 @@ pub fn context(line: &str, cursor: usize) -> Context {
         prefix,
         replace: start..end,
     }
-}
-
-const fn active_is_missing(index: usize, len: usize) -> bool {
-    index == len
 }
 
 /// ASCII-only output also prevents keys and replies from injecting terminal escapes.
@@ -210,6 +207,8 @@ mod tests {
         assert_eq!(c.args.len(), 2);
         assert!(parse("GET \"broken").error.is_some());
         assert!(parse("GET \\xZZ").error.is_some());
+        assert!(parse("GET \\x+1").error.is_some());
+        assert_eq!(parse("\\x7F\\xaB").words[0].bytes, b"\x7f\xab");
         assert_eq!(parse("SET '' 'a b'").words[1].bytes, b"");
     }
 

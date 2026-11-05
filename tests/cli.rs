@@ -374,6 +374,31 @@ fn tls_trust_client_certificates_and_insecure_are_applied() {
     }
 }
 
+#[test]
+fn unusable_system_certificates_block_only_verified_tls() {
+    let ca = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/tls/ca.pem");
+    let missing = "/nonexistent/rmycli-test";
+    for (certificate_file, flags, reaches_network) in [
+        (missing.as_ref(), ["--tls"].as_slice(), false),
+        (missing.as_ref(), ["--tls", "--insecure"].as_slice(), true),
+        // A bad directory must not discard the certificates that did load.
+        (ca.as_path(), ["--tls"].as_slice(), true),
+    ] {
+        let result = base()
+            .env("SSL_CERT_FILE", certificate_file)
+            .env("SSL_CERT_DIR", missing)
+            .args(["-p", "1"])
+            .args(flags)
+            .arg("PING")
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert_eq!(error.contains("refused"), reaches_network, "{error}");
+    }
+}
+
 fn tls_server(
     config: rustls::ServerConfig,
 ) -> (u16, std::thread::JoinHandle<()>) {

@@ -177,10 +177,21 @@ impl Session {
         args: &[Vec<u8>],
         push: &mut impl FnMut(&Value),
     ) -> RedisResult<Value> {
-        let subscription =
-            [b"SUBSCRIBE".as_slice(), b"PSUBSCRIBE", b"SSUBSCRIBE"]
+        let unsubscription =
+            [b"UNSUBSCRIBE".as_slice(), b"PUNSUBSCRIBE", b"SUNSUBSCRIBE"]
                 .iter()
                 .any(|name| args[0].eq_ignore_ascii_case(name));
+        let subscription = unsubscription
+            || [b"SUBSCRIBE".as_slice(), b"PSUBSCRIBE", b"SSUBSCRIBE"]
+                .iter()
+                .any(|name| args[0].eq_ignore_ascii_case(name));
+        // Each named channel is acknowledged separately. Unread acknowledgments
+        // would otherwise be taken for the replies to the following commands.
+        let mut extra_acks = if unsubscription && !self.transaction {
+            args.len().saturating_sub(2)
+        } else {
+            0
+        };
         let result: RedisResult<Value> = async {
             self.connection
                 .send_packed_command(&command(args).get_packed_command())
@@ -189,6 +200,10 @@ impl Session {
                 match self.connection.recv_response().await? {
                     value @ Value::Push { .. } if !subscription => push(&value),
                     Value::ServerError(error) => break Err(error.into()),
+                    value if extra_acks > 0 => {
+                        extra_acks -= 1;
+                        push(&value);
+                    }
                     value => break Ok(value),
                 }
             }
@@ -196,8 +211,10 @@ impl Session {
         .await;
         match &result {
             Ok(value) => self.observe(args, value),
+            // EXEC without MULTI fails without clearing the server's WATCH.
             Err(error)
-                if args[0].eq_ignore_ascii_case(b"EXEC")
+                if self.transaction
+                    && args[0].eq_ignore_ascii_case(b"EXEC")
                     && !error.is_io_error() =>
             {
                 self.transaction = false;
@@ -210,7 +227,9 @@ impl Session {
     }
 
     fn observe(&mut self, args: &[Vec<u8>], reply: &Value) {
-        if matches!(reply, Value::SimpleString(s) if s == "QUEUED") {
+        if self.transaction
+            && matches!(reply, Value::SimpleString(s) if s == "QUEUED")
+        {
             self.queued.push(args.to_vec());
             return;
         }
@@ -238,14 +257,7 @@ impl Session {
                     .and_then(|a| std::str::from_utf8(a).ok())
                     .and_then(|a| a.parse().ok())
                 {
-                    self.config.info =
-                        self.config.info.clone().set_redis_settings(
-                            self.config
-                                .info
-                                .redis_settings()
-                                .clone()
-                                .set_db(db),
-                        );
+                    self.update_settings(|settings| settings.set_db(db));
                 }
             }
             "AUTH" => self.update_auth(&args[1..]),
@@ -264,10 +276,7 @@ impl Session {
                 self.connection.redirect = false;
                 self.auth_revision += 1;
                 self.config.binary_auth = false;
-                self.config.info =
-                    self.config.info.clone().set_redis_settings(
-                        redis::RedisConnectionInfo::default(),
-                    );
+                self.update_settings(|_| redis::RedisConnectionInfo::default());
                 self.config.name = None;
                 self.transaction = false;
                 self.watched = false;
@@ -283,25 +292,13 @@ impl Session {
     }
 
     fn observe_hello(&mut self, args: &[Vec<u8>]) {
-        if let Some(protocol) = args.get(1) {
-            if protocol == b"3" {
-                self.config.info = self.config.info.clone().set_redis_settings(
-                    self.config
-                        .info
-                        .redis_settings()
-                        .clone()
-                        .set_protocol(redis::ProtocolVersion::RESP3),
-                );
-            }
-            if protocol == b"2" {
-                self.config.info = self.config.info.clone().set_redis_settings(
-                    self.config
-                        .info
-                        .redis_settings()
-                        .clone()
-                        .set_protocol(redis::ProtocolVersion::RESP2),
-                );
-            }
+        let protocol = match args.get(1).map(Vec::as_slice) {
+            Some(b"2") => Some(redis::ProtocolVersion::RESP2),
+            Some(b"3") => Some(redis::ProtocolVersion::RESP3),
+            _ => None,
+        };
+        if let Some(protocol) = protocol {
+            self.update_settings(|settings| settings.set_protocol(protocol));
         }
         let mut options = args.get(2..).unwrap_or_default();
         let mut auth = None;
@@ -324,6 +321,17 @@ impl Session {
         }
     }
 
+    fn update_settings(
+        &mut self,
+        update: impl FnOnce(
+            redis::RedisConnectionInfo,
+        ) -> redis::RedisConnectionInfo,
+    ) {
+        let settings = update(self.config.info.redis_settings().clone());
+        self.config.info =
+            self.config.info.clone().set_redis_settings(settings);
+    }
+
     fn update_auth(&mut self, auth: &[Vec<u8>]) {
         let (user, password) = match auth {
             [password] => (None, password),
@@ -335,17 +343,12 @@ impl Session {
         let settings = redis::RedisConnectionInfo::default()
             .set_db(self.config.info.redis_settings().db())
             .set_protocol(self.config.info.redis_settings().protocol());
-        self.config.info = self
-            .config
-            .info
-            .clone()
-            .set_redis_settings(settings.clone());
         // Never persist a lossy conversion of successfully submitted bytes.
-        let Ok(password) = std::str::from_utf8(password) else {
-            self.notices.push("Binary credentials cannot be reused for background requests, reconnects, or saved authentication.".into());
-            return;
-        };
-        let Ok(user) = user.map(std::str::from_utf8).transpose() else {
+        let text = std::str::from_utf8(password)
+            .ok()
+            .zip(user.map(std::str::from_utf8).transpose().ok());
+        let Some((password, user)) = text else {
+            self.update_settings(|_| settings);
             self.notices.push("Binary credentials cannot be reused for background requests, reconnects, or saved authentication.".into());
             return;
         };
@@ -353,8 +356,7 @@ impl Session {
         if let Some(user) = user {
             settings = settings.set_username(user);
         }
-        self.config.info =
-            self.config.info.clone().set_redis_settings(settings);
+        self.update_settings(|_| settings);
         self.config.binary_auth = false;
         self.save_auth();
     }
@@ -410,6 +412,12 @@ pub fn format_reply(value: &Value) -> Vec<String> {
         Value::SimpleString(s) | Value::VerbatimString { text: s, .. } => {
             vec![quote(s.as_bytes())]
         }
+        Value::Set(values) if values.is_empty() => {
+            vec!["(empty set)".into()]
+        }
+        Value::Map(entries) if entries.is_empty() => {
+            vec!["(empty hash)".into()]
+        }
         Value::Array(values)
         | Value::Set(values)
         | Value::Push { data: values, .. } => {
@@ -420,13 +428,13 @@ pub fn format_reply(value: &Value) -> Vec<String> {
                 .iter()
                 .enumerate()
                 .flat_map(|(index, value)| {
+                    let label = format!("{}) ", index + 1);
+                    let indent = " ".repeat(label.len());
                     format_reply(value).into_iter().enumerate().map(
                         move |(line, text)| {
-                            if line == 0 {
-                                format!("{}) {text}", index + 1)
-                            } else {
-                                format!("   {text}")
-                            }
+                            let prefix =
+                                if line == 0 { &label } else { &indent };
+                            format!("{prefix}{text}")
                         },
                     )
                 })
@@ -1181,6 +1189,55 @@ mod tests {
             .expect("handshake must time out");
         assert!(error.is_timeout());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_without_multi_keeps_the_watch_state() {
+        let (port, server) = server(|args| match args[0].as_str() {
+            "EXEC" => b"-ERR EXEC without MULTI\r\n".to_vec(),
+            _ => b"+OK\r\n".to_vec(),
+        });
+        let mut session = Session::open(config(port)).await.unwrap();
+        session
+            .execute(&[b"WATCH".to_vec(), b"key".to_vec()])
+            .await
+            .unwrap();
+        session.execute(&[b"EXEC".to_vec()]).await.unwrap_err();
+        assert!(session.watched);
+        drop(session);
+        tokio::task::yield_now().await;
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_reply_outside_multi_is_not_replayed_by_exec() {
+        let (port, server) = server(|args| match args[0].as_str() {
+            "EVAL" | "SELECT" => b"+QUEUED\r\n".to_vec(),
+            "EXEC" => b"*1\r\n+OK\r\n".to_vec(),
+            _ => b"+OK\r\n".to_vec(),
+        });
+        let mut session = Session::open(config(port)).await.unwrap();
+        let select = [b"SELECT".to_vec(), b"5".to_vec()];
+        session.execute(&[b"EVAL".to_vec()]).await.unwrap();
+        session.execute(&[b"MULTI".to_vec()]).await.unwrap();
+        session.execute(&select).await.unwrap();
+        session.execute(&[b"EXEC".to_vec()]).await.unwrap();
+        assert_eq!(session.config.info.redis_settings().db(), 5);
+        drop(session);
+        tokio::task::yield_now().await;
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn empty_aggregates_and_wide_indexes_format_readably() {
+        assert_eq!(format_reply(&Value::Map(vec![])), ["(empty hash)"]);
+        assert_eq!(format_reply(&Value::Set(vec![])), ["(empty set)"]);
+        assert_eq!(format_reply(&Value::Array(vec![])), ["(empty array)"]);
+        let mut values = vec![Value::Nil; 9];
+        values.push(Value::Array(vec![Value::Int(1), Value::Int(2)]));
+        let lines = format_reply(&Value::Array(values));
+        assert_eq!(lines[9], "10) 1) (integer) 1");
+        assert_eq!(lines[10], "    2) (integer) 2");
     }
 
     #[test]

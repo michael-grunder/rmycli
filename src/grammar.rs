@@ -20,8 +20,10 @@ impl Atom {
         match self.kind.as_str() {
             "integer" | "unix-time" => std::str::from_utf8(bytes)
                 .is_ok_and(|s| s.parse::<i64>().is_ok()),
-            "double" => std::str::from_utf8(bytes)
-                .is_ok_and(|s| s.parse::<f64>().is_ok()),
+            // Score ranges mark an exclusive bound with a leading parenthesis.
+            "double" => std::str::from_utf8(bytes).is_ok_and(|s| {
+                s.strip_prefix('(').unwrap_or(s).parse::<f64>().is_ok()
+            }),
             _ => true,
         }
     }
@@ -39,12 +41,16 @@ pub struct Grammar {
     pub syntax: String,
 }
 
+/// Bundled docs use booleans; servers list flags, spelling hyphens as `_`.
 pub fn flag(arg: &Value, name: &str) -> bool {
+    let underscored = name.replace('-', "_");
     arg[name].as_bool().unwrap_or(false)
-        || arg[name.replace('-', "_")].as_bool().unwrap_or(false)
-        || arg["flags"]
-            .as_array()
-            .is_some_and(|flags| flags.iter().any(|f| f.as_str() == Some(name)))
+        || arg[&underscored].as_bool().unwrap_or(false)
+        || arg["flags"].as_array().is_some_and(|flags| {
+            flags.iter().any(|f| {
+                f.as_str().is_some_and(|f| f == name || f == underscored)
+            })
+        })
 }
 
 pub fn string<'a>(value: &'a Value, name: &str) -> &'a str {
@@ -337,8 +343,20 @@ mod tests {
         assert_eq!(render(&weights), "WEIGHTS weight [weight ...]");
         let get = json!({"name":"pattern", "type":"pattern", "token":"GET", "flags":["multiple", "multiple-token"]});
         assert_eq!(render(&get), "GET pattern [GET pattern ...]");
+        let live = json!({"name":"pattern", "type":"pattern", "token":"GET", "flags":["multiple", "multiple_token"]});
+        assert_eq!(render(&live), "GET pattern [GET pattern ...]");
         let block = json!({"name":"fields", "type":"block", "token":"FIELDS", "arguments":[{"name":"count","type":"integer"}]});
         assert_eq!(render(&block), "FIELDS count");
+    }
+
+    #[test]
+    fn exclusive_score_bounds_are_doubles() {
+        let args = json!([{"name":"min", "type":"double"}, {"name":"max", "type":"double"}]);
+        let grammar = Grammar::from_docs(args.as_array().unwrap());
+        for word in ["(1.5", "-inf", "+inf", "(-inf", "2"] {
+            assert_eq!(grammar.remaining(&[word.into()]), "max", "{word}");
+        }
+        assert_eq!(grammar.remaining(&[b"(x".to_vec()]), "");
     }
 
     #[test]
