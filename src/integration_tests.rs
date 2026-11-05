@@ -619,16 +619,21 @@ async fn subscriptions_keep_the_session_and_all_replies() {
             panic!("expected client id");
         };
         execute(&mut session, &format!("HELLO {protocol}")).await;
-        let first = execute(&mut session, "SUBSCRIBE first second").await;
-        let second = tokio::time::timeout(
-            Duration::from_secs(2),
-            session.connection.recv_response(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        for (reply, channel, count) in
-            [(first, b"first".as_slice(), 1), (second, b"second", 2)]
+        let mut replies = Vec::new();
+        let last = session
+            .execute_with_push(
+                &[b"SUBSCRIBE".to_vec(), b"first".to_vec(), b"second".to_vec()],
+                |reply| replies.push(reply.clone()),
+            )
+            .await
+            .unwrap();
+        replies.push(last);
+        assert_eq!(replies.len(), 2);
+        for (reply, channel, count) in replies
+            .into_iter()
+            .zip([b"first".as_slice(), b"second"])
+            .zip(1..)
+            .map(|((reply, channel), count)| (reply, channel, count))
         {
             let data = match reply {
                 Value::Array(values) => {
@@ -682,6 +687,186 @@ async fn subscriptions_keep_the_session_and_all_replies() {
             data.last(),
             Some(&Value::BulkString(b"a\x00\xff".to_vec()))
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn subscribed_commands_and_messages_keep_their_replies() {
+    let fixture = RedisFixture::new();
+    let mut publisher = fixture.connection();
+    for protocol in [2, 3] {
+        for (subscribe, unsubscribe, publish) in [
+            ("SUBSCRIBE", "UNSUBSCRIBE", "PUBLISH"),
+            ("PSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH"),
+            ("SSUBSCRIBE", "SUNSUBSCRIBE", "SPUBLISH"),
+        ] {
+            let mut session =
+                Session::open(fixture.config.clone()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                execute(&mut session, &format!("HELLO {protocol}")).await;
+                execute(
+                    &mut session,
+                    &format!(r"{subscribe} a b a '\x00\xff'"),
+                )
+                .await;
+                assert!(session.subscribed());
+                assert!(!session.streaming);
+                assert!(!session.assistance_allowed());
+                redis::cmd(publish)
+                    .arg("a")
+                    .arg("before-subscribe")
+                    .query::<i64>(&mut publisher)
+                    .unwrap();
+                let mut pushes = Vec::new();
+                session
+                    .execute_with_push(
+                        &[
+                            subscribe.as_bytes().to_vec(),
+                            b"c".to_vec(),
+                            b"d".to_vec(),
+                        ],
+                        |reply| pushes.push(reply.clone()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(pushes.len(), 2, "message and first acknowledgment");
+                let data = match &pushes[0] {
+                    Value::Array(data) | Value::Push { data, .. } => data,
+                    other => panic!("unexpected message: {other:?}"),
+                };
+                assert_eq!(
+                    data.last(),
+                    Some(&Value::BulkString(b"before-subscribe".to_vec()))
+                );
+                let reply = session
+                    .execute(&[b"GET".to_vec(), b"missing".to_vec()])
+                    .await;
+                if protocol == 2 {
+                    assert_eq!(reply.unwrap_err().code(), Some("ERR"));
+                } else {
+                    assert_eq!(reply.unwrap(), Value::Nil);
+                }
+                let pong = execute(&mut session, "PING marker").await;
+                if protocol == 2 {
+                    assert_eq!(
+                        pong,
+                        Value::Array(vec![
+                            Value::BulkString(b"pong".to_vec()),
+                            Value::BulkString(b"marker".to_vec()),
+                        ])
+                    );
+                } else {
+                    assert_eq!(pong, Value::BulkString(b"marker".to_vec()));
+                }
+                execute(&mut session, &format!("{unsubscribe} a absent a"))
+                    .await;
+                assert!(session.subscribed());
+                execute(&mut session, unsubscribe).await;
+                assert!(!session.subscribed());
+                assert!(session.assistance_allowed());
+                assert_eq!(
+                    execute(&mut session, "ECHO next").await,
+                    Value::BulkString(b"next".to_vec())
+                );
+            })
+            .await
+            .expect("subscription acknowledgments must not hang");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn unsubscribe_preserves_other_subscription_types_and_reset_clears_them()
+{
+    let fixture = RedisFixture::new();
+    for protocol in [2, 3] {
+        let mut session = Session::open(fixture.config.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            execute(&mut session, &format!("HELLO {protocol}")).await;
+            for final_command in ["SUNSUBSCRIBE", "RESET"] {
+                for line in
+                    ["SUBSCRIBE a b", "PSUBSCRIBE a* b*", "SSUBSCRIBE c d"]
+                {
+                    execute(&mut session, line).await;
+                }
+                for line in ["UNSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE"] {
+                    execute(&mut session, line).await;
+                    assert!(session.subscribed());
+                    assert!(!session.assistance_allowed());
+                }
+                execute(&mut session, final_command).await;
+                assert!(!session.subscribed());
+                assert!(session.assistance_allowed());
+                assert_eq!(
+                    execute(&mut session, "PING").await,
+                    Value::SimpleString("PONG".into())
+                );
+            }
+            assert!(session.execute(&[b"SUBSCRIBE".to_vec()]).await.is_err());
+            assert!(!session.subscribed());
+        })
+        .await
+        .expect("mixed subscriptions must not hang");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn queued_subscriptions_drain_all_acknowledgments() {
+    let fixture = RedisFixture::new();
+    for protocol in [2, 3] {
+        let mut session = Session::open(fixture.config.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            execute(&mut session, &format!("HELLO {protocol}")).await;
+            execute(&mut session, "MULTI").await;
+            for line in [
+                "SUBSCRIBE a b a",
+                "PSUBSCRIBE p q",
+                "UNSUBSCRIBE",
+                "PUNSUBSCRIBE",
+                "SUBSCRIBE c d",
+            ] {
+                assert_eq!(
+                    execute(&mut session, line).await,
+                    Value::SimpleString("QUEUED".into())
+                );
+                assert!(!session.subscribed());
+            }
+            let Value::Array(replies) = execute(&mut session, "EXEC").await
+            else {
+                panic!("expected EXEC replies");
+            };
+            assert_eq!(replies.len(), 5);
+            assert!(session.subscribed());
+            assert!(!session.transaction);
+            execute(&mut session, "UNSUBSCRIBE").await;
+            assert!(session.assistance_allowed());
+            assert_eq!(
+                execute(&mut session, "ECHO aligned").await,
+                Value::BulkString(b"aligned".to_vec())
+            );
+            if protocol == 3 {
+                execute(&mut session, "SUBSCRIBE a b").await;
+                execute(&mut session, "MULTI").await;
+                execute(&mut session, "UNSUBSCRIBE").await;
+                execute(&mut session, "GET absent").await;
+                execute(&mut session, "PSUBSCRIBE x y").await;
+                let Value::Array(replies) = execute(&mut session, "EXEC").await
+                else {
+                    panic!("expected subscribed EXEC replies");
+                };
+                assert_eq!(replies.len(), 3);
+                assert_eq!(replies[1], Value::Nil);
+                assert!(session.subscribed());
+                execute(&mut session, "PUNSUBSCRIBE").await;
+                assert!(session.assistance_allowed());
+                assert_eq!(
+                    execute(&mut session, "PING").await,
+                    Value::SimpleString("PONG".into())
+                );
+            }
+        })
+        .await
+        .expect("queued subscriptions must not hang");
     }
 }
 

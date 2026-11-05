@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use redis::{Client, Connection, ConnectionInfo, RedisResult, Value};
 
@@ -64,6 +64,64 @@ pub fn command(args: &[Vec<u8>]) -> redis::Cmd {
     command
 }
 
+const SUBSCRIPTIONS: [&[u8]; 6] = [
+    b"SUBSCRIBE",
+    b"PSUBSCRIBE",
+    b"SSUBSCRIBE",
+    b"UNSUBSCRIBE",
+    b"PUNSUBSCRIBE",
+    b"SUNSUBSCRIBE",
+];
+
+fn subscription_ack(reply: &Value) -> Option<(usize, &[Value])> {
+    use redis::PushKind;
+    match reply {
+        Value::Push { kind, data } => {
+            let index = match kind {
+                PushKind::Subscribe => 0,
+                PushKind::PSubscribe => 1,
+                PushKind::SSubscribe => 2,
+                PushKind::Unsubscribe => 3,
+                PushKind::PUnsubscribe => 4,
+                PushKind::SUnsubscribe => 5,
+                _ => return None,
+            };
+            Some((index, data))
+        }
+        Value::Array(data) => {
+            let (Value::BulkString(name), data) = data.split_first()? else {
+                return None;
+            };
+            SUBSCRIPTIONS
+                .iter()
+                .position(|command| name.eq_ignore_ascii_case(command))
+                .map(|index| (index, data))
+        }
+        _ => None,
+    }
+}
+
+fn pubsub_message(reply: &Value) -> bool {
+    match reply {
+        Value::Push { kind, .. } => matches!(
+            kind,
+            redis::PushKind::Message
+                | redis::PushKind::PMessage
+                | redis::PushKind::SMessage
+        ),
+        Value::Array(data) => matches!(
+            data.first(),
+            Some(Value::BulkString(name))
+                if matches!(name.as_slice(), b"message" | b"pmessage" | b"smessage")
+        ),
+        _ => false,
+    }
+}
+
+pub fn is_pubsub(reply: &Value) -> bool {
+    subscription_ack(reply).is_some() || pubsub_message(reply)
+}
+
 pub struct Session {
     pub connection: crate::transport::Connection,
     pub config: Config,
@@ -72,6 +130,7 @@ pub struct Session {
     pub streaming: bool,
     pub auth_revision: u64,
     pub notices: Vec<String>,
+    subscriptions: [HashSet<Vec<u8>>; 3],
     queued: Vec<Vec<Vec<u8>>>,
     routing_revision: u64,
 }
@@ -86,6 +145,7 @@ impl Session {
             streaming: false,
             auth_revision: 0,
             notices: Vec::new(),
+            subscriptions: std::array::from_fn(|_| HashSet::new()),
             queued: Vec::new(),
             routing_revision: 0,
         };
@@ -93,8 +153,17 @@ impl Session {
         Ok(session)
     }
 
-    pub const fn assistance_allowed(&self) -> bool {
-        !self.transaction && !self.watched && !self.streaming
+    pub fn subscribed(&self) -> bool {
+        self.subscriptions
+            .iter()
+            .any(|channels| !channels.is_empty())
+    }
+
+    pub fn assistance_allowed(&self) -> bool {
+        !self.transaction
+            && !self.watched
+            && !self.streaming
+            && !self.subscribed()
     }
 
     #[cfg(test)]
@@ -177,35 +246,32 @@ impl Session {
         args: &[Vec<u8>],
         push: &mut impl FnMut(&Value),
     ) -> RedisResult<Value> {
-        let unsubscription =
-            [b"UNSUBSCRIBE".as_slice(), b"PUNSUBSCRIBE", b"SUNSUBSCRIBE"]
-                .iter()
-                .any(|name| args[0].eq_ignore_ascii_case(name));
-        let subscription = unsubscription
-            || [b"SUBSCRIBE".as_slice(), b"PSUBSCRIBE", b"SSUBSCRIBE"]
-                .iter()
-                .any(|name| args[0].eq_ignore_ascii_case(name));
-        // Each named channel is acknowledged separately. Unread acknowledgments
-        // would otherwise be taken for the replies to the following commands.
-        let mut extra_acks = if unsubscription && !self.transaction {
-            args.len().saturating_sub(2)
-        } else {
-            0
-        };
         let result: RedisResult<Value> = async {
             self.connection
                 .send_packed_command(&command(args).get_packed_command())
                 .await?;
-            loop {
-                match self.connection.recv_response().await? {
-                    value @ Value::Push { .. } if !subscription => push(&value),
-                    Value::ServerError(error) => break Err(error.into()),
-                    value if extra_acks > 0 => {
-                        extra_acks -= 1;
-                        push(&value);
+            let reply = self
+                .read_reply(args, push, &mut Vec::new().into_iter())
+                .await?;
+            match reply {
+                Value::ServerError(error) => Err(error.into()),
+                Value::Array(values)
+                    if self.transaction
+                        && args[0].eq_ignore_ascii_case(b"EXEC") =>
+                {
+                    // Redis counts queued commands in EXEC's array header,
+                    // even when a subscription emits several acknowledgments.
+                    let mut pending = values.into_iter();
+                    let mut replies = Vec::new();
+                    for queued in self.queued.clone() {
+                        replies.push(
+                            self.read_reply(&queued, push, &mut pending)
+                                .await?,
+                        );
                     }
-                    value => break Ok(value),
+                    Ok(Value::Array(replies))
                 }
+                value => Ok(value),
             }
         }
         .await;
@@ -224,6 +290,69 @@ impl Session {
             _ => {}
         }
         result
+    }
+
+    async fn read_reply(
+        &mut self,
+        args: &[Vec<u8>],
+        push: &mut impl FnMut(&Value),
+        pending: &mut std::vec::IntoIter<Value>,
+    ) -> RedisResult<Value> {
+        let subscription = SUBSCRIPTIONS
+            .iter()
+            .position(|name| args[0].eq_ignore_ascii_case(name));
+        // Each named channel is acknowledged separately. Unread acknowledgments
+        // would otherwise be taken for the replies to the following commands.
+        let mut acknowledgments = subscription.map_or(1, |index| {
+            if index >= 3 && args.len() == 1 {
+                self.subscriptions[index - 3].len().max(1)
+            } else {
+                args.len().saturating_sub(1).max(1)
+            }
+        });
+        let resp2_subscribed = self.subscribed()
+            && self.config.info.redis_settings().protocol()
+                == redis::ProtocolVersion::RESP2;
+        loop {
+            let value = match pending.next() {
+                Some(value) => value,
+                None => self.connection.recv_response().await?,
+            };
+            if let Some((index, data)) = subscription_ack(&value)
+                && subscription == Some(index)
+            {
+                self.observe_subscription(index, data);
+                acknowledgments -= 1;
+                if acknowledgments == 0 {
+                    break Ok(value);
+                }
+                push(&value);
+            } else {
+                match value {
+                    Value::Push { .. } => {
+                        if let Some((index, data)) = subscription_ack(&value) {
+                            self.observe_subscription(index, data);
+                        }
+                        push(&value);
+                    }
+                    value if resp2_subscribed && pubsub_message(&value) => {
+                        push(&value);
+                    }
+                    value => break Ok(value),
+                }
+            }
+        }
+    }
+
+    fn observe_subscription(&mut self, index: usize, data: &[Value]) {
+        if let [Value::BulkString(channel), Value::Int(_)] = data {
+            let channels = &mut self.subscriptions[index % 3];
+            if index < 3 {
+                channels.insert(channel.clone());
+            } else {
+                channels.remove(channel);
+            }
+        }
     }
 
     fn observe(&mut self, args: &[Vec<u8>], reply: &Value) {
@@ -281,10 +410,10 @@ impl Session {
                 self.transaction = false;
                 self.watched = false;
                 self.streaming = false;
+                self.subscriptions.iter_mut().for_each(HashSet::clear);
                 self.queued.clear();
             }
-            "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR" | "SYNC"
-            | "PSYNC" => {
+            "MONITOR" | "SYNC" | "PSYNC" => {
                 self.streaming = true;
             }
             _ => {}

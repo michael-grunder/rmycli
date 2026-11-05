@@ -47,6 +47,7 @@ pub enum Event {
         config: Config,
         allowed: bool,
         streaming: bool,
+        subscribed: bool,
         client_id: Option<i64>,
         connected: bool,
     },
@@ -245,7 +246,10 @@ fn received_message(
     match reply {
         Ok(reply) => {
             let push = matches!(reply, Value::Push { .. });
-            if !push || session.streaming || session.config.show_pushes {
+            if !push
+                || crate::session::is_pubsub(&reply)
+                || session.config.show_pushes
+            {
                 let lines = session.config.output.lines(&reply);
                 let event = if push {
                     Event::Push(lines)
@@ -256,7 +260,7 @@ fn received_message(
             }
         }
         Err(error) => {
-            let state = if session.streaming {
+            let state = if session.streaming || session.subscribed() {
                 "Stream ended"
             } else {
                 "Connection lost"
@@ -296,7 +300,7 @@ async fn execution_loop(
                 let output = session.config.output.clone();
                 let show_pushes = session.config.show_pushes;
                 let push = |reply: &Value| {
-                    if show_pushes {
+                    if show_pushes || crate::session::is_pubsub(reply) {
                         let _ = events.send(Event::Push(output.lines(reply)));
                     }
                 };
@@ -337,6 +341,7 @@ async fn execution_loop(
                         config: session.config.clone(),
                         allowed: session.assistance_allowed() && connected,
                         streaming: session.streaming,
+                        subscribed: session.subscribed(),
                         client_id: id,
                         connected,
                     })
@@ -397,6 +402,7 @@ fn credential_action(
         config: session.config.clone(),
         allowed: session.assistance_allowed() && listening,
         streaming: session.streaming,
+        subscribed: session.subscribed(),
         client_id: id,
         connected: listening,
     });

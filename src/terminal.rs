@@ -466,6 +466,7 @@ enum Mode {
     Ready,
     Busy,
     Stateful,
+    Subscribed,
     Streaming,
     Disconnected,
 }
@@ -684,6 +685,7 @@ impl App {
                 config,
                 allowed,
                 streaming,
+                subscribed,
                 client_id,
                 connected,
             } => {
@@ -701,14 +703,12 @@ impl App {
                 self.config = config;
                 self.client_id = client_id;
                 self.busy_until = None;
-                self.mode = if !connected {
-                    Mode::Disconnected
-                } else if streaming {
-                    Mode::Streaming
-                } else if allowed {
-                    Mode::Ready
-                } else {
-                    Mode::Stateful
+                self.mode = match (connected, streaming, subscribed, allowed) {
+                    (false, ..) => Mode::Disconnected,
+                    (_, true, ..) => Mode::Streaming,
+                    (_, _, true, _) => Mode::Subscribed,
+                    (_, _, _, true) => Mode::Ready,
+                    _ => Mode::Stateful,
                 };
                 self.status = if connected {
                     if allowed {
@@ -976,6 +976,13 @@ impl App {
         if let Some(cancelled) = &self.listing {
             cancelled.store(true, Ordering::Relaxed);
             self.status = "Stopping SCAN after the current request…".into();
+        } else if self.mode == Mode::Subscribed {
+            self.mode = Mode::Busy;
+            self.status = "Unsubscribing…".into();
+            let _ = self
+                .workers
+                .execution
+                .send(Execution::Run(vec![b"UNSUBSCRIBE".to_vec()]));
         } else if matches!(self.mode, Mode::Busy | Mode::Streaming) {
             if let Some(client_id) = self.client_id {
                 let _ = self.workers.assistance.send(Assistance::Cancel {
@@ -1230,7 +1237,7 @@ impl App {
             }
             if self.mode != Mode::Ready {
                 self.status =
-                    "Alternate KEYS is unavailable during MULTI or WATCH"
+                    "Alternate KEYS is unavailable during MULTI, WATCH, or subscriptions"
                         .into();
                 return false;
             }
@@ -1330,6 +1337,7 @@ impl App {
             Mode::Ready | Mode::Stateful => "Connected",
             Mode::Busy => "Busy",
             Mode::Streaming => "Streaming",
+            Mode::Subscribed => "Subscribed",
             Mode::Disconnected => "Disconnected",
         };
         vec![
@@ -1338,6 +1346,7 @@ impl App {
             "HELP command: full command help; HELP @group: command list".into(),
             "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
             "Ctrl+Enter on KEYS <pattern>: stream SCAN batches; Ctrl-C stops without disconnecting".into(),
+            "Ctrl-C while subscribed: UNSUBSCRIBE from all ordinary channels; keep the connection".into(),
             "Ctrl-R: fuzzy history search; 'term: exact substring; Enter: recall; Esc/Ctrl-C: restore draft".into(),
             "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
             "F1: command and editor help; PgUp/PgDn: scroll help; Ctrl-D or \\quit: exit".into(),
@@ -2155,6 +2164,7 @@ mod tests {
             ("KEYS a b", Mode::Ready),
             ("KEYS \"unfinished", Mode::Ready),
             ("KEYS *", Mode::Stateful),
+            ("KEYS *", Mode::Subscribed),
             ("KEYS *", Mode::Streaming),
             ("KEYS *", Mode::Disconnected),
         ] {
@@ -2180,6 +2190,57 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert_eq!(app.editor.line, "KEYS foo:*");
         assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
+    fn subscribed_prompt_submits_commands_and_ctrl_c_unsubscribes() {
+        for line in ["GET key", "PING", "SUBSCRIBE second third"] {
+            let (mut app, mut executed) = test_app();
+            app.on_worker(Event::Executed {
+                lines: vec![],
+                config: app.config.clone(),
+                allowed: false,
+                streaming: false,
+                subscribed: true,
+                client_id: Some(42),
+                connected: true,
+            });
+            assert!(app.mode == Mode::Subscribed);
+            app.editor.line = line.into();
+            app.editor.cursor = line.len();
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let Execution::Run(args) = executed.try_recv().unwrap() else {
+                panic!("expected command while subscribed");
+            };
+            assert_eq!(
+                args,
+                input::parse(line)
+                    .words
+                    .into_iter()
+                    .map(|word| word.bytes)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let (mut app, mut executed) = test_app();
+        app.mode = Mode::Subscribed;
+        app.client_id = None;
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let Execution::Run(args) = executed.try_recv().unwrap() else {
+            panic!("expected unsubscribe");
+        };
+        assert_eq!(args, [b"UNSUBSCRIBE"]);
+        assert_eq!(app.editor.line, "GET a");
+        assert!(app.mode == Mode::Busy);
+        app.on_worker(Event::Executed {
+            lines: vec![],
+            config: app.config.clone(),
+            allowed: true,
+            streaming: false,
+            subscribed: false,
+            client_id: None,
+            connected: true,
+        });
+        assert!(app.mode == Mode::Ready);
     }
 
     #[test]
@@ -2209,6 +2270,7 @@ mod tests {
             config: app.config.clone(),
             allowed: true,
             streaming: false,
+            subscribed: false,
             client_id: Some(42),
             connected: true,
         });
@@ -2338,6 +2400,7 @@ mod tests {
                 config: app.config.clone(),
                 allowed: true,
                 streaming: false,
+                subscribed: false,
                 client_id: None,
                 connected: true,
             });
@@ -2514,6 +2577,7 @@ mod tests {
         for mode in [
             Mode::Ready,
             Mode::Stateful,
+            Mode::Subscribed,
             Mode::Disconnected,
             Mode::Streaming,
         ] {

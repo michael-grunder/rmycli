@@ -144,7 +144,9 @@ async fn run_once(
     let mut output_error = None;
     let reply = session
         .execute_with_push(args, |reply| {
-            if show_pushes && output_error.is_none() {
+            if (show_pushes || crate::session::is_pubsub(reply))
+                && output_error.is_none()
+            {
                 output_error = options.output.print(reply).err();
             }
         })
@@ -156,7 +158,7 @@ async fn run_once(
         return Err(error.into());
     }
     options.output.print(&reply)?;
-    while session.streaming {
+    while session.streaming || session.subscribed() {
         options
             .output
             .print(&session.connection.recv_response().await?)?;

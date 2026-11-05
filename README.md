@@ -697,7 +697,7 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | PageUp / PageDown, Up / Down with help open | Scroll the help panel |
 | Enter with help open | Close help without submitting input |
 | `CLEAR`, Ctrl-L | Clear the screen locally without sending a Redis command |
-| Ctrl-C | Stop alternate `KEYS` scanning; otherwise clear input or close an executing/streaming connection |
+| Ctrl-C | Stop alternate `KEYS` scanning; send `UNSUBSCRIBE` while subscribed; otherwise clear input or close an executing/streaming connection |
 | Ctrl-D, `\quit`, `\q`, `QUIT`, `EXIT` | Exit |
 | `HELP command`, `HELP @group` | Full command help or commands in a group |
 | `HELP`, `\help` | Open editor help and connection details |
@@ -925,9 +925,18 @@ Closing the socket cannot undo a command the server has already executed.
 - A scan describes only the connected node and database. `-c` follows command
   redirects; slot-map routing and cluster-wide discovery are not implemented.
   Even a completed SCAN is not a snapshot of a changing keyspace.
-- Pub/Sub and MONITOR replies stream to the transcript. In interactive streaming
-  mode, Ctrl-C ends the stream; reconnect before submitting further commands.
-  Replication protocols and an interactive unsubscribe workflow are not provided.
+- Pub/Sub replies stream while the interactive prompt accepts further commands,
+  including additional subscriptions. Redis enforces the allowed commands in
+  RESP2; RESP3 permits ordinary commands while subscribed. Ctrl-C at the subscribed
+  prompt sends `UNSUBSCRIBE` without arguments, removing all ordinary channel
+  subscriptions and keeping the connection and session state. Pattern and shard
+  subscriptions remain until `PUNSUBSCRIBE` and `SUNSUBSCRIBE`, respectively.
+  Background assistance resumes once all subscriptions end, unless MULTI or
+  WATCH is still active. Ctrl-C during an executing command still closes the
+  connection to cancel it.
+- MONITOR replies stream to the transcript; Ctrl-C closes that connection, so
+  reconnect before submitting further commands. Replication protocols are not
+  provided.
 - History is bounded and displayed output is released by the application, but
   command replies are decoded in memory before display. The `LRANGE` estimate
   is not a general reply-memory cap.

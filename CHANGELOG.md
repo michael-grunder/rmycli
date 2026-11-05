@@ -28,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Accept interactive commands and additional subscriptions while subscribed,
+  leaving command restrictions to Redis. Ctrl-C sends argument-free `UNSUBSCRIBE`
+  without disconnecting; pattern and shard subscriptions remain active. Drain
+  every subscription acknowledgment and keep published messages separate from
+  command replies in RESP2 and RESP3, including when push display is disabled.
 - Type shifted characters correctly on Kitty keyboard protocol terminals, where
   Shift+a produced `a` and Shift+; produced `;`. Caps Lock now applies as well.
 - Stop hanging on RESP3 `UNSUBSCRIBE`, `PUNSUBSCRIBE`, and `SUNSUBSCRIBE`, whose
