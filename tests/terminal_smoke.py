@@ -713,8 +713,6 @@ def main():
             terminal.send(b"\x15BLPOP missing 0\r")
             terminal.expect("Executing")
             terminal.send(b"\x03")
-            terminal.expect("Connection lost")
-            terminal.send(b"\\reconnect\r")
             terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1] ❯" and not f.row(f.y + 1), "reconnected prompt")
             terminal.send(b"SUBSCRIBE channel\r")
             terminal.expect("subscribe")
@@ -733,6 +731,22 @@ def main():
             terminal.send(b"\x03")
             terminal.expect("unsubscribe")
             terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1] ❯" and not f.row(f.y + 1), "unsubscribed prompt keeps database")
+            terminal.send(b"PING\r")
+            terminal.expect("PONG")
+
+            terminal.send(b"MONITOR\r")
+            terminal.expect_frame(lambda f: f.row(f.y - 1) == "OK" and not f.row(f.y), "monitor without prompt")
+            redis("ECHO", 'monitor "quoted"\n')
+            terminal.expect_frame(
+                lambda f: f.row(f.y - 1).endswith(r'"ECHO" "monitor \"quoted\"\n"')
+                and f.row(f.y - 1)[0].isdigit() and not f.row(f.y),
+                "monitor retains server quoting",
+            )
+            terminal.send(b"\x03")
+            terminal.expect_frame(lambda f: f.row(f.y) == f"default@{socket}[1] ❯", "monitor cancellation reconnects quietly")
+            assert b"SETINFO" not in terminal.data
+            assert b"Connection lost" not in terminal.data
+            assert b"Reconnect" not in terminal.data
             terminal.send(b"PING\r")
             terminal.expect("PONG")
 

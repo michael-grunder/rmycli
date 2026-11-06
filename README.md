@@ -907,12 +907,14 @@ and credentials. They are paused during `MULTI`, `WATCH`, and streaming modes.
 update auxiliary connection settings. Probes never enter the user's transaction.
 Commands queued inside transactions execute without reply-size confirmation.
 
-Connection errors never trigger automatic command replay. Use `\reconnect`
-explicitly; reconnecting starts a fresh session and does not restore transaction,
-WATCH, subscription, or other connection-local state. Ctrl-C during execution
-uses `CLIENT ID` and `CLIENT KILL ID` through the auxiliary connection to close
-only this client's socket. If ACLs forbid cancellation, Ctrl-D exits the client.
-Closing the socket cannot undo a command the server has already executed.
+Interactive sessions reconnect quietly after connection loss or Ctrl-C during
+execution. If reconnection fails, the error is shown; submitting a new command
+or using `\reconnect` tries again. Interrupted commands are never replayed.
+Reconnection reuses the current endpoint, database, credentials, protocol, and
+client name, but starts a fresh session: transaction, WATCH, subscription, and
+other connection-local state are not restored. Ctrl-C closes the active socket
+locally, without requiring `CLIENT ID` or `CLIENT KILL` permissions. Closing the
+socket cannot undo a command the server has already executed.
 
 ## Compatibility and limits
 
@@ -937,9 +939,10 @@ Closing the socket cannot undo a command the server has already executed.
   Background assistance resumes once all subscriptions end, unless MULTI or
   WATCH is still active. Ctrl-C during an executing command still closes the
   connection to cancel it.
-- MONITOR replies stream to the transcript; Ctrl-C closes that connection, so
-  reconnect before submitting further commands. Replication protocols are not
-  provided.
+- MONITOR displays server-formatted lines without extra quoting or an input
+  prompt. Ctrl-C stops the stream and quietly reconnects before restoring the
+  prompt. Terminal control characters remain escaped. Replication protocols
+  are not provided.
 - History is bounded and displayed output is released by the application, but
   command replies are decoded in memory before display. The `LRANGE` estimate
   is not a general reply-memory cap.

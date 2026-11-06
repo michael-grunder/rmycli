@@ -8,7 +8,7 @@ use redis::Value;
 use crate::estimate;
 use crate::metadata::Catalog;
 use crate::scan::{self, Discovery, Limits};
-use crate::session::{Config, Session, command};
+use crate::session::{Config, Session};
 
 pub enum Execution {
     Run(Vec<Vec<u8>>),
@@ -34,10 +34,6 @@ pub enum Assistance {
         generation: u64,
         config: Config,
         args: Vec<Vec<u8>>,
-    },
-    Cancel {
-        config: Config,
-        client_id: i64,
     },
 }
 
@@ -67,7 +63,6 @@ pub enum Event {
         count: Option<u64>,
     },
     Failed(String),
-    Notice(String),
 }
 
 pub struct Workers {
@@ -75,6 +70,7 @@ pub struct Workers {
     pub assistance: Sender<Assistance>,
     pub events: Receiver<Event>,
     pub generation: Arc<AtomicU64>,
+    pub cancel: Arc<tokio::sync::Notify>,
 }
 
 async fn client_id(session: &mut Session) -> Option<i64> {
@@ -104,15 +100,23 @@ impl Workers {
         thread::spawn(move || {
             assist_loop(&assistance_rx, &assist_tx, &assist_generation);
         });
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let execution_cancel = Arc::clone(&cancel);
         let runtime = tokio::runtime::Handle::current();
         thread::spawn(move || {
-            runtime.block_on(execution_loop(session, execution_rx, &event_tx));
+            runtime.block_on(execution_loop(
+                session,
+                execution_rx,
+                &event_tx,
+                &execution_cancel,
+            ));
         });
         Self {
             execution,
             assistance,
             events,
             generation,
+            cancel,
         }
     }
 
@@ -193,23 +197,6 @@ fn assist_loop(
                     count,
                 });
             }
-            Assistance::Cancel { config, client_id } => {
-                let result =
-                    config.connect_auxiliary().and_then(|mut connection| {
-                        command(&[
-                            b"CLIENT".to_vec(),
-                            b"KILL".to_vec(),
-                            b"ID".to_vec(),
-                            client_id.to_string().into_bytes(),
-                        ])
-                        .query::<i64>(&mut connection)
-                    });
-                if let Err(error) = result {
-                    let _ = events.send(Event::Notice(format!(
-                        "Cannot cancel connection: {error}. Ctrl-D exits."
-                    )));
-                }
-            }
         }
     }
 }
@@ -239,86 +226,103 @@ async fn announce(
 }
 
 fn received_message(
-    session: &mut Session,
+    session: &Session,
     events: &SyncSender<Event>,
-    reply: redis::RedisResult<Value>,
+    reply: &Value,
 ) -> bool {
-    match reply {
-        Ok(reply) => {
-            let push = matches!(reply, Value::Push { .. });
-            if !push
-                || crate::session::is_pubsub(&reply)
-                || session.config.show_pushes
-            {
-                let lines = session.config.output.lines(&reply);
-                let event = if push {
-                    Event::Push(lines)
-                } else {
-                    Event::Output(lines)
-                };
-                return events.send(event).is_ok();
-            }
-        }
-        Err(error) => {
-            let state = if session.streaming || session.subscribed() {
-                "Stream ended"
-            } else {
-                "Connection lost"
-            };
-            session.streaming = false;
-            let _ = events.send(Event::Failed(format!(
-                "{state}: {error}. Use \\reconnect."
-            )));
-            return false;
-        }
+    let push = matches!(reply, Value::Push { .. });
+    if !push || crate::session::is_pubsub(reply) || session.config.show_pushes {
+        let lines = if session.streaming
+            && let Value::SimpleString(line) = reply
+        {
+            vec![line.clone()]
+        } else {
+            session.config.output.lines(reply)
+        };
+        let event = if push {
+            Event::Push(lines)
+        } else {
+            Event::Output(lines)
+        };
+        return events.send(event).is_ok();
     }
     true
+}
+
+async fn reconnect(
+    session: &mut Session,
+    events: &SyncSender<Event>,
+    id: &mut Option<i64>,
+) -> bool {
+    // Drop the old stream before any handshake or metadata requests.
+    session.connection.close();
+    match Session::open(session.config.clone()).await {
+        Ok(fresh) => {
+            *session = fresh;
+            *id = announce(session, events).await;
+            true
+        }
+        Err(error) => {
+            let _ = events.send(Event::Failed(format!(
+                "Reconnect failed: {error}. Submit a new command or use \\reconnect to try again."
+            )));
+            false
+        }
+    }
 }
 
 async fn execution_loop(
     mut session: Session,
     mut requests: tokio::sync::mpsc::UnboundedReceiver<Execution>,
     events: &SyncSender<Event>,
+    cancel: &tokio::sync::Notify,
 ) {
     let mut id = announce(&mut session, events).await;
     let mut auth_revision = session.auth_revision;
     let mut listening = true;
+    let mut needs_reconnect = false;
     loop {
+        if needs_reconnect {
+            listening = reconnect(&mut session, events, &mut id).await;
+            auth_revision = session.auth_revision;
+            needs_reconnect = false;
+        }
         let request = tokio::select! {
+            biased;
             request = requests.recv() => match request {
                 Some(request) => request,
                 None => return,
             },
+            () = cancel.notified() => Execution::Reconnect,
             reply = session.connection.recv_response(), if listening => {
-                listening = received_message(&mut session, events, reply);
+                match reply {
+                    Ok(reply) => {
+                        if !received_message(&session, events, &reply) {
+                            return;
+                        }
+                    }
+                    Err(_) => needs_reconnect = true,
+                }
                 continue;
             }
         };
         match request {
             request @ (Execution::Run(_) | Execution::Scan { .. }) => {
-                let previous_addr = session.config.info.addr().clone();
-                let output = session.config.output.clone();
-                let show_pushes = session.config.show_pushes;
-                let push = |reply: &Value| {
-                    if show_pushes || crate::session::is_pubsub(reply) {
-                        let _ = events.send(Event::Push(output.lines(reply)));
+                if !listening {
+                    listening = reconnect(&mut session, events, &mut id).await;
+                    auth_revision = session.auth_revision;
+                    if !listening {
+                        continue;
                     }
-                };
-                let result = match request {
-                    Execution::Run(args) => session
-                        .execute_with_push(&args, push)
-                        .await
-                        .map(|reply| output.lines(&reply)),
-                    Execution::Scan { pattern, cancelled } => scan_keys(
-                        &mut session,
-                        &pattern,
-                        &cancelled,
-                        events,
-                        push,
-                    )
-                    .await
-                    .map(|()| Vec::new()),
-                    Execution::Reconnect | Execution::Auth(_) => unreachable!(),
+                }
+                let previous_addr = session.config.info.addr().clone();
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.notified() => {
+                        needs_reconnect = true;
+                        continue;
+                    }
+                    result = execute_request(&mut session, request, events) => result,
                 };
                 if previous_addr != *session.config.info.addr() {
                     id = client_id(&mut session).await;
@@ -328,6 +332,7 @@ async fn execution_loop(
                     .err()
                     .is_none_or(|error| !error.is_io_error());
                 listening = connected;
+                needs_reconnect = !connected;
                 let mut lines = result.unwrap_or_else(|error| {
                     vec![format!(
                         "(error) {}",
@@ -360,22 +365,34 @@ async fn execution_loop(
             Execution::Auth(action) => {
                 credential_action(&session, action, events, id, listening);
             }
-            Execution::Reconnect => {
-                match Session::open(session.config.clone()).await {
-                    Ok(fresh) => {
-                        session = fresh;
-                        listening = true;
-                        id = announce(&mut session, events).await;
-                        auth_revision = session.auth_revision;
-                    }
-                    Err(error) => {
-                        let _ = events.send(Event::Failed(format!(
-                            "Reconnect failed: {error}"
-                        )));
-                    }
-                }
-            }
+            Execution::Reconnect => needs_reconnect = true,
         }
+    }
+}
+
+async fn execute_request(
+    session: &mut Session,
+    request: Execution,
+    events: &SyncSender<Event>,
+) -> redis::RedisResult<Vec<String>> {
+    let output = session.config.output.clone();
+    let show_pushes = session.config.show_pushes;
+    let push = |reply: &Value| {
+        if show_pushes || crate::session::is_pubsub(reply) {
+            let _ = events.send(Event::Push(output.lines(reply)));
+        }
+    };
+    match request {
+        Execution::Run(args) => session
+            .execute_with_push(&args, push)
+            .await
+            .map(|reply| output.lines(&reply)),
+        Execution::Scan { pattern, cancelled } => {
+            scan_keys(session, &pattern, &cancelled, events, push)
+                .await
+                .map(|()| Vec::new())
+        }
+        Execution::Reconnect | Execution::Auth(_) => unreachable!(),
     }
 }
 

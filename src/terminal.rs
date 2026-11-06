@@ -711,14 +711,13 @@ impl App {
                     _ => Mode::Stateful,
                 };
                 self.status = if connected {
-                    if allowed {
+                    if allowed || streaming {
                         String::new()
                     } else {
                         "Background assistance paused for session state".into()
                     }
                 } else {
-                    "Connection lost; command was not retried. Use \\reconnect."
-                        .into()
+                    "Connection lost; command was not retried.".into()
                 };
             }
             Event::Output(lines) => {
@@ -739,7 +738,6 @@ impl App {
                 self.status = message;
                 self.mode = Mode::Disconnected;
             }
-            Event::Notice(message) => self.status = message,
             Event::Scanned { generation, state }
                 if generation == self.workers.current() && !state.cancelled =>
             {
@@ -770,6 +768,9 @@ impl App {
         let key = apply_caps_lock(key);
         self.update_control(key);
         if key.kind == KeyEventKind::Release
+            || (self.mode == Mode::Streaming
+                && !(key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c' | 'd' | 'l'))))
             || matches!(key.code, KeyCode::Modifier(_))
         {
             return false;
@@ -885,6 +886,9 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        if self.mode == Mode::Streaming {
+            return;
+        }
         self.busy_until = None;
         // Pasting never submits commands, including embedded newlines.
         let text = text.replace(['\r', '\n'], " ");
@@ -984,17 +988,10 @@ impl App {
                 .execution
                 .send(Execution::Run(vec![b"UNSUBSCRIBE".to_vec()]));
         } else if matches!(self.mode, Mode::Busy | Mode::Streaming) {
-            if let Some(client_id) = self.client_id {
-                let _ = self.workers.assistance.send(Assistance::Cancel {
-                    config: self.config.clone(),
-                    client_id,
-                });
-                self.status =
-                    "Closing the active connection; use \\reconnect afterward"
-                        .into();
-            } else {
-                self.status = "CLIENT ID unavailable; Ctrl-D exits".into();
-            }
+            self.workers.cancel.notify_one();
+            self.mode = Mode::Busy;
+            self.status.clear();
+            self.busy_until = Some(Instant::now() + BUSY_PROMPT_DELAY);
         } else {
             self.editor.line.clear();
             self.editor.cursor = 0;
@@ -1202,8 +1199,7 @@ impl App {
             return false;
         }
         if self.mode == Mode::Streaming {
-            self.status =
-                "Ctrl-C closes the stream; then use \\reconnect".into();
+            self.status = "Ctrl-C stops the stream".into();
             return false;
         }
         self.invalidate();
@@ -1221,12 +1217,6 @@ impl App {
         }
         if args[0].eq_ignore_ascii_case(b"HELP") || args[0] == b"\\help" {
             self.local_help(&args);
-            return false;
-        }
-        if self.mode == Mode::Disconnected {
-            self.status =
-                "Disconnected; use \\reconnect. Commands are never replayed."
-                    .into();
             return false;
         }
         if alternate && args[0].eq_ignore_ascii_case(b"KEYS") {
@@ -1412,7 +1402,7 @@ impl App {
             self.clear = false;
         }
         screen.write_output(out, self.output.drain(..), width, height)?;
-        if self.busy_until.is_some() {
+        if self.busy_until.is_some() || self.mode == Mode::Streaming {
             // Like a shell, leave the cursor below the submitted command so a
             // quick reply never follows a transient prompt and busy status.
             return queue!(
@@ -1815,6 +1805,7 @@ mod tests {
                 assistance,
                 events,
                 generation: Arc::new(AtomicU64::new(0)),
+                cancel: Arc::new(tokio::sync::Notify::new()),
             },
             config: Config {
                 auth_store: None,
@@ -2165,7 +2156,6 @@ mod tests {
             ("KEYS \"unfinished", Mode::Ready),
             ("KEYS *", Mode::Stateful),
             ("KEYS *", Mode::Subscribed),
-            ("KEYS *", Mode::Streaming),
             ("KEYS *", Mode::Disconnected),
         ] {
             let (mut app, mut executed) = test_app();
@@ -2176,6 +2166,71 @@ mod tests {
             assert!(app.listing.is_none());
             assert_ne!(app.status, "");
         }
+    }
+
+    #[tokio::test]
+    async fn monitor_hides_prompt_and_ctrl_c_cancels_without_client_id() {
+        let (mut app, _) = test_app();
+        app.editor.line.clear();
+        app.editor.cursor = 0;
+        app.on_worker(Event::Executed {
+            lines: vec!["OK".into()],
+            config: app.config.clone(),
+            allowed: false,
+            streaming: true,
+            subscribed: false,
+            client_id: None,
+            connected: true,
+        });
+        assert_eq!(app.status, "");
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.paste("PING");
+        assert_eq!(app.editor.line, "");
+        app.on_worker(Event::Output(vec![
+            "123.456 [0 client] \"PING\" \"\\n\"".into(),
+            "terminal control: \x1b[31m".into(),
+        ]));
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("123.456 [0 client] \"PING\" \"\\n\"\r\n"));
+        assert!(text.contains(r"terminal control: \u{1b}[31m"));
+        assert!(!text.contains("default@"));
+        assert!(!text.contains("Background assistance"));
+        assert!(!text.contains("\x1b[31m"));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            app.workers.cancel.notified(),
+        )
+        .await
+        .expect("Ctrl-C must cancel even without CLIENT ID permission");
+        assert_eq!(app.status, "");
+        app.on_worker(Event::Connected {
+            catalog: Box::new(Catalog::bundled()),
+            config: app.config.clone(),
+            client_id: None,
+        });
+        let mut rendered = Vec::new();
+        app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("default@localhost:6379>")
+        );
+    }
+
+    #[test]
+    fn disconnected_prompt_accepts_a_new_command() {
+        let (mut app, mut executed) = test_app();
+        app.mode = Mode::Disconnected;
+        app.editor.line = "PING".into();
+        app.editor.cursor = 4;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(executed.try_recv().unwrap(), Execution::Run(args) if args == [b"PING"])
+        );
     }
 
     #[test]
@@ -2579,7 +2634,6 @@ mod tests {
             Mode::Stateful,
             Mode::Subscribed,
             Mode::Disconnected,
-            Mode::Streaming,
         ] {
             for line in ["clear", "CLEAR", "  ClEaR  ", "\"clear\""] {
                 let (mut app, mut executed) = test_app();

@@ -28,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Show MONITOR lines with Redis's quoting and hide the prompt while monitoring.
+  Ctrl-C closes the socket locally before reconnecting, avoiding cancellation
+  handshake traffic in the monitor output and removing the need for CLIENT KILL
+  permissions.
+
 - Always double-quote bulk string replies in interactive and `--no-raw`
   output, including strings inside collections, like redis-cli.
 - Accept interactive commands and additional subscriptions while subscribed,
@@ -77,6 +82,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   status appears only when a reply takes longer than 200 ms or you type.
 
 ### Changed
+
+- Reconnect interactive sessions quietly after cancellation or connection loss.
+  Failed reconnects can be retried by submitting a new command or `\reconnect`.
+  Interrupted commands are never replayed; connection-local state such as
+  transactions, WATCH, and subscriptions is not restored.
 
 - Render queued streaming output without waiting for the input poll interval.
   An interactive `KEYS` scan of 300,000 keys dropped from about 95 seconds to

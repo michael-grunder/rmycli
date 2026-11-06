@@ -306,7 +306,7 @@ async fn worker_shows_server_errors_without_library_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn worker_displays_idle_invalidations_and_preserves_session_state() {
-    use crate::worker::{Event, Execution, Workers};
+    use crate::worker::{Event, Workers};
 
     let fixture = RedisFixture::new();
     let mut writer = fixture.connection();
@@ -364,7 +364,9 @@ async fn worker_displays_idle_invalidations_and_preserves_session_state() {
             };
             assert_eq!(lines, ["-> invalidate: (nil)"]);
         }
-        // Disconnection is noticed while idle, and reconnect restores reading.
+        worker_command(&workers, "MULTI");
+        assert_eq!(worker_command(&workers, "INCR abandoned"), ["QUEUED"]);
+        // Idle disconnection reconnects without a failure event or command replay.
         redis::cmd("CLIENT")
             .arg("KILL")
             .arg("ID")
@@ -373,14 +375,10 @@ async fn worker_displays_idle_invalidations_and_preserves_session_state() {
             .unwrap();
         assert!(matches!(
             workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
-            Event::Failed(_)
-        ));
-        workers.execution.send(Execution::Reconnect).unwrap();
-        assert!(matches!(
-            workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
             Event::Connected { .. }
         ));
         assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+        assert_eq!(worker_command(&workers, "GET abandoned"), ["(nil)"]);
     }
 }
 
@@ -909,6 +907,194 @@ async fn monitor_keeps_the_session() {
                 .is_some_and(|flags| flags.contains('O'))),
         "{client}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn monitor_output_and_cancellation_reconnect_quietly() {
+    use crate::worker::{Event, Workers};
+
+    let fixture = RedisFixture::new();
+    let mut publisher = fixture.connection();
+    redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("default")
+        .arg("-client|id")
+        .arg("-client|kill")
+        .query::<()>(&mut publisher)
+        .unwrap();
+    for protocol in
+        [redis::ProtocolVersion::RESP2, redis::ProtocolVersion::RESP3]
+    {
+        let mut config = fixture.config.clone();
+        config.info = config.info.clone().set_redis_settings(
+            config.info.redis_settings().clone().set_protocol(protocol),
+        );
+        let workers = Workers::start(Session::open(config).await.unwrap());
+        assert!(matches!(
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Connected {
+                client_id: None,
+                ..
+            }
+        ));
+        assert_eq!(worker_command(&workers, "SELECT 2"), ["OK"]);
+        assert_eq!(worker_command(&workers, "MONITOR"), ["OK"]);
+        redis::cmd("ECHO")
+            .arg(b"monitor \"quote\"\\\n\xff".as_slice())
+            .query::<Vec<u8>>(&mut publisher)
+            .unwrap();
+        let Event::Output(lines) =
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected monitor output");
+        };
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].starts_with(|c: char| c.is_ascii_digit()),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].ends_with(r#""ECHO" "monitor \"quote\"\\\n\xff""#),
+            "{lines:?}"
+        );
+        workers.cancel.notify_one();
+        let Event::Connected { config, .. } =
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!(
+                "cancellation must reconnect without errors or handshake output"
+            );
+        };
+        assert_eq!(config.info.redis_settings().db(), 2);
+        assert_eq!(config.info.redis_settings().protocol(), protocol);
+        assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn interrupted_commands_reconnect_without_replay() {
+    use crate::worker::{Event, Execution, Workers};
+
+    let fixture = RedisFixture::new();
+    let mut writer = fixture.connection();
+    for cancel in [true, false] {
+        let workers = Workers::start(
+            Session::open(fixture.config.clone()).await.unwrap(),
+        );
+        let Event::Connected { client_id, .. } =
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected connection");
+        };
+        workers
+            .execution
+            .send(Execution::Run(vec![
+                b"BLPOP".to_vec(),
+                b"pending".to_vec(),
+                b"0".to_vec(),
+            ]))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let clients: String =
+                redis::cmd("CLIENT").arg("LIST").query(&mut writer).unwrap();
+            if clients.lines().any(|line| {
+                line.starts_with(&format!("id={} ", client_id.unwrap()))
+                    && line.contains("cmd=blpop")
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "BLPOP did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if cancel {
+            workers.cancel.notify_one();
+        } else {
+            redis::cmd("CLIENT")
+                .arg("KILL")
+                .arg("ID")
+                .arg(client_id.unwrap())
+                .query::<i64>(&mut writer)
+                .unwrap();
+            assert!(matches!(
+                workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+                Event::Executed {
+                    connected: false,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Connected { .. }
+        ));
+        redis::cmd("RPUSH")
+            .arg("pending")
+            .arg("untouched")
+            .query::<i64>(&mut writer)
+            .unwrap();
+        assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+        let item: String = redis::cmd("LPOP")
+            .arg("pending")
+            .query(&mut writer)
+            .unwrap();
+        assert_eq!(item, "untouched");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn failed_reconnect_retries_only_on_new_requests() {
+    use crate::worker::{Event, Execution, Workers};
+
+    let fixture = RedisFixture::new();
+    let mut writer = fixture.connection();
+    let workers =
+        Workers::start(Session::open(fixture.config.clone()).await.unwrap());
+    let Event::Connected { client_id, .. } =
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+    else {
+        panic!("expected connection");
+    };
+    let socket = fixture.path.join("redis.sock");
+    let unavailable = fixture.path.join("unavailable.sock");
+    std::fs::rename(&socket, &unavailable).unwrap();
+    redis::cmd("CLIENT")
+        .arg("KILL")
+        .arg("ID")
+        .arg(client_id.unwrap())
+        .query::<i64>(&mut writer)
+        .unwrap();
+    assert!(
+        matches!(workers.events.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Failed(message) if message.contains("Reconnect failed"))
+    );
+    assert!(
+        workers
+            .events
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    workers
+        .execution
+        .send(Execution::Run(vec![b"INCR".to_vec(), b"counter".to_vec()]))
+        .unwrap();
+    assert!(matches!(
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Event::Failed(_)
+    ));
+    std::fs::rename(&unavailable, &socket).unwrap();
+    workers
+        .execution
+        .send(Execution::Run(vec![b"PING".to_vec()]))
+        .unwrap();
+    assert!(matches!(
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Event::Connected { .. }
+    ));
+    assert!(
+        matches!(workers.events.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Executed { lines, .. } if lines == ["PONG"])
+    );
+    assert_eq!(worker_command(&workers, "GET counter"), ["(nil)"]);
+    assert_eq!(worker_command(&workers, "INCR counter"), ["(integer) 1"]);
 }
 
 #[test]
