@@ -537,7 +537,7 @@ pub fn format_reply(value: &Value) -> Vec<String> {
         Value::Nil => vec!["(nil)".into()],
         Value::Okay => vec!["OK".into()],
         Value::Int(n) => vec![format!("(integer) {n}")],
-        Value::BulkString(bytes) => vec![quote(bytes)],
+        Value::BulkString(bytes) => vec![crate::input::quote_like(bytes, "\"")],
         Value::SimpleString(s) | Value::VerbatimString { text: s, .. } => {
             vec![quote(s.as_bytes())]
         }

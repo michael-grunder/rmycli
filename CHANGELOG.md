@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Always double-quote bulk string replies in interactive and `--no-raw`
+  output, including strings inside collections, like redis-cli.
 - Accept interactive commands and additional subscriptions while subscribed,
   leaving command restrictions to Redis. Ctrl-C sends argument-free `UNSUBSCRIBE`
   without disconnecting; pattern and shard subscriptions remain active. Drain

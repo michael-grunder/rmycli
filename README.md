@@ -63,10 +63,13 @@ Command-line arguments pass through as supplied by the operating system.
 Interactive and stdin input support single/double quotes, backslash escapes,
 and `\xHH` byte escapes. Suggestions round-trip through the same parser, so
 spaces, quotes, backslashes, NULs, and non-UTF-8 key bytes remain intact.
-Formatted output escapes terminal control sequences. Redirected stdout now
-uses raw output by default, like `redis-cli`; `--no-raw` restores formatted
-output. `--raw` writes reply bytes verbatim in noninteractive mode. Redis errors
-exit noninteractive mode with a nonzero status, with or without `-e`.
+Formatted output double-quotes bulk strings, including values inside
+collections, and escapes terminal control sequences. For example, `GET foo`
+displays `"bar"`; status replies such as `OK` and `PONG` remain unquoted.
+Redirected stdout uses raw output by default, like `redis-cli`; `--no-raw`
+restores formatted output. `--raw` writes reply bytes verbatim in noninteractive
+mode. Redis errors exit noninteractive mode with a nonzero status, with or
+without `-e`.
 Server errors show the server's message without the Redis library's preamble
 (for example, `(error) syntax error` in the editor). Errors without a message
 show their server error code. Client and connection errors retain their context.

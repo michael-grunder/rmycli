@@ -220,6 +220,7 @@ fn binary_stdin_output_modes_repetition_and_eval() {
     assert_eq!(f.success(&["-D", "", "GET", "binary"], b""), bytes);
     f.success(&["-X", "payload", "SET", "binary", "payload", "XX"], b"new");
     assert_eq!(f.success(&["GET", "binary"], b""), b"new\n");
+    assert_eq!(f.success(&["--no-raw", "GET", "binary"], b""), b"\"new\"\n");
     assert_eq!(
         f.success(&["-r", "3", "-i", "0.001", "INCR", "counter"], b""),
         b"1\n2\n3\n"

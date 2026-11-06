@@ -328,6 +328,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bulk_strings_are_always_quoted_in_formatted_output() {
+        for (bytes, expected) in [
+            (b"bar".as_slice(), r#""bar""#),
+            (b"", r#""""#),
+            (b"hello world", r#""hello world""#),
+            (b"a\"b\\c", r#""a\"b\\c""#),
+            (b"\n\r\t\0\x1b\xff", r#""\n\r\t\x00\x1b\xff""#),
+        ] {
+            let reply = Value::BulkString(bytes.to_vec());
+            assert_eq!(Options::default().lines(&reply), [expected]);
+            assert_eq!(
+                Options::default().lines(&Value::Array(vec![reply.clone()])),
+                [format!("1) {expected}")]
+            );
+            for (options, terminal) in [
+                (Options::default(), true),
+                (
+                    Options {
+                        no_raw: true,
+                        ..Options::default()
+                    },
+                    false,
+                ),
+            ] {
+                let mut output = Vec::new();
+                options.write(&mut output, &reply, terminal).unwrap();
+                assert_eq!(output, format!("{expected}\n").as_bytes());
+            }
+            let mut raw = Vec::new();
+            Options::default().write(&mut raw, &reply, false).unwrap();
+            assert_eq!(raw, [bytes, b"\n"].concat());
+        }
+        for (reply, expected) in [
+            (Value::Okay, "OK"),
+            (Value::SimpleString("PONG".into()), "PONG"),
+            (Value::SimpleString("QUEUED".into()), "QUEUED"),
+        ] {
+            assert_eq!(Options::default().lines(&reply), [expected]);
+        }
+    }
+
+    #[test]
     fn server_errors_show_messages_or_codes_in_every_format() {
         for (wire, message) in [
             ("-ERR syntax error\r\n", "syntax error"),

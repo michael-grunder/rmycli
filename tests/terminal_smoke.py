@@ -272,7 +272,7 @@ def encrypted_auth_smoke(directory, socket, settings, terminals):
     ])
     terminals.append(restored)
     restored.send(b"ACL WHOAMI\r")
-    restored.expect_frame(lambda f: f.row(f.y - 1) == "qa", "encrypted auth reused")
+    restored.expect_frame(lambda f: f.row(f.y - 1) == '"qa"', "encrypted auth reused")
     auth_command(directory, "passwd", [("Master passphrase: ", b"first-master-secret")], success=False)
     auth_command(directory, "passwd", [
         ("Master passphrase: ", b"second-master-secret"),
@@ -722,12 +722,12 @@ def main():
             redis("PUBLISH", "channel", "after-idle")
             terminal.expect("after-idle")
             terminal.send(b"SUBSCRIBE second third channel\r")
-            terminal.expect("2) third")
+            terminal.expect('2) "third"')
             terminal.expect_frame(lambda f: "Background assistance paused" in f.row(f.y), "additional subscriptions acknowledged")
             terminal.send(b"GET missing\r")
             terminal.expect("(error)")
             terminal.send(b"PING subscribed-marker\r")
-            terminal.expect("2) subscribed-marker")
+            terminal.expect('2) "subscribed-marker"')
             redis("PUBLISH", "third", "additional-channel-message")
             terminal.expect("additional-channel-message")
             terminal.send(b"\x03")
@@ -752,12 +752,12 @@ def main():
             third.send(b"\x1b\x15PING\r")
             third.expect("PONG")
             third.send(b"SUBSCRIBE resp3-first resp3-second\r")
-            third.expect("2) resp3-second")
+            third.expect('2) "resp3-second"')
             third.expect_frame(lambda f: "Background assistance paused" in f.row(f.y), "RESP3 subscriptions acknowledged")
             third.send(b"SET subscribed-key subscribed-value\r")
             third.expect_frame(lambda f: f.row(f.y - 1) == "OK", "RESP3 command while subscribed")
             third.send(b"SUBSCRIBE resp3-third\r")
-            third.expect("2) resp3-third")
+            third.expect('2) "resp3-third"')
             third.expect_frame(lambda f: "Background assistance paused" in f.row(f.y), "additional RESP3 subscription acknowledged")
             redis("PUBLISH", "resp3-third", "resp3-message")
             third.expect("resp3-message")
@@ -765,7 +765,7 @@ def main():
             third.expect("unsubscribe")
             third.expect_frame(lambda f: f.row(f.y) == f"default@{socket} ❯" and not f.row(f.y + 1), "RESP3 unsubscribed prompt")
             third.send(b"GET subscribed-key\r")
-            third.expect_frame(lambda f: f.row(f.y - 1) == "subscribed-value", "GET after unsubscribing")
+            third.expect_frame(lambda f: f.row(f.y - 1) == '"subscribed-value"', "GET after unsubscribing")
 
             # Enable TCP on this isolated server for a saved instance.
             with sockets.socket() as listener:
@@ -787,7 +787,7 @@ def main():
                                   env=auth_env, endpoint=f"127.0.0.1:{port}", user="qa")
             terminals.append(configured)
             configured.send(b"ACL WHOAMI\r")
-            configured.expect_frame(lambda f: any(f.row(y) == "qa" for y in range(f.y)),
+            configured.expect_frame(lambda f: any(f.row(y) == '"qa"' for y in range(f.y)),
                                     "saved instance authenticated as qa")
             configured.send(b"get")
             configured.expect_frame(
@@ -815,7 +815,7 @@ def main():
             configured.send(b"\x15LRANGE list:a\t")
             configured.expect("1 matches")
             configured.send(b"\x15LRANGE list:a 0 -1\r")
-            configured.expect_frame(lambda f: any(f.row(y) == "1) a" for y in range(f.y)),
+            configured.expect_frame(lambda f: any(f.row(y) == '1) "a"' for y in range(f.y)),
                                     "authenticated execution and auxiliary requests")
             auth_settings = Path(directory) / "auth-settings.toml"
             auth_settings.write_text('save-auth = "local"\n')
@@ -847,7 +847,7 @@ def main():
                                 env={"XDG_CONFIG_HOME": directory}, user="qa")
             terminals.append(restored)
             restored.send(b"ACL WHOAMI\r")
-            restored.expect_frame(lambda f: f.row(f.y - 1) == "qa", "saved auth reused")
+            restored.expect_frame(lambda f: f.row(f.y - 1) == '"qa"', "saved auth reused")
             encrypted_auth_smoke(directory, socket, auth_settings, terminals)
             print("Terminal and CLI smoke tests passed")
         finally:
