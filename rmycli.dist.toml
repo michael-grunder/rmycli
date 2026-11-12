@@ -12,7 +12,7 @@
 #
 # All settings are optional. Unknown fields and invalid values are errors.
 # Uncomment examples as needed; do not define the same setting twice.
-# Cluster detection, history, prompt, theme, instance, and auth settings live here.
+# Protocol, cluster, history, prompt, theme, instance, and auth settings live here.
 # Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
 # command-line options. See README.md and rmycli --help.
 #
@@ -23,6 +23,13 @@
 # Color reads and updates include a colored sample in terminals.
 # --color always forces previews; --color never suppresses them.
 # Automatic previews respect NO_COLOR and are omitted from piped output.
+
+# Protocol version for the main connection: 2 (default) or 3 (HELLO 3).
+# Instances inherit this value unless they set their own resp integer.
+# -2/-3 override configuration; --json/--quoted-json select RESP3 unless -2.
+# Auxiliary connections use RESP2 independently.
+#   rmycli config set resp 3
+resp = 2
 
 # Detect cluster mode after connecting and follow MOVED/ASK redirects.
 # false disables automatic detection; -c still explicitly enables redirects.
@@ -181,6 +188,11 @@ host = "127.0.0.1" # Nonempty hostname or IP address.
 port = 6379        # Integer from 1 through 65535.
 db = 0             # Nonnegative database number.
 tls = false        # true enables TLS with certificate verification.
+
+# Omit to inherit the global resp setting; use 2 or 3 to override it.
+# resp = 3
+#   rmycli config set instances.local.resp 3
+#   rmycli config unset instances.local.resp
 
 # Redis ACL username. Omit for the default user/password-only authentication.
 # user = "alice"

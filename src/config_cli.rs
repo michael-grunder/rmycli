@@ -209,6 +209,7 @@ impl SettingKey {
             ["auto-cluster" | "history-per-server" | "encrypt-auth"] => {
                 Kind::Boolean
             }
+            ["resp"] => Kind::Integer,
             ["save-auth"] => Kind::SaveAuth,
             ["prompt"] => Kind::String,
             ["theme", "inline-hint"] => Kind::Color,
@@ -218,7 +219,7 @@ impl SettingKey {
             ["instances", name, field] if !name.trim().is_empty() => {
                 match *field {
                     "host" | "user" | "password-env" => Kind::String,
-                    "port" | "db" => Kind::Integer,
+                    "port" | "db" | "resp" => Kind::Integer,
                     "tls" => Kind::Boolean,
                     "password" => Kind::Password,
                     _ => return Err(format!("unknown setting {key:?}").into()),
@@ -312,6 +313,9 @@ impl SettingKey {
         if self.parts == ["prompt"] {
             return Ok(settings.prompt.source().to_owned());
         }
+        if self.parts == ["resp"] {
+            return Ok(settings.resp.to_string());
+        }
         if self.parts == ["auto-cluster"] {
             return Ok(settings.auto_cluster.to_string());
         }
@@ -338,6 +342,7 @@ impl SettingKey {
             "port" => Ok("6379".into()),
             "db" => Ok("0".into()),
             "tls" => Ok("false".into()),
+            "resp" => Ok(settings.resp.to_string()),
             _ => Err("setting is not set".into()),
         }
     }

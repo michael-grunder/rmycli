@@ -136,6 +136,39 @@ fn boolean_settings_can_be_read_disabled_and_reset() {
     }
 }
 
+#[test]
+fn instance_protocol_setting_inherits_and_can_be_reset() {
+    let fixture = Fixture::new();
+    fixture.write("user/rmycli.toml", "[instances.qa]\n");
+    let key = "instances.qa.resp";
+    assert_eq!(success(&mut fixture.config(&["get", "resp"])), "2\n");
+    assert_eq!(success(&mut fixture.config(&["get", key])), "2\n");
+    assert_eq!(success(&mut fixture.config(&["set", "resp", "3"])), "3\n");
+    assert_eq!(success(&mut fixture.config(&["get", "resp"])), "3\n");
+    assert_eq!(success(&mut fixture.config(&["get", key])), "3\n");
+    assert_eq!(success(&mut fixture.config(&["set", key, "2"])), "2\n");
+    assert_eq!(success(&mut fixture.config(&["get", key])), "2\n");
+    let path = fixture.0.join("user/rmycli.toml");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    for setting in ["resp", key] {
+        for invalid in ["true", "false", "'3'", "3.0", "-1", "0", "1", "4"] {
+            error(&mut fixture.config(&["set", setting, invalid]));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        }
+    }
+    success(&mut fixture.config(&["unset", key]));
+    assert_eq!(success(&mut fixture.config(&["get", key])), "3\n");
+    success(&mut fixture.config(&["unset", "resp"]));
+    assert_eq!(success(&mut fixture.config(&["get", "resp"])), "2\n");
+    assert_eq!(success(&mut fixture.config(&["get", key])), "2\n");
+    success(&mut fixture.config(&["set", key, "3"]));
+    assert_eq!(success(&mut fixture.config(&["get", key])), "3\n");
+    assert!(
+        error(&mut fixture.config(&["get", "instances.missing.resp"]))
+            .contains("unknown instance")
+    );
+}
+
 fn assert_path_error(command: &mut Command, path: &Path, expected: &str) {
     let error = error(command);
     assert!(error.contains(path.to_str().unwrap()), "{error}");

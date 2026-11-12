@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Global numeric `resp` configuration (`2` or `3`, default `2`) with per-instance
+  overrides, replacing the unreleased `resp3` boolean. Instances inherit
+  the global default when omitted; `-2` and `-3` override configuration.
+  Read, set, or restore inheritance with `config get/set/unset`.
+
 - Dynamic shell completions for Bash, Zsh, Fish, PowerShell, and Elvish using
   clap's command-line definitions. Complete configured instance names and local
   saved usernames for the selected endpoint, including partial names. Completion

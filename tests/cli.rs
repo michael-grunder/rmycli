@@ -163,6 +163,34 @@ fn help_examples_version_and_invalid_switches_need_no_server() {
 }
 
 #[test]
+fn configured_protocol_is_negotiated_and_no_config_restores_resp2() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.dir.path().join("rmycli.toml"), "resp = 3\n")
+        .unwrap();
+    for (flags, expected) in
+        [(vec![], "3"), (vec!["-2"], "2"), (vec!["--no-config"], "2")]
+    {
+        let output = Command::new(env!("CARGO_BIN_EXE_rmycli"))
+            .env_remove("REDIS_URL")
+            .env_remove("REDISCLI_AUTH")
+            .env("XDG_CONFIG_HOME", fixture.dir.path())
+            .arg("-s")
+            .arg(&fixture.socket)
+            .args(flags)
+            .args(["CLIENT", "INFO"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let reply = String::from_utf8(output.stdout).unwrap();
+        assert!(reply.contains(&format!("resp={expected}")), "{reply}");
+    }
+}
+
+#[test]
 fn protocols_auth_database_and_client_name() {
     let f = Fixture::new();
     for (flags, expected) in [

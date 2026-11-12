@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, de::Error};
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Settings {
+    pub resp: u8,
     pub auto_cluster: bool,
     pub history_per_server: bool,
     pub prompt: crate::prompt::Prompt,
@@ -21,6 +22,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            resp: 2,
             auto_cluster: true,
             history_per_server: true,
             prompt: crate::prompt::Prompt::default(),
@@ -80,6 +82,7 @@ impl Settings {
         // Do not print the source excerpt: it may contain credentials.
         let settings: Self = toml::from_str(source)
             .map_err(|error: toml::de::Error| error.message().to_owned())?;
+        validate_resp(settings.resp)?;
         for (name, instance) in &settings.instances {
             if name.trim().is_empty() {
                 return Err("instance names must not be empty".into());
@@ -89,6 +92,14 @@ impl Settings {
                 .map_err(|error| format!("instance {name:?}: {error}"))?;
         }
         Ok(settings)
+    }
+}
+
+const fn validate_resp(version: u8) -> Result<(), &'static str> {
+    if matches!(version, 2 | 3) {
+        Ok(())
+    } else {
+        Err("resp must be 2 or 3")
     }
 }
 
@@ -157,6 +168,7 @@ pub fn normalize_command(name: &str) -> String {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Instance {
+    pub resp: Option<u8>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub db: Option<i64>,
@@ -168,6 +180,9 @@ pub struct Instance {
 
 impl Instance {
     fn validate(&self) -> Result<(), &'static str> {
+        if let Some(resp) = self.resp {
+            validate_resp(resp)?;
+        }
         if self
             .host
             .as_ref()
@@ -225,6 +240,9 @@ mod tests {
     #[test]
     fn defaults_and_partial_settings() {
         let settings = Settings::parse("").unwrap();
+        assert_eq!(settings.resp, 2);
+        assert_eq!(Settings::parse("resp = 2").unwrap().resp, 2);
+        assert_eq!(Settings::parse("resp = 3").unwrap().resp, 3);
         assert!(!settings.encrypt_auth);
         assert!(Settings::parse("encrypt-auth = true").unwrap().encrypt_auth);
         assert!(settings.auto_cluster);
@@ -270,6 +288,8 @@ mod tests {
     fn invalid_settings_are_rejected() {
         for source in [
             "unknown = true",
+            "resp3 = true",
+            "[instances.qa]\nresp3 = false",
             "encrypt-auth = 'yes'",
             "auto-cluster = 'false'",
             "auto-cluster = 1",
@@ -293,6 +313,22 @@ mod tests {
             "[broken",
         ] {
             assert!(Settings::parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn protocol_versions_require_supported_integers() {
+        for prefix in ["", "[instances.qa]\n"] {
+            for value in [
+                "true", "false", "'2'", "'3'", "2.0", "-1", "0", "1", "4",
+                "256",
+            ] {
+                let source = format!("{prefix}resp = {value}");
+                assert!(Settings::parse(&source).is_err(), "{source}");
+            }
+            let error =
+                Settings::parse(&format!("{prefix}resp = 4")).err().unwrap();
+            assert!(error.contains("resp must be 2 or 3"), "{error}");
         }
     }
 

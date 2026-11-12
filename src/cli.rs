@@ -109,10 +109,10 @@ pub struct Options {
     pub yes: bool,
     #[command(flatten, next_help_heading = "Output")]
     pub output: crate::output::Options,
-    /// Start in RESP2 protocol mode (default)
+    /// Start in RESP2 protocol mode, overriding configuration
     #[arg(short = '2', conflicts_with = "resp3", help_heading = "Connection")]
     pub resp2: bool,
-    /// Start in RESP3 protocol mode (HELLO 3)
+    /// Start in RESP3 protocol mode (HELLO 3), overriding configuration
     #[arg(short = '3', conflicts_with = "resp2", help_heading = "Connection")]
     pub resp3: bool,
     /// Prompt for a password without echo; overrides all other passwords
@@ -218,7 +218,11 @@ impl Options {
         let mut redis = info.redis_settings().clone();
         if self.resp2 {
             redis = redis.set_protocol(redis::ProtocolVersion::RESP2);
-        } else if self.resp3 || self.output.json || self.output.quoted_json {
+        } else if self.resp3
+            || self.output.json
+            || self.output.quoted_json
+            || instance.resp.unwrap_or(settings.resp) == 3
+        {
             redis = redis.set_protocol(redis::ProtocolVersion::RESP3);
         }
         if let Some(db) = self.db.or(instance.db) {
@@ -334,6 +338,48 @@ mod tests {
              db = 2\nuser = 'alice'\npassword = 'qa-secret'\ntls = true",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn protocol_defaults_inherit_and_explicit_flags_win() {
+        use redis::ProtocolVersion::{RESP2, RESP3};
+
+        for global in ["", "resp = 2", "resp = 3"] {
+            let settings = config::Settings::parse(&format!(
+                "{global}\n[instances.inherited]\n\
+                 [instances.two]\nresp = 2\n\
+                 [instances.three]\nresp = 3"
+            ))
+            .unwrap();
+            for (instance, configured) in [
+                (None, settings.resp),
+                (Some("inherited"), settings.resp),
+                (Some("two"), 2),
+                (Some("three"), 3),
+            ] {
+                for (flags, expected) in [
+                    (vec![], if configured == 3 { RESP3 } else { RESP2 }),
+                    (vec!["-2"], RESP2),
+                    (vec!["-3"], RESP3),
+                    (vec!["--json"], RESP3),
+                    (vec!["--quoted-json"], RESP3),
+                    (vec!["--json", "-2"], RESP2),
+                    (vec!["--quoted-json", "-2"], RESP2),
+                ] {
+                    let mut args = vec!["rmycli"];
+                    if let Some(instance) = instance {
+                        args.extend(["--instance", instance]);
+                    }
+                    args.extend(flags);
+                    let config = options(&args).config(&settings).unwrap();
+                    assert_eq!(
+                        config.info.redis_settings().protocol(),
+                        expected,
+                        "{global:?}: {args:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

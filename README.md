@@ -175,9 +175,11 @@ rmycli --eval script.lua key1 key2 , arg1 arg2
 rmycli --scan --pattern 'user:*' --count 100
 ```
 
-- RESP2 remains the default. `-3` negotiates RESP3 on connection; `--json`
-  and `--quoted-json` also select RESP3 unless `-2` is given. `-2` and `-3`
-  together are rejected. Auxiliary connections use RESP2 independently.
+- RESP2 remains the built-in default. Set `resp = 3` globally or in a
+  selected instance to negotiate RESP3 on connection. `-2` and `-3` override
+  configuration; `--json` and `--quoted-json` also select RESP3 unless `-2`
+  is given. `-2` and `-3` together are rejected. Auxiliary connections use
+  RESP2 independently.
 - `--pass`/`-a` takes precedence over `REDISCLI_AUTH`; `--askpass` overrides
   every password source. The prompt requires terminal stdin and disables echo;
   it cannot be combined with `-x`/`-X`. Use `REDISCLI_AUTH` with piped input.
@@ -294,6 +296,8 @@ file is not loaded automatically.
 For a shorter example, create `~/.config/rmycli.toml`:
 
 ```toml
+resp = 3
+
 [theme]
 inline-hint = "dark_grey"
 
@@ -310,6 +314,7 @@ db = 0
 user = "alice"
 password-env = "QA_REDIS_PASSWORD"
 tls = false
+resp = 2 # Override the global default for this instance.
 ```
 
 Select an instance with `rmycli --instance qa` (also works with a command, such
@@ -330,8 +335,22 @@ Explicit `-h`, `-p`, `-n`, `--user`, and `-a`/`--pass` override the selected ins
 values. `REDISCLI_AUTH` overrides its password too; `-a` takes precedence over
 that environment variable. `--tls` can enable TLS on an instance. `--instance`
 cannot be combined with `-u`/`REDIS_URL` or `-s`; unset `REDIS_URL` before
-selecting an instance. Without `--instance`, connection behavior is unchanged.
+selecting an instance. Without `--instance`, only global settings apply.
 Connection timeouts and discovery/reply limits remain command-line options.
+
+The top-level `resp` integer defaults to `2`; supported values are `2` and `3`.
+Set it **before any TOML table headings** to choose the protocol for connections.
+Each `[instances.NAME]` can set `resp = 2` or `resp = 3`; omitting it inherits
+the global value. Other versions, strings, and booleans are rejected.
+These settings apply to the main connection. Explicit `-2`/`-3` take precedence,
+and JSON output selects RESP3 unless `-2` is given. Manage the settings with:
+
+```sh
+rmycli config set resp 3
+rmycli config set instances.qa.resp 2
+rmycli config get instances.qa.resp
+rmycli config unset instances.qa.resp # Restore global inheritance.
+```
 
 ### Prompt customization
 
