@@ -572,6 +572,31 @@ mod tests {
     }
 
     #[test]
+    fn raw_maps_preserve_nested_bulk_bytes_and_delimiters() {
+        let reply = Value::Map(vec![(
+            Value::BulkString(b"k\0\xff".to_vec()),
+            Value::Attribute {
+                data: Box::new(Value::Array(vec![
+                    Value::BulkString(b"\"v\"\n\x1b".to_vec()),
+                    Value::BulkString(vec![]),
+                ])),
+                attributes: vec![],
+            },
+        )]);
+        for options in [
+            Options::default(),
+            Options {
+                raw: true,
+                ..Options::default()
+            },
+        ] {
+            let mut bytes = Vec::new();
+            options.write(&mut bytes, &reply, false).unwrap();
+            assert_eq!(bytes, b"k\0\xff \"v\"\n\x1b\n\n");
+        }
+    }
+
+    #[test]
     fn structured_formats_handle_resp3_and_binary_strings() {
         let value = Value::Map(vec![(
             Value::Int(1),

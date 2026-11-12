@@ -28,6 +28,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Render RESP3 maps as numbered `key => value` pairs, distinguish set entries
+  with `~`, and align collection indexes and nested replies.
+
 - Show MONITOR lines with Redis's quoting and hide the prompt while monitoring.
   Ctrl-C closes the socket locally before reconnecting, avoiding cancellation
   handshake traffic in the monitor output and removing the need for CLIENT KILL

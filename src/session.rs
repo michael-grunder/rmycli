@@ -541,44 +541,27 @@ pub fn format_reply(value: &Value) -> Vec<String> {
         Value::SimpleString(s) | Value::VerbatimString { text: s, .. } => {
             vec![quote(s.as_bytes())]
         }
-        Value::Set(values) if values.is_empty() => {
-            vec!["(empty set)".into()]
+        Value::Array(values) | Value::Push { data: values, .. } => {
+            format_collection(values.iter().map(format_reply), ')', "array")
         }
-        Value::Map(entries) if entries.is_empty() => {
-            vec!["(empty hash)".into()]
+        Value::Set(values) => {
+            format_collection(values.iter().map(format_reply), '~', "set")
         }
-        Value::Array(values)
-        | Value::Set(values)
-        | Value::Push { data: values, .. } => {
-            if values.is_empty() {
-                return vec!["(empty array)".into()];
-            }
-            values
-                .iter()
-                .enumerate()
-                .flat_map(|(index, value)| {
-                    let label = format!("{}) ", index + 1);
-                    let indent = " ".repeat(label.len());
-                    format_reply(value).into_iter().enumerate().map(
-                        move |(line, text)| {
-                            let prefix =
-                                if line == 0 { &label } else { &indent };
-                            format!("{prefix}{text}")
-                        },
-                    )
-                })
-                .collect()
-        }
-        Value::Map(entries) => entries
-            .iter()
-            .flat_map(|(k, v)| {
-                let mut result = format_reply(k);
-                result.extend(
-                    format_reply(v).into_iter().map(|line| format!("  {line}")),
-                );
-                result
-            })
-            .collect(),
+        Value::Map(entries) => format_collection(
+            entries.iter().map(|(key, value)| {
+                let mut lines = format_reply(key);
+                let last = lines.last_mut().expect("replies have a line");
+                last.push_str(" => ");
+                let mut values = format_reply(value).into_iter();
+                if !starts_numbered_sequence(value) {
+                    last.push_str(&values.next().expect("replies have a line"));
+                }
+                lines.extend(values);
+                lines
+            }),
+            '#',
+            "hash",
+        ),
         Value::Attribute { data, .. } => format_reply(data),
         Value::Double(n) => vec![format!("(double) {n}")],
         Value::Boolean(b) => vec![format!("(boolean) {b}")],
@@ -598,6 +581,41 @@ pub fn format_reply(value: &Value) -> Vec<String> {
         )],
         _ => vec!["(unsupported Redis reply type)".into()],
     }
+}
+
+fn starts_numbered_sequence(value: &Value) -> bool {
+    match value {
+        Value::Array(values)
+        | Value::Set(values)
+        | Value::Push { data: values, .. } => !values.is_empty(),
+        Value::Attribute { data, .. } => starts_numbered_sequence(data),
+        _ => false,
+    }
+}
+
+fn format_collection(
+    entries: impl ExactSizeIterator<Item = Vec<String>>,
+    marker: char,
+    kind: &str,
+) -> Vec<String> {
+    if entries.len() == 0 {
+        return vec![format!("(empty {kind})")];
+    }
+    let width = entries.len().to_string().len();
+    let indent = " ".repeat(width + 2);
+    entries
+        .enumerate()
+        .flat_map(|(index, lines)| {
+            let indent = &indent;
+            lines.into_iter().enumerate().map(move |(line, text)| {
+                if line == 0 {
+                    format!("{:>width$}{marker} {text}", index + 1)
+                } else {
+                    format!("{indent}{text}")
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1399,5 +1417,94 @@ mod tests {
         ] {
             assert!(redirect_address(&mut addr, target).is_err(), "{target}");
         }
+    }
+
+    fn bulk(text: &str) -> Value {
+        Value::BulkString(text.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn bulk_replies_are_always_quoted_and_binary_safe() {
+        assert_eq!(format_reply(&bulk("bar")), [r#""bar""#]);
+        assert_eq!(format_reply(&bulk("")), [r#""""#]);
+        assert_eq!(
+            format_reply(&Value::BulkString(
+                b"a\"\\\n\r\t\0\x1b\x7f\xff".to_vec()
+            )),
+            [r#""a\"\\\n\r\t\x00\x1b\x7f\xff""#]
+        );
+        assert_eq!(format_reply(&bulk("é")), [r#""\xc3\xa9""#]);
+        assert_eq!(format_reply(&Value::Okay), ["OK"]);
+        assert_eq!(
+            format_reply(&Value::SimpleString("QUEUED".into())),
+            ["QUEUED"]
+        );
+    }
+
+    #[test]
+    fn maps_number_key_value_pairs() {
+        let map = Value::Map(vec![
+            (bulk("k1"), bulk("v1")),
+            (bulk("k2"), bulk("v2")),
+            (bulk("k3"), bulk("v3")),
+        ]);
+        assert_eq!(
+            format_reply(&map),
+            [
+                r#"1# "k1" => "v1""#,
+                r#"2# "k2" => "v2""#,
+                r#"3# "k3" => "v3""#,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_collections_and_sets_identify_their_types() {
+        assert_eq!(format_reply(&Value::Map(vec![])), ["(empty hash)"]);
+        assert_eq!(format_reply(&Value::Set(vec![])), ["(empty set)"]);
+        assert_eq!(format_reply(&Value::Array(vec![])), ["(empty array)"]);
+        assert_eq!(
+            format_reply(&Value::Set(vec![bulk("a"), bulk("b")])),
+            [r#"1~ "a""#, r#"2~ "b""#]
+        );
+    }
+
+    #[test]
+    fn nested_maps_and_sequences_preserve_structure() {
+        let map = Value::Map(vec![
+            (bulk("a"), Value::Array(vec![bulk("x"), bulk("y")])),
+            (bulk("b"), Value::Map(vec![(bulk("k"), bulk("v"))])),
+            (Value::Array(vec![Value::Int(1), Value::Int(2)]), Value::Nil),
+            (bulk("empty"), Value::Map(vec![])),
+        ]);
+        assert_eq!(
+            format_reply(&Value::Array(vec![map, bulk("tail")])),
+            [
+                r#"1) 1# "a" => "#,
+                r#"      1) "x""#,
+                r#"      2) "y""#,
+                r#"   2# "b" => 1# "k" => "v""#,
+                "   3# 1) (integer) 1",
+                "      2) (integer) 2 => (nil)",
+                r#"   4# "empty" => (empty hash)"#,
+                r#"2) "tail""#,
+            ]
+        );
+    }
+
+    #[test]
+    fn collection_numbering_aligns_nested_lines_after_nine_entries() {
+        let map = Value::Map(
+            (1..=10)
+                .map(|n| {
+                    (Value::Int(n), Value::Array(vec![bulk("a"), bulk("b")]))
+                })
+                .collect(),
+        );
+        let lines = format_reply(&map);
+        assert_eq!(lines[0], " 1# (integer) 1 => ");
+        assert_eq!(lines[1], r#"    1) "a""#);
+        assert_eq!(lines[27], "10# (integer) 10 => ");
+        assert_eq!(lines[29], r#"    2) "b""#);
     }
 }

@@ -479,7 +479,14 @@ def main():
             assert cli("PING").stdout == b"PONG\n"
             assert b"maxmemory" in cli("CONFIG", "GET", "maxmemory").stdout
             assert cli("SET", "binary", "a b").returncode == 0
+            assert cli("--no-raw", "GET", "binary").stdout == b'"a b"\n'
             assert cli("--raw", "GET", "binary").stdout == b"a b\n"
+            redis("HSET", "hash", "k1", "v1", "k2", "v2", "k3", "v3")
+            formatted_map = b'1# "k1" => "v1"\n2# "k2" => "v2"\n3# "k3" => "v3"\n'
+            assert cli("--no-raw", stdin=b"HELLO 3\nHGETALL hash\n").stdout.endswith(formatted_map)
+            assert cli("--raw", stdin=b"HELLO 3\nHGETALL hash\n").stdout.endswith(
+                b"k1 v1\nk2 v2\nk3 v3\n"
+            )
             assert cli("--reply-threshold", "1", "LRANGE", "list:a", "0", "-1").returncode == 1
             assert cli("--yes", "--reply-threshold", "1", "LRANGE", "list:a", "0", "-1").returncode == 0
             assert b"PONG" in cli(stdin=b"MULTI\nPING\nEXEC\n").stdout
@@ -663,6 +670,34 @@ def main():
             )
             assert frame.y == 9
             assert frame.row(6) == "previous shell output"
+            terminal.send(b"SET foo bar\r")
+            terminal.expect_frame(
+                lambda f: f.row(f.y - 1) == "OK" and f.row(f.y) == f"default@{socket} ❯",
+                "status replies stay unquoted",
+            )
+            terminal.send(b"GET foo\r")
+            terminal.expect_frame(
+                lambda f: f.row(f.y - 1) == '"bar"' and f.row(f.y) == f"default@{socket} ❯",
+                "bulk string replies are quoted",
+            )
+            terminal.send(b"HELLO 3\r")
+            terminal.expect_frame(
+                lambda f: f.row(f.y) == f"default@{socket} ❯" and '=> ' in f.row(f.y - 1),
+                "RESP3 negotiation renders a map",
+            )
+            terminal.send(b"HGETALL hash\r")
+            terminal.expect_frame(
+                lambda f: f.row(f.y) == f"default@{socket} ❯"
+                and [f.row(f.y - offset) for offset in (3, 2, 1)]
+                == ['1# "k1" => "v1"', '2# "k2" => "v2"', '3# "k3" => "v3"'],
+                "RESP3 hashes render numbered key/value pairs",
+            )
+            terminal.send(b"HELLO 2\r")
+            terminal.expect_frame(
+                lambda f: f.row(f.y) == f"default@{socket} ❯"
+                and f.row(f.y - 1).endswith("(empty array)"),
+                "restore RESP2 for the remaining terminal checks",
+            )
             terminal.send(b"clear\r")
             terminal.expect_frame(
                 lambda f: f.row(f.y) == f"default@{socket} ❯"

@@ -66,6 +66,8 @@ spaces, quotes, backslashes, NULs, and non-UTF-8 key bytes remain intact.
 Formatted output double-quotes bulk strings, including values inside
 collections, and escapes terminal control sequences. For example, `GET foo`
 displays `"bar"`; status replies such as `OK` and `PONG` remain unquoted.
+RESP3 maps use numbered `1# "key" => "value"` entries; sets use `1~` and
+arrays use `1)`, with nested replies indented and empty collections labeled.
 Redirected stdout uses raw output by default, like `redis-cli`; `--no-raw`
 restores formatted output. `--raw` writes reply bytes verbatim in noninteractive
 mode. Redis errors exit noninteractive mode with a nonzero status, with or
