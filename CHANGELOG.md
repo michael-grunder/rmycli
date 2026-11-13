@@ -33,6 +33,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Ctrl-C at an idle prompt now exits like `redis-cli` instead of clearing
+  the input. It still stops scans, unsubscribes while subscribed, and cancels
+  executing commands without exiting.
 - Render RESP3 maps as numbered `key => value` pairs, distinguish set entries
   with `~`, and align collection indexes and nested replies.
 

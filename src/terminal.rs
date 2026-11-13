@@ -788,16 +788,13 @@ impl App {
                     self.start_history_search();
                     return false;
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('c') if self.cancel() => return false,
+                KeyCode::Char('c' | 'd') => {
                     if let Some(cancelled) = &self.listing {
                         cancelled.store(true, Ordering::Relaxed);
                     }
                     self.workers.invalidate();
                     return true;
-                }
-                KeyCode::Char('c') => {
-                    self.cancel();
-                    return false;
                 }
                 KeyCode::Char('a') => {
                     self.invalidate();
@@ -975,7 +972,8 @@ impl App {
         }
     }
 
-    fn cancel(&mut self) {
+    /// Interrupts active work; returns false when idle so Ctrl-C exits.
+    fn cancel(&mut self) -> bool {
         self.invalidate();
         if let Some(cancelled) = &self.listing {
             cancelled.store(true, Ordering::Relaxed);
@@ -993,9 +991,9 @@ impl App {
             self.status.clear();
             self.busy_until = Some(Instant::now() + BUSY_PROMPT_DELAY);
         } else {
-            self.editor.line.clear();
-            self.editor.cursor = 0;
+            return false;
         }
+        true
     }
 
     fn help_key(&mut self, code: KeyCode) -> bool {
@@ -1342,7 +1340,7 @@ impl App {
             "F1: command and editor help; PgUp/PgDn: scroll help; Ctrl-D or \\quit: exit".into(),
             "CLEAR or Ctrl-L: clear the screen; terminal scrollback retains output".into(),
             "\\auth lock|unlock|passwd: manage the encrypted credential store".into(),
-            "\\reconnect: new connection and refreshed metadata; Ctrl-C: cancel input or close active connection".into(),
+            "\\reconnect: new connection and refreshed metadata; Ctrl-C: close active connection, or exit when idle".into(),
         ]
     }
 
@@ -2237,6 +2235,19 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
         assert_eq!(app.editor.line, "KEYS foo:*");
         assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
+    fn ctrl_c_exits_only_when_idle() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let (mut app, _executed) = test_app();
+        app.editor.insert("GET key");
+        assert!(app.on_key(ctrl_c));
+        for mode in [Mode::Subscribed, Mode::Busy] {
+            let (mut app, _executed) = test_app();
+            app.mode = mode;
+            assert!(!app.on_key(ctrl_c));
+        }
     }
 
     #[test]

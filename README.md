@@ -721,7 +721,7 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | PageUp / PageDown, Up / Down with help open | Scroll the help panel |
 | Enter with help open | Close help without submitting input |
 | `CLEAR`, Ctrl-L | Clear the screen locally without sending a Redis command |
-| Ctrl-C | Stop alternate `KEYS` scanning; send `UNSUBSCRIBE` while subscribed; otherwise clear input or close an executing/streaming connection |
+| Ctrl-C | Stop alternate `KEYS` scanning; send `UNSUBSCRIBE` while subscribed; close an executing/streaming connection; otherwise exit |
 | Ctrl-D, `\quit`, `\q`, `QUIT`, `EXIT` | Exit |
 | `HELP command`, `HELP @group` | Full command help or commands in a group |
 | `HELP`, `\help` | Open editor help and connection details |
