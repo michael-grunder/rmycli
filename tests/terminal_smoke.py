@@ -855,8 +855,15 @@ def main():
                 "subcommand color overrides parent command",
             )
             configured.send(b"\x15xgroup destroy")
+            # Redis versions use either "groupname" or "group" here. Check
+            # the live argument labels while still verifying color and cursor.
+            destroy_docs = redis("COMMAND", "DOCS", "XGROUP|DESTROY")["xgroup|destroy"]
+            destroy_hint = " " + " ".join(
+                arg.get("display_text", arg["name"])
+                for arg in destroy_docs["arguments"]
+            )
             configured.expect_frame(
-                lambda f: f.hint_is_inline("xgroup destroy", " key group", ("92", "38;5;10")),
+                lambda f: f.hint_is_inline("xgroup destroy", destroy_hint, ("92", "38;5;10")),
                 "subcommand inherits parent color",
             )
             # Disabling the default account makes missing auxiliary auth fail.

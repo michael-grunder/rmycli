@@ -46,6 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Derive the terminal smoke test's `XGROUP DESTROY` hint expectation from
+  live command metadata, accommodating Redis versions that label the group
+  argument `groupname` instead of `group` while retaining color and cursor checks.
+
 - Ctrl-C at an idle prompt now exits like `redis-cli` instead of clearing
   the input. It still stops scans, unsubscribes while subscribed, and cancels
   executing commands without exiting.
