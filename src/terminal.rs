@@ -1564,15 +1564,7 @@ fn draw_line(
 }
 
 fn safe(text: &str) -> String {
-    text.chars()
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
+    input::escape_controls(text)
 }
 
 fn truncate(text: &str, width: usize) -> String {

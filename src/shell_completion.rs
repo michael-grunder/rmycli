@@ -80,10 +80,8 @@ pub fn users(current: &OsStr) -> Vec<CompletionCandidate> {
             .unwrap_or_default();
     if options.set_default_user.is_none()
         && let Some(user) = options
-            .settings
-            .instance
-            .as_ref()
-            .and_then(|name| settings.instances.get(name))
+            .instance(&settings)
+            .ok()
             .and_then(|instance| instance.user.as_ref())
     {
         names.push(user.clone());

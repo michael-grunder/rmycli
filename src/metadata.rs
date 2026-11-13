@@ -434,19 +434,15 @@ pub fn spec_position(
         "keyword" => {
             let from = begin_spec["startfrom"].as_i64()?;
             let keyword = string(begin_spec, "keyword").as_bytes();
-            let from = if from < 0 {
-                args.len()
-                    .checked_sub(usize::try_from(from.unsigned_abs()).ok()?)?
+            let matches = |&i: &usize| args[i].eq_ignore_ascii_case(keyword);
+            // Negative offsets search backward from the end of the command.
+            let found = if from < 0 {
+                let last = args
+                    .len()
+                    .checked_sub(usize::try_from(from.unsigned_abs()).ok()?)?;
+                (0..=last).rev().find(matches)
             } else {
-                usize::try_from(from).ok()?
-            };
-            let found = if begin_spec["startfrom"].as_i64()? < 0 {
-                (0..=from.min(args.len().saturating_sub(1)))
-                    .rev()
-                    .find(|&i| args[i].eq_ignore_ascii_case(keyword))
-            } else {
-                (from..args.len())
-                    .find(|&i| args[i].eq_ignore_ascii_case(keyword))
+                (usize::try_from(from).ok()?..args.len()).find(matches)
             };
             let Some(found) = found else {
                 return Some(false);

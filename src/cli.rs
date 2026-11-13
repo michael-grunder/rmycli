@@ -159,20 +159,39 @@ pub struct ConfigOptions {
     pub instance: Option<String>,
 }
 
+/// Settings used when no `--instance` is selected.
+static NO_INSTANCE: config::Instance = config::Instance {
+    resp: None,
+    host: None,
+    port: None,
+    db: None,
+    user: None,
+    password: None,
+    password_env: None,
+    tls: false,
+};
+
 impl Options {
+    pub fn instance<'a>(
+        &self,
+        settings: &'a config::Settings,
+    ) -> Result<&'a config::Instance, String> {
+        self.settings
+            .instance
+            .as_ref()
+            .map_or(Ok(&NO_INSTANCE), |name| {
+                settings
+                    .instances
+                    .get(name)
+                    .ok_or_else(|| format!("unknown instance {name:?}"))
+            })
+    }
+
     pub fn connection_info(
         &self,
         settings: &config::Settings,
     ) -> Result<redis::ConnectionInfo, Box<dyn std::error::Error>> {
-        let default_instance = config::Instance::default();
-        let instance = if let Some(name) = &self.settings.instance {
-            settings
-                .instances
-                .get(name)
-                .ok_or_else(|| format!("unknown instance {name:?}"))?
-        } else {
-            &default_instance
-        };
+        let instance = self.instance(settings)?;
         let host = self
             .host
             .as_deref()
@@ -207,13 +226,7 @@ impl Options {
         settings: &config::Settings,
     ) -> Result<Config, Box<dyn std::error::Error>> {
         let mut info = self.connection_info(settings)?;
-        let default_instance = config::Instance::default();
-        let instance = self
-            .settings
-            .instance
-            .as_ref()
-            .and_then(|name| settings.instances.get(name))
-            .unwrap_or(&default_instance);
+        let instance = self.instance(settings)?;
         let tls = self.certificates.apply(&mut info)?;
         let mut redis = info.redis_settings().clone();
         if self.resp2 {

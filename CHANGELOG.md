@@ -91,6 +91,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- History and plaintext credential saves share one locked, atomic write path.
+  A busy-file error now names the file as well as its stale lock.
+
 - Reconnect interactive sessions quietly after cancellation or connection loss.
   Failed reconnects can be retried by submitting a new command or `\reconnect`.
   Interrupted commands are never replayed; connection-local state such as

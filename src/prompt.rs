@@ -114,13 +114,9 @@ impl Prompt {
             };
             let start = rendered.text.len();
             // Connection values are data, never template syntax or terminal codes.
-            for c in text.chars() {
-                if c.is_control() {
-                    rendered.text.extend(c.escape_default());
-                } else {
-                    rendered.text.push(c);
-                }
-            }
+            rendered
+                .text
+                .push_str(&crate::input::escape_controls(&text));
             let end = rendered.text.len();
             if start != end {
                 if let Some((range, previous)) = rendered.colors.last_mut()

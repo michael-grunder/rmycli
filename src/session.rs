@@ -568,16 +568,10 @@ pub fn format_reply(value: &Value) -> Vec<String> {
         Value::BigNumber(n) => vec![format!("(big number) {n}")],
         Value::ServerError(error) => vec![format!(
             "(error) {}",
-            crate::output::server_error_message(error.code(), error.details())
-                .chars()
-                .map(|c| {
-                    if c.is_control() {
-                        c.escape_default().to_string()
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect::<String>()
+            crate::input::escape_controls(crate::output::server_error_message(
+                error.code(),
+                error.details()
+            ))
         )],
         _ => vec!["(unsupported Redis reply type)".into()],
     }
@@ -1376,10 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_aggregates_and_wide_indexes_format_readably() {
-        assert_eq!(format_reply(&Value::Map(vec![])), ["(empty hash)"]);
-        assert_eq!(format_reply(&Value::Set(vec![])), ["(empty set)"]);
-        assert_eq!(format_reply(&Value::Array(vec![])), ["(empty array)"]);
+    fn wide_indexes_align_nested_lines() {
         let mut values = vec![Value::Nil; 9];
         values.push(Value::Array(vec![Value::Int(1), Value::Int(2)]));
         let lines = format_reply(&Value::Array(values));

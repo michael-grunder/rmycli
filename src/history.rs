@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -56,56 +56,22 @@ impl Store {
         if self.pending.is_empty() {
             return Ok(());
         }
-        // Follow managed dotfile links while replacing their target atomically.
-        let path = if self.path.try_exists()? {
-            self.path.canonicalize()?
-        } else {
-            self.path.clone()
-        };
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::other("history file has no parent directory")
-        })?;
-        std::fs::create_dir_all(parent)?;
-        let lock_path = path.with_extension("lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    io::Error::new(error.kind(), format!(
-                        "history file is busy; check for a stale lock at {}",
-                        lock_path.display()
-                    ))
-                } else {
-                    error
-                }
-            })?;
-        let _lock = Lock(lock_path);
-        drop(lock_file);
-        // Merge only this session's new commands with the latest disk contents.
-        let mut entries = read(&path)?;
-        entries.extend(self.pending.iter().map(|line| Entry {
-            server: self.server.clone(),
-            line: line.clone(),
-        }));
-        entries.drain(..entries.len().saturating_sub(LIMIT));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        for entry in entries {
-            serde_json::to_writer(&mut temporary, &entry)?;
-            temporary.write_all(b"\n")?;
-        }
-        temporary.as_file().sync_all()?;
-        temporary.persist(path)?;
-        Ok(())
-    }
-}
-
-struct Lock(PathBuf);
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        crate::locked_file::replace(&self.path, "lock", |path| {
+            // Merge only this session's new commands with the latest disk
+            // contents.
+            let mut entries = read(path)?;
+            entries.extend(self.pending.iter().map(|line| Entry {
+                server: self.server.clone(),
+                line: line.clone(),
+            }));
+            entries.drain(..entries.len().saturating_sub(LIMIT));
+            let mut bytes = Vec::new();
+            for entry in entries {
+                serde_json::to_writer(&mut bytes, &entry)?;
+                bytes.push(b'\n');
+            }
+            Ok(Some(bytes))
+        })
     }
 }
 

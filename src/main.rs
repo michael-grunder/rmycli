@@ -11,6 +11,7 @@ mod grammar;
 mod hints;
 mod history;
 mod input;
+mod locked_file;
 mod metadata;
 mod output;
 mod prompt;
@@ -45,8 +46,8 @@ async fn async_main() {
         .unwrap_or_else(|error| error.exit());
     let explicit_credentials = matches.value_source("password")
         == Some(ValueSource::CommandLine)
-        || matches.value_source("uri") == Some(ValueSource::CommandLine)
-            && options.uri.as_ref().is_some_and(|uri| uri.contains('@'));
+        || (matches.value_source("uri") == Some(ValueSource::CommandLine)
+            && options.uri.as_ref().is_some_and(|uri| uri.contains('@')));
     if let Err(error) = run(&options, explicit_credentials).await {
         let message = error
             .downcast_ref::<redis::RedisError>()

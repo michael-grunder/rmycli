@@ -190,12 +190,7 @@ fn raw_reply(
 }
 
 fn quoted(bytes: &[u8]) -> String {
-    let quoted = crate::input::quote(bytes);
-    if quoted.starts_with('"') {
-        quoted
-    } else {
-        format!("\"{quoted}\"")
-    }
+    crate::input::quote_like(bytes, "\"")
 }
 
 fn csv_reply(out: &mut impl Write, value: &Value) -> io::Result<()> {

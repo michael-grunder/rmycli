@@ -341,15 +341,7 @@ async fn execution_loop(
                 });
                 lines.append(&mut session.notices);
                 if events
-                    .send(Event::Executed {
-                        lines,
-                        config: session.config.clone(),
-                        allowed: session.assistance_allowed() && connected,
-                        streaming: session.streaming,
-                        subscribed: session.subscribed(),
-                        client_id: id,
-                        connected,
-                    })
+                    .send(executed(&session, lines, id, connected))
                     .is_err()
                 {
                     return;
@@ -414,15 +406,24 @@ fn credential_action(
     let lines = vec![
         result.map_or_else(|error| format!("(error) {error}"), str::to_owned),
     ];
-    let _ = events.send(Event::Executed {
+    let _ = events.send(executed(session, lines, id, listening));
+}
+
+fn executed(
+    session: &Session,
+    lines: Vec<String>,
+    client_id: Option<i64>,
+    connected: bool,
+) -> Event {
+    Event::Executed {
         lines,
         config: session.config.clone(),
-        allowed: session.assistance_allowed() && listening,
+        allowed: session.assistance_allowed() && connected,
         streaming: session.streaming,
         subscribed: session.subscribed(),
-        client_id: id,
-        connected: listening,
-    });
+        client_id,
+        connected,
+    }
 }
 
 async fn scan_keys(

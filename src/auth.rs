@@ -1,6 +1,6 @@
 //! Opt-in credential persistence, matched to an exact transport and endpoint.
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -503,46 +503,11 @@ impl Store {
         &self,
         edit: impl FnOnce(&AuthFile, &mut DocumentMut) -> io::Result<bool>,
     ) -> io::Result<()> {
-        // Follow managed dotfile links while replacing their target atomically.
-        let path = if self.path.try_exists()? {
-            self.path.canonicalize()?
-        } else {
-            self.path.clone()
-        };
-        let parent = path.parent().ok_or_else(|| {
-            io::Error::other("auth file has no parent directory")
-        })?;
-        std::fs::create_dir_all(parent)?;
-        let lock_path = path.with_extension("toml.lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    io::Error::new(
-                        error.kind(),
-                        format!(
-                            "auth file is busy; check for a stale lock at {}",
-                            lock_path.display()
-                        ),
-                    )
-                } else {
-                    error
-                }
-            })?;
-        let _lock = Lock(lock_path);
-        drop(lock_file);
-        let (file, mut document) = self.read()?;
-        if !edit(&file, &mut document)? {
-            return Ok(());
-        }
-        // NamedTempFile starts owner-only on Unix, including replacements.
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.write_all(document.to_string().as_bytes())?;
-        temporary.as_file().sync_all()?;
-        temporary.persist(path)?;
-        Ok(())
+        crate::locked_file::replace(&self.path, "toml.lock", |_| {
+            let (file, mut document) = self.read()?;
+            Ok(edit(&file, &mut document)?
+                .then(|| document.to_string().into_bytes()))
+        })
     }
 }
 
@@ -632,14 +597,6 @@ fn insert_user(
         .ok_or_else(|| io::Error::other("users must be a table"))?
         .insert(user, value(password));
     Ok(())
-}
-
-struct Lock(PathBuf);
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
 }
 
 #[cfg(test)]

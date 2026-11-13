@@ -154,6 +154,19 @@ pub fn quote(bytes: &[u8]) -> String {
     result
 }
 
+/// Escape control characters so text can never drive the terminal.
+pub fn escape_controls(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+
 pub fn glob_prefix(prefix: &[u8]) -> Vec<u8> {
     let mut pattern = Vec::new();
     for &b in prefix {
