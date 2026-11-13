@@ -37,6 +37,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Quick replies replace the submitted line directly. Only commands that
 /// outlast this delay get an intermediate prompt with a busy status.
 const BUSY_PROMPT_DELAY: Duration = Duration::from_millis(200);
+/// Accent for reply-size hints, distinct from the argument hint.
+const SIZE_HINT: Color = Color::DarkCyan;
 
 struct Screen {
     row: u16,
@@ -489,6 +491,10 @@ struct App {
     control_keys: [bool; 2],
     completion_span: Range<usize>,
     pending: Pending,
+    /// The line a size hint was last requested for; cleared on invalidation.
+    size_requested: Option<String>,
+    /// A `[N members]` reply-size hint and the line it describes.
+    size_hint: Option<(String, String)>,
     /// While set, hide the prompt during startup or below a submitted command.
     busy_until: Option<Instant>,
     options: Options,
@@ -529,6 +535,8 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         control_keys: [false; 2],
         completion_span: 0..0,
         pending: Pending::default(),
+        size_requested: None,
+        size_hint: None,
         busy_until: Some(Instant::now() + BUSY_PROMPT_DELAY),
         options,
     };
@@ -583,6 +591,7 @@ fn run_app(app: &mut App) -> io::Result<()> {
             }
         }
         dirty |= app.tick(Instant::now());
+        app.request_size_hint();
         if dirty {
             app.draw(&mut screen, &mut io::stdout(), terminal::size()?)?;
             dirty = false;
@@ -661,7 +670,44 @@ impl App {
         self.help = None;
         self.scan = None;
         self.pending = Pending::default();
+        self.size_requested = None;
         self.status.clear();
+    }
+
+    /// Ask the worker to size the reply of the command being typed. Keys come
+    /// from server key specs; only the counting probe is command specific.
+    fn request_size_hint(&mut self) {
+        let line = &self.editor.line;
+        if self.mode != Mode::Ready
+            || self.history_search.is_some()
+            || self.size_requested.as_ref() == Some(line)
+        {
+            return;
+        }
+        self.size_requested = Some(line.clone());
+        let parsed = input::parse(line);
+        if parsed.error.is_some() {
+            return;
+        }
+        let args: Vec<_> = parsed.words.into_iter().map(|w| w.bytes).collect();
+        let Some((command, keys)) =
+            self.catalog.resolve(&args).and_then(|(command, _)| {
+                estimate::sized(&command.name)
+                    .then(|| command.accessed_keys(&args))
+                    .flatten()
+                    .map(|keys| (command.name.clone(), keys))
+            })
+        else {
+            return;
+        };
+        let _ = self.workers.assistance.send(Assistance::SizeHint {
+            generation: self.workers.current(),
+            config: self.config.clone(),
+            line: line.clone(),
+            command,
+            args,
+            keys,
+        });
     }
 
     fn on_worker(&mut self, event: Event) {
@@ -743,24 +789,35 @@ impl App {
             {
                 self.scan_result(state);
             }
+            Event::SizeHinted {
+                generation,
+                line,
+                hint,
+            } if generation == self.workers.current() => {
+                self.size_hint = hint.map(|hint| (line, hint));
+            }
             Event::Estimated { generation, count }
                 if generation == self.workers.current() =>
             {
-                if estimate::needs_confirmation(
-                    count,
-                    self.options.reply_threshold,
-                    self.options.yes,
-                ) {
-                    self.pending.confirmation = count;
-                    self.status = format!(
-                        "Continue? [y/N] May return about {} elements (not bytes; data can change).",
-                        count.unwrap_or_default()
-                    );
-                } else if let Some(args) = self.pending.decide(true) {
-                    self.execute(args);
-                }
+                self.estimated(count);
             }
             _ => {}
+        }
+    }
+
+    fn estimated(&mut self, count: Option<u64>) {
+        if estimate::needs_confirmation(
+            count,
+            self.options.reply_threshold,
+            self.options.yes,
+        ) {
+            self.pending.confirmation = count;
+            self.status = format!(
+                "Continue? [y/N] May return about {} elements (not bytes; data can change).",
+                count.unwrap_or_default()
+            );
+        } else if let Some(args) = self.pending.decide(true) {
+            self.execute(args);
         }
     }
 
@@ -1462,7 +1519,8 @@ impl App {
         let used = display_width(&line);
         let hint = fit(&safe(&hint), width.saturating_sub(used));
         let color = self.hint_color(&editor.line);
-        queue!(out, SetForegroundColor(color), Print(hint), ResetColor)?;
+        queue!(out, SetForegroundColor(color), Print(&hint), ResetColor)?;
+        self.draw_size_hint(out, used + display_width(&hint), width)?;
         let panel_row = input_row + 1 + status.len();
         if let Some(help) = &self.help {
             help.draw(out, panel_row, width, panel_rows)?;
@@ -1488,6 +1546,35 @@ impl App {
             ),
             cursor::Show,
             EndSynchronizedUpdate
+        )
+    }
+
+    /// Accented `[N members]` after the argument hint, for the current line.
+    fn draw_size_hint(
+        &self,
+        out: &mut impl Write,
+        used: usize,
+        width: usize,
+    ) -> io::Result<()> {
+        let Some((line, size)) = &self.size_hint else {
+            return Ok(());
+        };
+        // Empty lines never have one, so inline status cannot collide.
+        if self.mode != Mode::Ready
+            || self.history_search.is_some()
+            || *line != self.editor.line
+            || self.editor.cursor != line.len()
+        {
+            return Ok(());
+        }
+        let size = fit(&format!(" {size}"), width.saturating_sub(used));
+        queue!(
+            out,
+            SetForegroundColor(SIZE_HINT),
+            SetAttribute(Attribute::Italic),
+            Print(size),
+            SetAttribute(Attribute::NoItalic),
+            ResetColor
         )
     }
 }
@@ -1825,6 +1912,8 @@ mod tests {
                 args: Some(vec![b"GET".to_vec(), b"a".to_vec()]),
                 confirmation: None,
             },
+            size_requested: None,
+            size_hint: None,
             busy_until: None,
             options: Options {
                 limits: Limits::default(),
@@ -2553,6 +2642,57 @@ mod tests {
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.contains("Loading server command metadata"));
+    }
+
+    #[test]
+    fn size_hints_request_once_per_line_and_render_only_when_current() {
+        let (mut app, _) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.editor.line = "SUNION a \"b c\"".into();
+        app.editor.cursor = app.editor.line.len();
+        app.request_size_hint();
+        let Ok(Assistance::SizeHint { command, keys, .. }) =
+            requests.try_recv()
+        else {
+            panic!("expected a size hint request");
+        };
+        assert_eq!(command, "SUNION");
+        assert_eq!(keys, [b"a".to_vec(), b"b c".to_vec()]);
+        app.request_size_hint();
+        assert!(requests.try_recv().is_err(), "same line requests once");
+        for (line, mode) in [
+            ("SUNIONSTORE d a", Mode::Ready),
+            ("SET k v", Mode::Ready),
+            ("SMEMBERS s", Mode::Stateful),
+        ] {
+            app.invalidate();
+            app.mode = mode;
+            app.editor.line = line.into();
+            app.request_size_hint();
+            assert!(requests.try_recv().is_err(), "{line}");
+        }
+        app.mode = Mode::Ready;
+        app.editor.line = "SUNION a b".into();
+        app.editor.cursor = app.editor.line.len();
+        let hinted = |generation| Event::SizeHinted {
+            generation,
+            line: "SUNION a b".into(),
+            hint: Some("[≤7 members]".into()),
+        };
+        app.on_worker(hinted(app.workers.current() + 1));
+        assert!(app.size_hint.is_none(), "stale results are ignored");
+        app.on_worker(hinted(app.workers.current()));
+        let mut screen = std::mem::ManuallyDrop::new(Screen { row: 7 });
+        let render = |app: &mut App, screen: &mut Screen| {
+            let mut rendered = Vec::new();
+            app.draw(screen, &mut rendered, (80, 24)).unwrap();
+            String::from_utf8(rendered).unwrap()
+        };
+        assert!(render(&mut app, &mut screen).contains("[≤7 members]"));
+        app.editor.line.push('c');
+        app.editor.cursor += 1;
+        assert!(!render(&mut app, &mut screen).contains("members]"));
     }
 
     #[test]

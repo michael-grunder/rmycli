@@ -35,6 +35,14 @@ pub enum Assistance {
         config: Config,
         args: Vec<Vec<u8>>,
     },
+    SizeHint {
+        generation: u64,
+        config: Config,
+        line: String,
+        command: String,
+        args: Vec<Vec<u8>>,
+        keys: Vec<Vec<u8>>,
+    },
 }
 
 pub enum Event {
@@ -61,6 +69,11 @@ pub enum Event {
     Estimated {
         generation: u64,
         count: Option<u64>,
+    },
+    SizeHinted {
+        generation: u64,
+        line: String,
+        hint: Option<String>,
     },
     Failed(String),
 }
@@ -195,6 +208,34 @@ fn assist_loop(
                 let _ = events.send(Event::Estimated {
                     generation: expected,
                     count,
+                });
+            }
+            Assistance::SizeHint {
+                generation: expected,
+                config,
+                line,
+                command,
+                args,
+                keys,
+            } => {
+                // Typing queues one request per keystroke; skip stale ones.
+                if generation.load(Ordering::Relaxed) != expected {
+                    continue;
+                }
+                let hint = config.connect_auxiliary().ok().and_then(
+                    |mut connection| {
+                        estimate::size_hint(
+                            &mut connection,
+                            &command,
+                            &args,
+                            &keys,
+                        )
+                    },
+                );
+                let _ = events.send(Event::SizeHinted {
+                    generation: expected,
+                    line,
+                    hint,
                 });
             }
         }

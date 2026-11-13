@@ -343,6 +343,28 @@ impl Command {
                 }))
     }
 
+    /// Keys whose contents the command reads (the `access` key-spec flag), in
+    /// argument order. `None` when any spec cannot place an argument, such as
+    /// an unparsed `numkeys`, or when metadata lists no such keys.
+    pub fn accessed_keys(&self, args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
+        let specs: Vec<_> = self
+            .specs
+            .iter()
+            .filter(|spec| flag(spec, "access") && !flag(spec, "not_key"))
+            .collect();
+        let mut keys = Vec::new();
+        for (position, arg) in args.iter().enumerate().skip(1) {
+            let mut key = false;
+            for spec in &specs {
+                key |= spec_position(spec, args, position)?;
+            }
+            if key {
+                keys.push(arg.clone());
+            }
+        }
+        (!keys.is_empty()).then_some(keys)
+    }
+
     fn expected(&self, ctx: &Context, words: usize) -> Vec<Atom> {
         if ctx.index < words {
             return Vec::new();
@@ -562,6 +584,31 @@ mod tests {
             assert_eq!(command.key_position(&ctx, words), expected, "{line}");
         }
         assert!(catalog.commands.len() > 300);
+    }
+
+    #[test]
+    fn accessed_keys_follow_specs_and_skip_destinations() {
+        let catalog = Catalog::bundled();
+        for (line, expected) in [
+            ("SMEMBERS s", Some(vec!["s"])),
+            ("SUNION a b c", Some(vec!["a", "b", "c"])),
+            ("SUNIONSTORE dest a b", Some(vec!["a", "b"])),
+            ("ZUNION 2 a b WITHSCORES", Some(vec!["a", "b"])),
+            ("ZUNION x a", None),
+            ("LRANGE \"l k\" 0 -1", Some(vec!["l k"])),
+            ("SMEMBERS", None),
+        ] {
+            let args: Vec<_> = crate::input::parse(line)
+                .words
+                .into_iter()
+                .map(|w| w.bytes)
+                .collect();
+            let (command, _) = catalog.resolve(&args).unwrap();
+            let expected = expected.map(|keys| {
+                keys.iter().map(|k| k.as_bytes().to_vec()).collect()
+            });
+            assert_eq!(command.accessed_keys(&args), expected, "{line}");
+        }
     }
 
     #[test]

@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Live reply-size hints while typing, such as `SMEMBERS s [3 members]` or
+  `SUNION a b [≤5 members]`. Keys come from the server's `COMMAND` key specs;
+  `SCARD`/`ZCARD`/`HLEN`/`LLEN`/`STRLEN` probes run on the background
+  connection and pause during `MULTI`, `WATCH`, and streaming. Supported:
+  `SMEMBERS`, `SUNION`, `SINTER`, `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF`,
+  `HGETALL`, `HKEYS`, `HVALS`, `LRANGE`, and `GET`.
+
 - Global numeric `resp` configuration (`2` or `3`, default `2`) with per-instance
   overrides, replacing the unreleased `resp3` boolean. Instances inherit
   the global default when omitted; `-2` and `-3` override configuration.

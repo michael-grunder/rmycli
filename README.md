@@ -8,7 +8,8 @@ and type-aware key completion.
 The first interactive implementation is available. It connects to Redis,
 executes arbitrary commands, discovers the server's command catalog, shows
 syntax and argument help while editing, and completes keys using bounded,
-cancellable `SCAN` requests. It also estimates `LRANGE` replies before execution.
+cancellable `SCAN` requests. It also estimates `LRANGE` replies before execution
+and shows live reply-size hints such as `[3 members]` while typing.
 
 Common `redis-cli` connection, scripting, and output options are supported,
 including RESP3 and cluster redirects. Cluster-wide discovery, replication/RDB
@@ -920,6 +921,26 @@ noninteractive mode, an oversized estimate causes an error before execution;
 `--yes` explicitly bypasses the check. Unknown estimates, unsupported
 commands, and failed probes remain unknown and permit manual execution.
 These estimates are not memory limits or guarantees.
+
+While typing, supported commands show an accented reply-size hint after the
+argument hint:
+
+```text
+default@127.0.0.1:6379 ❯ SMEMBERS set1 [3 members]
+default@127.0.0.1:6379 ❯ SUNION set1 set2 [key ...] [≤5 members]
+```
+
+The connected server's `COMMAND` key specifications locate the keys. Only
+specs flagged `access` count, so a destination such as `SUNIONSTORE dest` does
+not. A small client-side table chooses the counting probe and how multiple
+keys combine. Unions add (`SUNION`, `ZUNION`), intersections take the minimum
+(`SINTER`, `ZINTER`), and differences use the first key (`SDIFF`, `ZDIFF`).
+`≤` marks these upper bounds. `SMEMBERS`, `HGETALL`, `HKEYS`, `HVALS`,
+`LRANGE`, and `GET` (bytes, using `STRLEN`) report a single key's count. Hints
+appear only with the cursor at the end of the line, and update after each edit.
+Missing keys count as zero. Wrong-type keys, unparsed `numkeys`, servers
+without key specs, and other commands show no hint. Hints are informational
+and never block execution. The accent color is currently fixed.
 
 Discovery and estimation use separate connections with the active database
 and credentials. They are paused during `MULTI`, `WATCH`, and streaming modes.

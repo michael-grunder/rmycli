@@ -437,6 +437,46 @@ fn live_metadata_typed_scan_binary_keys_and_estimates() {
     assert_eq!(estimate::estimate(&mut connection, &unknown), None);
 }
 
+#[test]
+fn size_hints_use_live_key_specs_and_typed_counts() {
+    let fixture = RedisFixture::new();
+    let mut connection = fixture.connection();
+    let catalog = Catalog::load(&mut connection);
+    redis::cmd("SADD")
+        .arg("s1")
+        .arg(&["a", "b", "c"])
+        .query::<i64>(&mut connection)
+        .unwrap();
+    redis::cmd("SADD")
+        .arg("s2")
+        .arg(&["c", "d"])
+        .query::<i64>(&mut connection)
+        .unwrap();
+    redis::cmd("SET")
+        .arg("str")
+        .arg("hello")
+        .exec(&mut connection)
+        .unwrap();
+    for (line, expected) in [
+        ("SMEMBERS s1", Some("[3 members]")),
+        ("SUNION s1 s2 missing", Some("[≤5 members]")),
+        ("SINTER s1 s2", Some("[≤2 members]")),
+        ("GET str", Some("[5 bytes]")),
+        ("SMEMBERS str", None),
+    ] {
+        let args: Vec<_> = input::parse(line)
+            .words
+            .into_iter()
+            .map(|w| w.bytes)
+            .collect();
+        let (command, _) = catalog.resolve(&args).unwrap();
+        let keys = command.accessed_keys(&args).unwrap();
+        let hint =
+            estimate::size_hint(&mut connection, &command.name, &args, &keys);
+        assert_eq!(hint.as_deref(), expected, "{line}");
+    }
+}
+
 async fn execute(session: &mut Session, line: &str) -> Value {
     let args = input::parse(line)
         .words
