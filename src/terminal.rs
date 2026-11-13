@@ -462,6 +462,7 @@ pub struct Options {
     pub keys_hints: crate::config::KeysHints,
     pub tick_ms: u64,
     pub prompt: Prompt,
+    pub alternate_prefix: char,
     pub theme: Theme,
 }
 
@@ -491,6 +492,7 @@ struct App {
     scan: Option<Discovery>,
     listing: Option<Arc<AtomicBool>>,
     control_keys: [bool; 2],
+    alternate_pending: bool,
     completion_span: Range<usize>,
     pending: Pending,
     /// The line a size hint was last requested for; cleared on invalidation.
@@ -535,6 +537,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         scan: None,
         listing: None,
         control_keys: [false; 2],
+        alternate_pending: false,
         completion_span: 0..0,
         pending: Pending::default(),
         size_requested: None,
@@ -635,6 +638,7 @@ fn run_app(app: &mut App) -> io::Result<()> {
                 }
                 TerminalEvent::FocusLost | TerminalEvent::FocusGained => {
                     app.control_keys = [false; 2];
+                    app.alternate_pending = false;
                 }
                 TerminalEvent::Paste(text) => {
                     app.paste(&text);
@@ -859,8 +863,20 @@ impl App {
         }
         // Typing ahead or cancelling should show the full prompt and status.
         self.busy_until = None;
+        let alternate = std::mem::take(&mut self.alternate_pending);
         if self.history_search.is_some() {
             return self.search_key(key);
+        }
+        if key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char(self.options.alternate_prefix)
+        {
+            self.alternate_pending = (key.kind == KeyEventKind::Repeat
+                || !alternate)
+                && self.mode != Mode::Busy
+                && self.pending.confirmation.is_none()
+                && self.scan.is_none()
+                && self.help.is_none();
+            return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code != KeyCode::Enter
@@ -912,6 +928,8 @@ impl App {
         if self.confirm_key(key.code) || self.help_key(key.code) {
             return false;
         }
+        let alternate =
+            alternate || key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
                 self.complete(key.code == KeyCode::BackTab);
@@ -921,23 +939,11 @@ impl App {
                     popup.accept(&mut self.editor);
                     self.invalidate();
                 } else if self.mode != Mode::Busy {
-                    return self
-                        .submit(key.modifiers.contains(KeyModifiers::CONTROL));
+                    return self.submit(alternate);
                 }
             }
             KeyCode::Esc => self.invalidate(),
-            KeyCode::F(1) => {
-                let ctx = input::context(&self.editor.line, self.editor.cursor);
-                let mut lines = self.editor_help();
-                if !self.editor.line.trim().is_empty() {
-                    let mut command = self.catalog.help(&ctx);
-                    command.push(String::new());
-                    command.extend(lines);
-                    lines = command;
-                }
-                self.popup = None;
-                self.help = Some(Help { lines, offset: 0 });
-            }
+            KeyCode::F(1) => self.show_editor_help(),
             code => {
                 self.invalidate();
                 self.editor.edit(code);
@@ -965,6 +971,7 @@ impl App {
     }
 
     fn paste(&mut self, text: &str) {
+        self.alternate_pending = false;
         if self.mode == Mode::Streaming {
             return;
         }
@@ -1301,8 +1308,10 @@ impl App {
         }
         if alternate && args[0].eq_ignore_ascii_case(b"KEYS") {
             if args.len() != 2 {
-                self.status =
-                    "Usage: KEYS <pattern> (Ctrl+Enter to scan)".into();
+                self.status = format!(
+                    "Usage: KEYS <pattern> (Ctrl+{}, Enter to scan)",
+                    self.options.alternate_prefix.to_ascii_uppercase()
+                );
                 return false;
             }
             if self.mode != Mode::Ready {
@@ -1402,6 +1411,19 @@ impl App {
         self.editor.cursor = 0;
     }
 
+    fn show_editor_help(&mut self) {
+        let ctx = input::context(&self.editor.line, self.editor.cursor);
+        let mut lines = self.editor_help();
+        if !self.editor.line.trim().is_empty() {
+            let mut command = self.catalog.help(&ctx);
+            command.push(String::new());
+            command.extend(lines);
+            lines = command;
+        }
+        self.popup = None;
+        self.help = Some(Help { lines, offset: 0 });
+    }
+
     fn editor_help(&self) -> Vec<String> {
         let state = match self.mode {
             Mode::Ready | Mode::Stateful => "Connected",
@@ -1415,7 +1437,8 @@ impl App {
                 self.catalog.commands.len(), self.config.info.redis_settings().db()),
             "HELP command: full command help; HELP @group: command list".into(),
             "Tab / Shift-Tab: cycle; Enter: accept candidate (press again to execute)".into(),
-            "Ctrl+Enter on KEYS <pattern>: stream SCAN batches; Ctrl-C stops without disconnecting".into(),
+            format!("Ctrl+{}, Enter (or Ctrl+Enter) on KEYS <pattern>: stream SCAN batches; Ctrl-C stops without disconnecting",
+                self.options.alternate_prefix.to_ascii_uppercase()),
             "Ctrl-C while subscribed: UNSUBSCRIBE from all ordinary channels; keep the connection".into(),
             "Ctrl-R: fuzzy history search; 'term: exact substring; Enter: recall; Esc/Ctrl-C: restore draft".into(),
             "Esc: cancel completion; arrows / Ctrl-A/E/U/K: edit; Up/Down: history".into(),
@@ -1444,7 +1467,7 @@ impl App {
     }
 
     fn input_prompt(&self) -> Rendered {
-        let ctrl = self.control_keys.contains(&true);
+        let ctrl = self.alternate_pending || self.control_keys.contains(&true);
         if self.history_search.is_some() {
             return Rendered {
                 text: if ctrl { "history[Ctrl]> " } else { "history> " }.into(),
@@ -1938,6 +1961,7 @@ mod tests {
             scan: None,
             listing: None,
             control_keys: [false; 2],
+            alternate_pending: false,
             completion_span: 4..5,
             pending: Pending {
                 args: Some(vec![b"GET".to_vec(), b"a".to_vec()]),
@@ -1951,6 +1975,7 @@ mod tests {
                 reply_threshold: 100,
                 yes: false,
                 history_per_server: true,
+                alternate_prefix: 'x',
                 size_hints: true,
                 size_hint_threshold: 10_000,
                 keys_hints: crate::config::KeysHints::default(),
@@ -2094,6 +2119,114 @@ mod tests {
             }
         }
         assert_eq!(app.editor.line, "GET a");
+        assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
+    fn prefix_scans_once_with_configured_binding_and_preserves_bytes() {
+        for letter in ['x', 'g'] {
+            let (mut app, mut executed) = test_app();
+            app.options.alternate_prefix = letter;
+            app.editor.line = r#"KEYS "a b\x00\xff*""#.into();
+            let prefix =
+                KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL);
+            assert!(!app.on_key(prefix));
+            assert!(app.input_prompt().text.contains("[Ctrl]"));
+            assert!(executed.try_recv().is_err());
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                app.on_key(KeyEvent::new_with_kind(
+                    prefix.code,
+                    prefix.modifiers,
+                    kind,
+                ));
+                assert!(app.alternate_pending);
+            }
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let Execution::Scan { pattern, .. } = executed.try_recv().unwrap()
+            else {
+                panic!("expected alternate KEYS");
+            };
+            assert_eq!(pattern, b"a b\0\xff*");
+            assert!(!app.alternate_pending);
+            assert!(!app.input_prompt().text.contains("[Ctrl]"));
+            app.mode = Mode::Ready;
+            app.editor.line = "KEYS *".into();
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(matches!(executed.try_recv(), Ok(Execution::Run(_))));
+        }
+    }
+
+    #[test]
+    fn prefix_cancels_on_other_keys_and_paste() {
+        let prefix = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        for key in [
+            prefix,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.on_key(prefix);
+            app.on_key(key);
+            assert!(!app.alternate_pending);
+            assert!(executed.try_recv().is_err());
+            if key.code == KeyCode::Char('!') {
+                assert_eq!(app.editor.line, "GET a!");
+            }
+            if key.code == KeyCode::Char('a') {
+                assert_eq!(app.editor.cursor, 0);
+            }
+        }
+        let (mut app, _) = test_app();
+        app.on_key(prefix);
+        app.paste("!");
+        assert!(!app.alternate_pending);
+        assert_eq!(app.editor.line, "GET a!");
+    }
+
+    #[test]
+    fn prefix_preserves_popup_confirmation_and_session_guards() {
+        let prefix = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let (mut app, mut executed) = test_app();
+        app.popup = Some(Popup {
+            candidates: vec!["another".into()],
+            selected: 0,
+            span: 4..5,
+        });
+        app.on_key(prefix);
+        app.on_key(enter);
+        assert_eq!(app.editor.line, "GET another");
+        assert!(!app.alternate_pending);
+        assert!(executed.try_recv().is_err());
+
+        app.pending.args = Some(vec![b"LRANGE".to_vec()]);
+        app.pending.confirmation = Some(1000);
+        app.on_key(prefix);
+        assert!(!app.alternate_pending);
+        assert_eq!(app.pending.confirmation, Some(1000));
+        app.on_key(enter);
+        assert!(executed.try_recv().is_err());
+
+        for mode in [
+            Mode::Busy,
+            Mode::Stateful,
+            Mode::Subscribed,
+            Mode::Streaming,
+        ] {
+            let (mut app, mut executed) = test_app();
+            app.mode = mode;
+            app.editor.line = "KEYS *".into();
+            app.on_key(prefix);
+            app.on_key(enter);
+            assert!(executed.try_recv().is_err());
+            assert!(!app.alternate_pending);
+        }
+        let (mut app, mut executed) = test_app();
+        app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_key(prefix);
+        assert!(!app.alternate_pending);
+        assert!(app.history_search.is_some());
         assert!(executed.try_recv().is_err());
     }
 

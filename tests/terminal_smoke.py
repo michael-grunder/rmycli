@@ -379,7 +379,7 @@ def password_prompt(socket, cancel=False):
 
 
 def tmux_history(socket, directory, redis):
-    """Check ordinary Ctrl-R with a private tmux server and default key handling."""
+    """Check Ctrl-R and the alternate prefix with default tmux key handling."""
     if not shutil.which("tmux"):
         print("Skipping tmux history check: tmux is not installed")
         return
@@ -433,6 +433,15 @@ def tmux_history(socket, directory, redis):
         keys("C-c")
         text("!")
         expect(f"default@{socket} ❯ GET dr!aft")
+        keys("End", "C-u")
+        redis("SET", "tmux-prefix:one", "1")
+        text("KEYS tmux-prefix:*")
+        keys("C-x")
+        expect(f"default@{socket} [Ctrl]❯ KEYS tmux-prefix:*")
+        keys("Enter")
+        expect('"tmux-prefix:one"')
+        pane = run("capture-pane", "-p", "-t", "history:0.0")
+        assert '"tmux-prefix:one"' in pane.splitlines(), "expected streamed SCAN output"
     finally:
         subprocess.run([*tmux, "kill-server"], env=env, capture_output=True, check=False)
 

@@ -214,7 +214,7 @@ impl SettingKey {
             ["resp" | "size-hint-threshold" | "tick-ms"]
             | ["keys-hints", "count" | "tick-ms"] => Kind::Integer,
             ["save-auth"] => Kind::SaveAuth,
-            ["prompt"] => Kind::String,
+            ["prompt" | "alternate-prefix"] => Kind::String,
             ["theme", "inline-hint" | "size-hint" | "size-hint-warning"] => {
                 Kind::Color
             }
@@ -319,6 +319,9 @@ impl SettingKey {
     }
 
     fn default_value(&self, settings: &Settings) -> Result<String> {
+        if self.parts == ["alternate-prefix"] {
+            return Ok(format!("ctrl+{}", settings.alternate_prefix));
+        }
         if self.parts == ["prompt"] {
             return Ok(settings.prompt.source().to_owned());
         }

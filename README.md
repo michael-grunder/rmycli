@@ -385,7 +385,7 @@ Restart an open shell to load changes. Named placeholders are case sensitive:
 | `{db}` | Current database number, including zero |
 | `{database}` | `[N]` for a nonzero database, otherwise empty |
 | `{transport}` | `redis`, `rediss`, or `unix` |
-| `{ctrl}` | `[Ctrl]` while held on terminals supporting modifier events |
+| `{ctrl}` | `[Ctrl]` while the alternate prefix is pending, or Ctrl is held with modifier-event support |
 | `{color:cyan}` | Set foreground color for following prompt text |
 | `{reset}` | Restore the terminal's default foreground color |
 
@@ -731,7 +731,8 @@ Command names are restricted to the live catalog when `COMMAND` succeeds.
 | Tab / Shift-Tab | Start completion / cycle through popup candidates |
 | Enter with popup open | Accept the candidate; does **not** execute |
 | Enter without popup | Submit the command |
-| Ctrl+Enter on `KEYS <pattern>` | Stream matching keys with `SCAN` |
+| Ctrl+X, then Enter on `KEYS <pattern>` | Stream matching keys with `SCAN` (configurable prefix) |
+| Ctrl+Enter on `KEYS <pattern>` | Same alternate action on supporting terminals |
 | Hold Ctrl (with modifier-event support) | Show `[Ctrl]` in the prompt |
 | Escape | Close the popup or cancel discovery/confirmation |
 | Left / Right, Home / End, Ctrl-A / Ctrl-E | Move the cursor |
@@ -802,7 +803,7 @@ it does not require extended keys or the Kitty keyboard protocol. No tmux
 configuration changes are needed with its default bindings. A custom tmux
 binding or terminal shortcut that intercepts Ctrl-R can still prevent delivery.
 
-Experiment with `KEYS *` or `KEYS foo:*` followed by **Ctrl+Enter** to stream
+Experiment with `KEYS *` or `KEYS foo:*` followed by **Ctrl+X, then Enter** to stream
 keys using `SCAN` until cursor zero. The pattern is passed through unchanged:
 `KEYS foo:*` uses `SCAN ... MATCH foo:* COUNT 128`. Empty batches do not stop
 iteration. Output is streamed with bounded buffering; duplicates are possible
@@ -814,10 +815,31 @@ in-flight request finishes first; buffered keys are discarded, and the output
 is labeled partial. You can then run another command on the same connection.
 Alternate `KEYS` is unavailable during MULTI, WATCH, or streaming sessions.
 Normal Enter still sends `KEYS` directly; there is no default-remapping setting
-yet. With a completion popup open, either Enter only accepts the candidate.
+yet. With a completion popup open, either Enter only accepts the candidate
+and consumes the prefix; press the prefix again before Enter to scan.
 
-Ctrl+Enter requires a terminal that distinguishes it from Enter. The editor
-requests the Kitty keyboard protocol, including modifier presses and releases.
+Ctrl+X is a one-shot prefix: release it, then press Enter. The prompt's `{ctrl}`
+field shows `[Ctrl]` while waiting. Any other key cancels the prefix and retains
+its normal action; pressing Ctrl+X again, pasting, or changing focus also clears
+it. The prefix is inactive during history search, help, confirmations, and busy
+or streaming work. It uses ordinary control bytes and works through tmux with
+default bindings, without extended keyboard support. Ctrl+X avoids tmux's
+default Ctrl+B prefix. If your terminal or custom tmux bindings intercept it,
+choose a different letter in `rmycli.toml`:
+
+```toml
+alternate-prefix = "ctrl+x"
+```
+
+For example, `rmycli config set alternate-prefix ctrl+g` selects Ctrl+G;
+`config get alternate-prefix` reads it and `config unset alternate-prefix`
+restores Ctrl+X. Restart rmycli after editing. Values are case-insensitive
+`Ctrl+<letter>` chords. Existing editor shortcuts and terminal aliases
+(A, C, D, E, H, I, J, K, L, M, R, U) are reserved.
+
+Ctrl+Enter remains available and requires a terminal that distinguishes it from
+Enter. The editor requests the Kitty keyboard protocol, including modifier
+presses and releases.
 On supporting terminals, holding either Ctrl key changes
 `default@127.0.0.1:6379 ❯` to `default@127.0.0.1:6379 [Ctrl]❯`; releasing it restores
 the prompt. Modifier events leave the input, completion popup, and confirmation
@@ -827,14 +849,13 @@ candidate; release events never submit commands.
 
 Terminals or multiplexers without this support may send plain Enter for both,
 which executes ordinary `KEYS`. They may also omit standalone Ctrl presses and
-releases, so the held-key indicator cannot work there. An ordinary Ctrl chord
-alone does not turn on the indicator, since its release may never be reported.
+releases, so the held-key indicator cannot work there. Ctrl chords other than
+the configured prefix do not turn on the indicator, since their releases may
+never be reported.
 
-If modified Enter acts like Enter, check the whole terminal path, including
-tmux or screen. For example, tmux with `extended-keys off` cannot forward the
-distinction. Changing the application shortcut alone cannot fix that. Try a
-terminal supporting the Kitty keyboard protocol directly, outside tmux, to
-test the held-key indicator. See the [keyboard protocol][keyboard-protocol]
+If modified Enter acts like Enter, use the prefix sequence instead. To test the
+held-key indicator, try a terminal supporting the Kitty keyboard protocol
+directly, outside tmux. See the [keyboard protocol][keyboard-protocol]
 and [tmux modifier-key troubleshooting][tmux-modifiers]. The application does
 not modify terminal or tmux configuration.
 
@@ -1080,7 +1101,8 @@ cargo build --locked
 python3 tests/terminal_smoke.py
 ```
 
-When `tmux` is installed, the smoke suite also checks Ctrl-R search in a
+When `tmux` is installed, the smoke suite also checks Ctrl-R search and Ctrl+X
+followed by Enter for alternate `KEYS` in a
 private tmux server with no user configuration. Linux CI installs tmux for this
 check. The test does not connect to or modify existing tmux sessions.
 

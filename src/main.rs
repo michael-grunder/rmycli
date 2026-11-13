@@ -171,6 +171,7 @@ fn terminal_options(
         reply_threshold: options.reply_threshold,
         yes: options.yes,
         history_per_server: settings.history_per_server,
+        alternate_prefix: settings.alternate_prefix,
         size_hints: settings.size_hints,
         size_hint_threshold: settings.size_hint_threshold,
         keys_hints: settings.keys_hints,

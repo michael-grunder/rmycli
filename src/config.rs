@@ -13,6 +13,8 @@ pub struct Settings {
     pub resp: u8,
     pub auto_cluster: bool,
     pub history_per_server: bool,
+    #[serde(deserialize_with = "alternate_prefix")]
+    pub alternate_prefix: char,
     pub size_hints: bool,
     pub size_hint_threshold: u64,
     pub tick_ms: u64,
@@ -30,6 +32,7 @@ impl Default for Settings {
             resp: 2,
             auto_cluster: true,
             history_per_server: true,
+            alternate_prefix: 'x',
             size_hints: true,
             size_hint_threshold: 10_000,
             tick_ms: 100,
@@ -41,6 +44,26 @@ impl Default for Settings {
             instances: BTreeMap::new(),
         }
     }
+}
+
+fn alternate_prefix<'de, D>(deserializer: D) -> Result<char, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let binding = String::deserialize(deserializer)?.to_ascii_lowercase();
+    let letter = binding.strip_prefix("ctrl+").unwrap_or_default();
+    if letter.len() != 1 || !letter.as_bytes()[0].is_ascii_lowercase() {
+        return Err(D::Error::custom(
+            "alternate-prefix must be Ctrl+<letter> (a-z)",
+        ));
+    }
+    let letter = char::from(letter.as_bytes()[0]);
+    if "acdehijklmru".contains(letter) {
+        return Err(D::Error::custom(
+            "alternate-prefix conflicts with an editor shortcut or terminal key",
+        ));
+    }
+    Ok(letter)
 }
 
 impl Settings {
@@ -272,6 +295,36 @@ mod tests {
         let settings =
             Settings::parse(include_str!("../rmycli.dist.toml")).unwrap();
         assert_eq!(settings.prompt.source(), crate::prompt::DEFAULT);
+        assert_eq!(settings.alternate_prefix, 'x');
+    }
+
+    #[test]
+    fn alternate_prefix_validates_control_letters() {
+        assert_eq!(Settings::default().alternate_prefix, 'x');
+        for binding in ["ctrl+x", "Ctrl+X", "CTRL+G"] {
+            let settings =
+                Settings::parse(&format!("alternate-prefix = '{binding}'"))
+                    .unwrap();
+            assert_eq!(
+                settings.alternate_prefix,
+                binding.chars().last().unwrap().to_ascii_lowercase()
+            );
+        }
+        for binding in
+            ["", "x", "alt+x", "ctrl+", "ctrl+xx", "ctrl+é", "ctrl+["]
+        {
+            assert!(
+                Settings::parse(&format!("alternate-prefix = '{binding}'"))
+                    .is_err()
+            );
+        }
+        for letter in "acdehijklmru".chars() {
+            assert!(
+                Settings::parse(&format!("alternate-prefix = 'ctrl+{letter}'"))
+                    .is_err()
+            );
+        }
+        assert!(Settings::parse("alternate-prefix = 24").is_err());
     }
 
     #[test]

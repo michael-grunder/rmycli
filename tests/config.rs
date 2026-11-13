@@ -362,10 +362,11 @@ port = 6380 # private endpoint
 }
 
 #[test]
-fn size_hint_settings_can_be_read_set_and_unset() {
+fn editor_settings_can_be_read_set_and_unset() {
     let fixture = Fixture::new();
     for (key, default, value) in [
         ("size-hints", "true", "false"),
+        ("alternate-prefix", "ctrl+x", "ctrl+g"),
         ("tick-ms", "100", "250"),
         ("keys-hints.enabled", "true", "false"),
         ("keys-hints.count", "1000", "500"),
@@ -432,6 +433,9 @@ fn invalid_config_updates_leave_files_unchanged() {
         ("theme.inline-hnit", "red"),
         ("theme.inline-hint", "not-a-color"),
         ("size-hints", "yes"),
+        ("alternate-prefix", "ctrl+c"),
+        ("alternate-prefix", "ctrl+m"),
+        ("alternate-prefix", "x"),
         ("tick-ms", "0"),
         ("keys-hints.enabled", "yes"),
         ("keys-hints.count", "0"),

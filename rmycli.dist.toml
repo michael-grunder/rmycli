@@ -43,6 +43,15 @@ auto-cluster = true
 #   rmycli config set history-per-server false
 history-per-server = true
 
+# One-shot alternate execution: type KEYS <pattern>, then Ctrl+X, then Enter
+# to stream SCAN batches. Any other key or paste cancels the prefix; keys keep
+# their normal behavior. The prefix also lights the prompt's {ctrl} indicator.
+# Uses ordinary control bytes, including through tmux with default bindings.
+# Case-insensitive Ctrl+<letter>; editor shortcuts and terminal aliases
+# (A, C, D, E, H, I, J, K, L, M, R, U) are reserved. Avoid your tmux prefix.
+#   rmycli config set alternate-prefix ctrl+g
+alternate-prefix = "ctrl+x"
+
 # Show live reply-size hints while typing, e.g. [3 members] (default: true).
 # false also disables their background probes. Execution confirmation is
 # controlled separately by --reply-threshold and --yes.
@@ -108,9 +117,9 @@ prompt = "{color:cyan}{user}@{address}{database}{reset} {color:green}{ctrl}❯{r
 #   {db}         Current database number, INCLUDING zero: 0, 1, 2, ...
 #   {database}   Optional bracketed suffix: empty for db 0, otherwise [1], [2]...
 #   {transport}  "redis" for TCP, "rediss" for TLS, or "unix" for sockets.
-#   {ctrl}       "[Ctrl]" while Ctrl is held, otherwise empty. Requires terminal
-#                modifier events; omit it to hide the indicator. It does not
-#                change Ctrl+Enter behavior. Command echoes omit the indicator.
+#   {ctrl}       "[Ctrl]" while the alternate prefix is pending or Ctrl is held.
+#                Held Ctrl requires modifier events. Omit to hide the indicator;
+#                shortcuts still work. Command echoes omit the indicator.
 #
 # Values follow the active connection after successful AUTH, HELLO AUTH,
 # SELECT, RESET, reconnects, and redirects. There are no password/URL fields.
