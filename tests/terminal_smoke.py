@@ -476,6 +476,20 @@ def main():
             redis("RPUSH", "list:b", "d", "e", "f")
             redis("SET", "list:not-a-list", "string")
 
+            hints = Terminal(socket)
+            terminals.append(hints)
+            for pattern, label in (("*", "[~3 keys]"),
+                                   ("list:*", "[~3/3 keys]"),
+                                   ("missing*", "[~0/3 keys]")):
+                hints.send(f"\x15KEYS {pattern}".encode())
+                hints.expect_frame(
+                    lambda f, label=label: f.row(f.y).endswith(label),
+                    f"KEYS {pattern} live size hint",
+                )
+            hints.send(b"\x15PING\r")
+            hints.expect_frame(lambda f: f.row(f.y - 1) == "PONG",
+                               "typing a hint never submits KEYS")
+
             assert cli("PING").stdout == b"PONG\n"
             assert b"maxmemory" in cli("CONFIG", "GET", "maxmemory").stdout
             assert cli("SET", "binary", "a b").returncode == 0

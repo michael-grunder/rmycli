@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
+use std::time::Duration;
 
 use redis::Value;
 
@@ -21,6 +22,14 @@ pub enum Execution {
 }
 
 pub enum Assistance {
+    KeysHint {
+        generation: u64,
+        config: Config,
+        line: String,
+        pattern: Vec<u8>,
+        count: u64,
+        tick: Duration,
+    },
     Scan {
         generation: u64,
         config: Config,
@@ -149,6 +158,10 @@ fn assist_loop(
 ) {
     while let Ok(request) = receiver.recv() {
         match request {
+            request @ (Assistance::KeysHint { .. }
+            | Assistance::SizeHint { .. }) => {
+                assist_size_hint(request, events, generation);
+            }
             Assistance::Scan {
                 generation: expected,
                 config,
@@ -210,35 +223,78 @@ fn assist_loop(
                     count,
                 });
             }
-            Assistance::SizeHint {
-                generation: expected,
-                config,
-                line,
-                command,
-                args,
-                keys,
-            } => {
-                // Typing queues one request per keystroke; skip stale ones.
-                if generation.load(Ordering::Relaxed) != expected {
-                    continue;
-                }
-                let hint = config.connect_auxiliary().ok().and_then(
-                    |mut connection| {
-                        estimate::size_hint(
-                            &mut connection,
-                            &command,
-                            &args,
-                            &keys,
-                        )
-                    },
-                );
+        }
+    }
+}
+
+fn assist_size_hint(
+    request: Assistance,
+    events: &SyncSender<Event>,
+    generation: &AtomicU64,
+) {
+    match request {
+        Assistance::KeysHint {
+            generation: expected,
+            config,
+            line,
+            pattern,
+            count,
+            tick,
+        } => {
+            let cancelled = || generation.load(Ordering::Relaxed) != expected;
+            if cancelled() {
+                return;
+            }
+            let result =
+                config.connect_auxiliary().and_then(|mut connection| {
+                    estimate::keys_hint(
+                        &mut connection,
+                        &pattern,
+                        count,
+                        tick,
+                        cancelled,
+                        |hint| {
+                            events
+                                .send(Event::SizeHinted {
+                                    generation: expected,
+                                    line: line.clone(),
+                                    hint: Some(hint),
+                                })
+                                .is_ok()
+                        },
+                    )
+                });
+            if result.is_err() && !cancelled() {
                 let _ = events.send(Event::SizeHinted {
                     generation: expected,
                     line,
-                    hint,
+                    hint: None,
                 });
             }
         }
+        Assistance::SizeHint {
+            generation: expected,
+            config,
+            line,
+            command,
+            args,
+            keys,
+        } => {
+            // Typing queues one request per keystroke; skip stale ones.
+            if generation.load(Ordering::Relaxed) != expected {
+                return;
+            }
+            let hint =
+                config.connect_auxiliary().ok().and_then(|mut connection| {
+                    estimate::size_hint(&mut connection, &command, &args, &keys)
+                });
+            let _ = events.send(Event::SizeHinted {
+                generation: expected,
+                line,
+                hint,
+            });
+        }
+        _ => unreachable!("only size hint requests are dispatched here"),
     }
 }
 

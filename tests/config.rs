@@ -366,6 +366,10 @@ fn size_hint_settings_can_be_read_set_and_unset() {
     let fixture = Fixture::new();
     for (key, default, value) in [
         ("size-hints", "true", "false"),
+        ("tick-ms", "100", "250"),
+        ("keys-hints.enabled", "true", "false"),
+        ("keys-hints.count", "1000", "500"),
+        ("keys-hints.tick-ms", "100", "20"),
         ("size-hint-threshold", "10000", "500"),
         ("theme.size-hint", "dark_cyan", "#12abef"),
         ("theme.size-hint-warning", "red", "ansi_(123)"),
@@ -400,6 +404,26 @@ fn size_hint_settings_can_be_read_set_and_unset() {
 }
 
 #[test]
+fn keys_hint_tick_inherits_global_after_unset() {
+    let fixture = Fixture::new();
+    success(&mut fixture.config(&["set", "tick-ms", "250"]));
+    assert_eq!(
+        success(&mut fixture.config(&["get", "keys-hints.tick-ms"])),
+        "250\n"
+    );
+    success(&mut fixture.config(&["set", "keys-hints.tick-ms", "20"]));
+    assert_eq!(
+        success(&mut fixture.config(&["get", "keys-hints.tick-ms"])),
+        "20\n"
+    );
+    success(&mut fixture.config(&["unset", "keys-hints.tick-ms"]));
+    assert_eq!(
+        success(&mut fixture.config(&["get", "keys-hints.tick-ms"])),
+        "250\n"
+    );
+}
+
+#[test]
 fn invalid_config_updates_leave_files_unchanged() {
     let fixture = Fixture::new();
     let source = "[instances.qa]\npassword-env = 'QA_AUTH'\n";
@@ -408,6 +432,10 @@ fn invalid_config_updates_leave_files_unchanged() {
         ("theme.inline-hnit", "red"),
         ("theme.inline-hint", "not-a-color"),
         ("size-hints", "yes"),
+        ("tick-ms", "0"),
+        ("keys-hints.enabled", "yes"),
+        ("keys-hints.count", "0"),
+        ("keys-hints.tick-ms", "-1"),
         ("size-hint-threshold", "-1"),
         ("size-hint-threshold", "1.5"),
         ("theme.size-hint", "not-a-color"),

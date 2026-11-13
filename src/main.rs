@@ -173,6 +173,8 @@ fn terminal_options(
         history_per_server: settings.history_per_server,
         size_hints: settings.size_hints,
         size_hint_threshold: settings.size_hint_threshold,
+        keys_hints: settings.keys_hints,
+        tick_ms: settings.tick_ms,
         prompt: settings.prompt,
         theme: settings.theme,
     }

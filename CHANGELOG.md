@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Live KEYS hints: `KEYS *` uses `DBSIZE`; other patterns update
+  `[~matches/dbsize keys; scanning]` after each background `SCAN MATCH` batch.
+  The database-size snapshot stays visible after scanning completes. Counts
+  include duplicates and remain estimates. Edits and submission cancel scans.
+  Configure `[keys-hints]` with `enabled` (default true), `count` (default 1000),
+  and optional `tick-ms`, inheriting the global `tick-ms` (default 100 ms).
+  These settings support `config get/set/unset`; `size-hints = false` also
+  disables KEYS probes.
+
 - Configurable live reply-size hints: `size-hints` (default enabled),
   `theme.size-hint` (default `dark_cyan`), `size-hint-threshold` (default 10,000),
   and `theme.size-hint-warning` (default `red`). Counts at or above the threshold

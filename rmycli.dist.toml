@@ -54,6 +54,11 @@ size-hints = true
 # Must be a nonnegative integer.
 size-hint-threshold = 10000
 
+# Default delay in milliseconds between background scan batches (default: 100).
+# Currently used by KEYS hints; feature sections can override it.
+# Must be a positive integer. Does not change terminal input polling.
+tick-ms = 100
+
 # Encrypt saved credentials in ~/.config/rmycli/auth.enc (under XDG_CONFIG_HOME).
 # Prompts for a master passphrase when needed; requires terminal stdin.
 # Existing encrypted files are detected even when this is false.
@@ -158,6 +163,18 @@ prompt = "{color:cyan}{user}@{address}{database}{reset} {color:green}{ctrl}❯{r
 # are allowed and hide the prompt entirely. Templates do not execute shell
 # commands or expand environment variables. Conditional expressions, background
 # colors, text attributes, multiline prompts, and theme packs are not supported.
+
+[keys-hints]
+# Live KEYS estimates (default: true). size-hints = false also disables these.
+# KEYS * uses DBSIZE. Other patterns show [~matches/dbsize keys; scanning],
+# dropping "; scanning" when the cursor reaches zero. Counts include duplicates;
+# the denominator is a DBSIZE snapshot, not a measure of scan progress.
+enabled = true
+# SCAN COUNT work hint per call, not a strict reply limit (default: 1000).
+# Higher counts or shorter intervals can increase server load.
+count = 1000
+# Optional positive millisecond delay after each batch; inherits global tick-ms.
+# tick-ms = 100
 
 [theme]
 # Foreground color of inline argument hints. Default: "dark_grey".

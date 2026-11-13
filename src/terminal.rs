@@ -459,6 +459,8 @@ pub struct Options {
     pub history_per_server: bool,
     pub size_hints: bool,
     pub size_hint_threshold: u64,
+    pub keys_hints: crate::config::KeysHints,
+    pub tick_ms: u64,
     pub prompt: Prompt,
     pub theme: Theme,
 }
@@ -541,6 +543,7 @@ pub fn run(session: Session, options: Options) -> io::Result<()> {
         options,
     };
     let result = run_app(&mut app);
+    app.workers.invalidate();
     // shortcut: save on exit; add checkpoints if crash recovery is needed.
     if let Some(store) = &app.editor.history_store
         && let Err(error) = store.save()
@@ -671,6 +674,7 @@ impl App {
         self.scan = None;
         self.pending = Pending::default();
         self.size_requested = None;
+        self.size_hint = None;
         self.status.clear();
     }
 
@@ -691,6 +695,26 @@ impl App {
             return;
         }
         let args: Vec<_> = parsed.words.into_iter().map(|w| w.bytes).collect();
+        if let [command, pattern] = args.as_slice()
+            && command.eq_ignore_ascii_case(b"KEYS")
+        {
+            if self.options.keys_hints.enabled {
+                let _ = self.workers.assistance.send(Assistance::KeysHint {
+                    generation: self.workers.current(),
+                    config: self.config.clone(),
+                    line: line.clone(),
+                    pattern: pattern.clone(),
+                    count: self.options.keys_hints.count,
+                    tick: Duration::from_millis(
+                        self.options
+                            .keys_hints
+                            .tick_ms
+                            .unwrap_or(self.options.tick_ms),
+                    ),
+                });
+            }
+            return;
+        }
         let Some((command, keys)) =
             self.catalog.resolve(&args).and_then(|(command, _)| {
                 estimate::sized(&command.name)
@@ -1929,6 +1953,8 @@ mod tests {
                 history_per_server: true,
                 size_hints: true,
                 size_hint_threshold: 10_000,
+                keys_hints: crate::config::KeysHints::default(),
+                tick_ms: 100,
                 prompt: Prompt::try_from(
                     "{user}@{address}{database}{ctrl}> ".to_owned(),
                 )
@@ -2651,6 +2677,116 @@ mod tests {
         app.draw(&mut screen, &mut rendered, (80, 24)).unwrap();
         let text = String::from_utf8(rendered).unwrap();
         assert!(text.contains("Loading server command metadata"));
+    }
+
+    #[test]
+    fn keys_hints_preserve_patterns_and_inherit_tick_settings() {
+        let (mut app, _) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.options.tick_ms = 250;
+        app.options.keys_hints.count = 123;
+        for (line, pattern) in [
+            ("keys *", b"*".as_slice()),
+            ("KEYS s*", b"s*"),
+            ("KEYS \"s *\"", b"s *"),
+            (r"KEYS 's\*'", b"s\\*"),
+            (r"KEYS s\xff*", b"s\xff*"),
+            ("KEYS ''", b""),
+        ] {
+            app.invalidate();
+            app.editor.line = line.into();
+            app.request_size_hint();
+            let Assistance::KeysHint {
+                pattern: sent,
+                count,
+                tick,
+                ..
+            } = requests.try_recv().unwrap()
+            else {
+                panic!("expected KEYS hint for {line}");
+            };
+            assert_eq!(sent, pattern);
+            assert_eq!(count, 123);
+            assert_eq!(tick, Duration::from_millis(250));
+            app.request_size_hint();
+            assert!(requests.try_recv().is_err());
+        }
+        app.invalidate();
+        app.options.keys_hints.tick_ms = Some(20);
+        app.request_size_hint();
+        assert!(
+            matches!(requests.try_recv(), Ok(Assistance::KeysHint { tick, .. }) if tick == Duration::from_millis(20))
+        );
+        for line in ["KEYS", "KEYS ", "KEYS \"s*", "KEYS s* extra", r"KEYS s\x"]
+        {
+            app.invalidate();
+            app.editor.line = line.into();
+            app.request_size_hint();
+            assert!(requests.try_recv().is_err(), "{line}");
+        }
+        app.editor.line = "KEYS s*".into();
+        for mode in [
+            Mode::Busy,
+            Mode::Stateful,
+            Mode::Streaming,
+            Mode::Subscribed,
+            Mode::Disconnected,
+        ] {
+            app.invalidate();
+            app.mode = mode;
+            app.request_size_hint();
+            assert!(requests.try_recv().is_err());
+        }
+        app.mode = Mode::Ready;
+        for (all, keys) in [(false, true), (true, false)] {
+            app.invalidate();
+            app.options.size_hints = all;
+            app.options.keys_hints.enabled = keys;
+            app.request_size_hint();
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn keys_hint_edits_cancel_and_clear_old_progress() {
+        let (mut app, mut executed) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.editor.line = "KEYS s".into();
+        app.editor.cursor = app.editor.line.len();
+        app.request_size_hint();
+        let Assistance::KeysHint { generation, .. } =
+            requests.try_recv().unwrap()
+        else {
+            panic!("expected KEYS hint");
+        };
+        let hinted = |line: &str| Event::SizeHinted {
+            generation,
+            line: line.into(),
+            hint: Some(estimate::SizeHint {
+                count: 2,
+                label: "[~2/500 keys; scanning]".into(),
+            }),
+        };
+        app.on_worker(hinted("KEYS s"));
+        let mut rendered = Vec::new();
+        app.draw_size_hint(&mut rendered, 0, 80).unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .contains("[~2/500 keys; scanning]")
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::NONE));
+        assert_ne!(app.workers.current(), generation);
+        assert!(app.size_hint.is_none());
+        app.on_worker(hinted("KEYS s"));
+        assert!(app.size_hint.is_none());
+        app.request_size_hint();
+        assert!(
+            matches!(requests.try_recv(), Ok(Assistance::KeysHint { pattern, .. }) if pattern == b"s*")
+        );
+        assert!(executed.try_recv().is_err(), "hints never execute KEYS");
     }
 
     #[test]

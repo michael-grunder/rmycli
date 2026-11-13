@@ -300,6 +300,12 @@ For a shorter example, create `~/.config/rmycli.toml`:
 resp = 3
 size-hints = true
 size-hint-threshold = 10000
+tick-ms = 100
+
+[keys-hints]
+enabled = true
+count = 1000
+# tick-ms = 50 # Optional override of the global interval.
 
 [theme]
 inline-hint = "dark_grey"
@@ -643,6 +649,11 @@ rmycli config get theme.inline-hint
 rmycli config set theme.inline-hint cyan
 rmycli config set size-hints false
 rmycli config set size-hint-threshold 50000
+rmycli config set keys-hints.enabled false
+rmycli config set keys-hints.count 1000
+rmycli config set tick-ms 100
+rmycli config set keys-hints.tick-ms 50
+rmycli config unset keys-hints.tick-ms
 rmycli config set theme.size-hint-warning red
 rmycli config set theme.commands.LRANGE '#89b4fa'
 rmycli config set 'theme.commands."XGROUP CREATE"' yellow
@@ -951,14 +962,38 @@ Missing keys count as zero. Wrong-type keys, unparsed `numkeys`, servers
 without key specs, and other commands show no hint. Hints are informational
 and never block execution.
 
+`KEYS *` shows `[~500 keys]` using a single `DBSIZE` request. Other patterns,
+such as `KEYS s*`, first show `[~0/500 keys; scanning]`, then update the running
+count after each background `SCAN MATCH` batch. The denominator is the initial
+`DBSIZE` snapshot: `KEYS` scans the whole database regardless of how few keys
+match. It is not a progress percentage or a guarantee of execution time.
+When the cursor reaches zero, the hint becomes, for example, `[~42/500 keys]`.
+The `~` remains because [SCAN can return duplicates][scan] and the database can
+change; counts are not deduplicated and can exceed the snapshot total. Empty
+batches do not end the scan. Each parsed pattern is passed through unchanged,
+including quoted and binary arguments. Editing or submitting the line cancels
+the old scan; a completed scan stays displayed until the next edit. Failed
+probes show no hint. The hint never executes `KEYS` itself.
+
+`[keys-hints]` has `enabled = true` and `count = 1000` by default. `count` is
+the `SCAN COUNT` work hint, not a strict batch-size limit. The global `tick-ms`
+(default 100) sets the delay after each batch, and `[keys-hints].tick-ms` can
+override it. Both count and intervals must be positive integers. The first
+probe runs immediately; subsequent batches reuse the connection. Higher counts
+and shorter intervals increase background load. The global interval currently
+applies to KEYS scans, not terminal polling or one-shot size probes. All these
+settings support `config get/set/unset`; unsetting `keys-hints.tick-ms` restores
+inheritance. Set `keys-hints.enabled = false` to disable only KEYS hints.
+
 In `rmycli.toml`, `size-hints` enables these hints by default; set it to `false`
 to hide them and stop their background probes. `theme.size-hint` sets the normal
 foreground color (default `dark_cyan`). Counts at or above `size-hint-threshold`
 (default 10,000) use `theme.size-hint-warning` (default `red`). Both colors
 accept the same named, RGB, and indexed formats as argument hints. The threshold
 must be a nonnegative integer; zero colors every count as a warning. It uses
-the displayed unit: members, fields, elements, or bytes for `GET`. Upper-bound
-estimates marked `≤` also use this threshold; their actual reply may be smaller.
+the displayed unit: members, fields, elements, matching keys, or bytes for `GET`.
+Upper-bound estimates marked `≤` also use this threshold; their actual reply
+may be smaller.
 These settings are independent of `--reply-threshold` and `--yes`, which control
 confirmation before execution.
 
@@ -1127,3 +1162,4 @@ licensed under CC BY-SA 4.0; see its [attribution and license](data/README.md).
 [command-docs]: https://redis.io/docs/latest/commands/command-docs/
 
 [redis-cli]: https://redis.io/docs/latest/develop/tools/cli/
+[scan]: https://redis.io/docs/latest/commands/scan/

@@ -209,8 +209,10 @@ impl SettingKey {
             [
                 "auto-cluster" | "history-per-server" | "encrypt-auth"
                 | "size-hints",
-            ] => Kind::Boolean,
-            ["resp" | "size-hint-threshold"] => Kind::Integer,
+            ]
+            | ["keys-hints", "enabled"] => Kind::Boolean,
+            ["resp" | "size-hint-threshold" | "tick-ms"]
+            | ["keys-hints", "count" | "tick-ms"] => Kind::Integer,
             ["save-auth"] => Kind::SaveAuth,
             ["prompt"] => Kind::String,
             ["theme", "inline-hint" | "size-hint" | "size-hint-warning"] => {
@@ -337,6 +339,22 @@ impl SettingKey {
         }
         if self.parts == ["size-hint-threshold"] {
             return Ok(settings.size_hint_threshold.to_string());
+        }
+        if self.parts == ["tick-ms"] {
+            return Ok(settings.tick_ms.to_string());
+        }
+        if self.parts == ["keys-hints", "enabled"] {
+            return Ok(settings.keys_hints.enabled.to_string());
+        }
+        if self.parts == ["keys-hints", "count"] {
+            return Ok(settings.keys_hints.count.to_string());
+        }
+        if self.parts == ["keys-hints", "tick-ms"] {
+            return Ok(settings
+                .keys_hints
+                .tick_ms
+                .unwrap_or(settings.tick_ms)
+                .to_string());
         }
         if matches!(self.kind, Kind::SaveAuth) {
             return Ok("false".into());

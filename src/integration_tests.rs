@@ -491,6 +491,69 @@ async fn execute(session: &mut Session, line: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn keys_hint_worker_uses_selected_db_and_restarts_during_long_ticks() {
+    use crate::worker::{Assistance, Event, Workers};
+    let fixture = RedisFixture::new();
+    let mut session = Session::open(fixture.config.clone()).await.unwrap();
+    execute(&mut session, "SELECT 2").await;
+    let config = session.config.clone();
+    let mut connection = config.connect_auxiliary().unwrap();
+    let mut pipe = redis::pipe();
+    for index in 0..200 {
+        pipe.cmd("SET").arg(format!("s:{index}")).arg("v").ignore();
+    }
+    pipe.query::<()>(&mut connection).unwrap();
+    let workers = Workers::start(session);
+    assert!(matches!(
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+        Event::Connected { .. }
+    ));
+    let request = |pattern: &[u8], count, tick| {
+        workers
+            .assistance
+            .send(Assistance::KeysHint {
+                generation: workers.current(),
+                config: config.clone(),
+                line: format!("KEYS {}", input::quote(pattern)),
+                pattern: pattern.to_vec(),
+                count,
+                tick,
+            })
+            .unwrap();
+    };
+    let receive = || {
+        let Event::SizeHinted {
+            generation, hint, ..
+        } = workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected a hint");
+        };
+        assert_eq!(generation, workers.current());
+        hint
+    };
+    request(b"s*", 1, Duration::from_secs(60));
+    assert_eq!(receive().unwrap().label, "[~0/200 keys; scanning]");
+    assert!(receive().unwrap().label.ends_with("/200 keys; scanning]"));
+    workers.invalidate();
+    request(b"*", 1, Duration::from_secs(60));
+    assert_eq!(receive().unwrap().label, "[~200 keys]");
+    request(b"s*", 1000, Duration::from_millis(1));
+    assert_eq!(receive().unwrap().label, "[~0/200 keys; scanning]");
+    assert_eq!(receive().unwrap().label, "[~200/200 keys]");
+    request(b"missing*", 1000, Duration::from_millis(1));
+    assert_eq!(receive().unwrap().label, "[~0/200 keys; scanning]");
+    assert_eq!(receive().unwrap().label, "[~0/200 keys]");
+    redis::cmd("ACL")
+        .arg(&["SETUSER", "default", "-scan"])
+        .query::<()>(&mut connection)
+        .unwrap();
+    request(b"s*", 1000, Duration::from_millis(1));
+    assert_eq!(receive().unwrap().label, "[~0/200 keys; scanning]");
+    assert!(receive().is_none(), "failed scans clear partial progress");
+    assert_eq!(worker_command(&workers, "DBSIZE"), ["(integer) 200"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn session_database_transaction_and_background_isolation() {
     let fixture = RedisFixture::new();
     let mut session = Session::open(fixture.config.clone()).await.unwrap();

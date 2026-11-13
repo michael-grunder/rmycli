@@ -1,5 +1,6 @@
 //! Cheap probes, never the original command. Counts are estimates, not bytes.
 use redis::Connection;
+use std::time::{Duration, Instant};
 
 pub fn range_count(length: i64, start: i64, stop: i64) -> u64 {
     if length <= 0 {
@@ -93,6 +94,71 @@ pub struct SizeHint {
     pub label: String,
 }
 
+/// One pass over a pattern; count entries without storing or deduplicating keys.
+pub fn keys_hint(
+    connection: &mut impl redis::ConnectionLike,
+    pattern: &[u8],
+    count: u64,
+    tick: Duration,
+    cancelled: impl Fn() -> bool,
+    mut publish: impl FnMut(SizeHint) -> bool,
+) -> redis::RedisResult<()> {
+    if cancelled() {
+        return Ok(());
+    }
+    let dbsize: u64 = redis::cmd("DBSIZE").query(connection)?;
+    if cancelled() {
+        return Ok(());
+    }
+    if pattern == b"*" {
+        publish(SizeHint {
+            count: dbsize,
+            label: format!("[~{dbsize} keys]"),
+        });
+        return Ok(());
+    }
+    if !publish(SizeHint {
+        count: 0,
+        label: format!("[~0/{dbsize} keys; scanning]"),
+    }) {
+        return Ok(());
+    }
+    let mut cursor = 0_u64;
+    let mut total = 0_u64;
+    while !cancelled() {
+        let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(count)
+            .query(connection)?;
+        total = total.saturating_add(keys.len() as u64);
+        drop(keys);
+        cursor = next;
+        let progress = if cursor == 0 { "" } else { "; scanning" };
+        if cancelled()
+            || !publish(SizeHint {
+                count: total,
+                label: format!("[~{total}/{dbsize} keys{progress}]"),
+            })
+            || cursor == 0
+        {
+            return Ok(());
+        }
+        // Even a long configured interval must yield promptly to edits.
+        let started = Instant::now();
+        while !cancelled() {
+            let remaining = tick.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+    Ok(())
+}
+
 /// A short `[N unit]` label, `≤` marking upper bounds. Wrong-type keys and
 /// failed probes give `None`; data can change before the command runs.
 pub fn size_hint(
@@ -131,6 +197,194 @@ pub const fn needs_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redis::{ConnectionLike, RedisResult, Value};
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct FakeConnection {
+        replies: VecDeque<RedisResult<Value>>,
+        commands: Vec<Vec<u8>>,
+        times: Vec<Instant>,
+    }
+
+    impl ConnectionLike for FakeConnection {
+        fn req_packed_command(&mut self, cmd: &[u8]) -> RedisResult<Value> {
+            self.commands.push(cmd.to_vec());
+            self.times.push(Instant::now());
+            self.replies.pop_front().expect("unexpected request")
+        }
+        fn req_packed_commands(
+            &mut self,
+            _: &[u8],
+            _: usize,
+            _: usize,
+        ) -> RedisResult<Vec<Value>> {
+            unreachable!("hints do not pipeline")
+        }
+        fn get_db(&self) -> i64 {
+            0
+        }
+        fn check_connection(&mut self) -> bool {
+            true
+        }
+        fn is_open(&self) -> bool {
+            true
+        }
+    }
+
+    fn batches() -> FakeConnection {
+        let batch = |cursor, keys: &[&[u8]]| {
+            Ok(Value::Array(vec![
+                Value::Int(cursor),
+                Value::Array(
+                    keys.iter()
+                        .map(|key| Value::BulkString(key.to_vec()))
+                        .collect(),
+                ),
+            ]))
+        };
+        FakeConnection {
+            replies: VecDeque::from([
+                Ok(Value::Int(500)),
+                batch(7, &[b"s:a", b"s:a"]),
+                batch(9, &[]),
+                batch(0, &[b"s:b"]),
+            ]),
+            ..FakeConnection::default()
+        }
+    }
+
+    #[test]
+    fn keys_counts_duplicates_and_empty_batches_until_cursor_zero() {
+        let mut source = batches();
+        let mut hints = Vec::new();
+        let tick = Duration::from_millis(2);
+        let pattern = b"s[ab]\\*\xff";
+        keys_hint(
+            &mut source,
+            pattern,
+            123,
+            tick,
+            || false,
+            |hint| {
+                hints.push((hint.count, hint.label));
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            hints,
+            [
+                (0, "[~0/500 keys; scanning]".into()),
+                (2, "[~2/500 keys; scanning]".into()),
+                (2, "[~2/500 keys; scanning]".into()),
+                (3, "[~3/500 keys]".into()),
+            ]
+        );
+        assert_eq!(
+            source.commands[0],
+            redis::cmd("DBSIZE").get_packed_command()
+        );
+        for (index, cursor) in [0, 7, 9].into_iter().enumerate() {
+            assert_eq!(
+                source.commands[index + 1],
+                redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(pattern)
+                    .arg("COUNT")
+                    .arg(123)
+                    .get_packed_command()
+            );
+        }
+        assert!(source.times[2].duration_since(source.times[1]) >= tick);
+        assert!(source.times[3].duration_since(source.times[2]) >= tick);
+        assert!(source.replies.is_empty());
+    }
+
+    #[test]
+    fn keys_star_only_uses_dbsize_and_errors_stay_unknown() {
+        let mut source = batches();
+        let mut hints = Vec::new();
+        keys_hint(
+            &mut source,
+            b"*",
+            10,
+            Duration::ZERO,
+            || false,
+            |hint| {
+                hints.push(hint.label);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(hints, ["[~500 keys]"]);
+        assert_eq!(source.commands.len(), 1);
+        source.replies =
+            VecDeque::from([Err((redis::ErrorKind::Client, "denied").into())]);
+        assert!(
+            keys_hint(
+                &mut source,
+                b"s*",
+                10,
+                Duration::ZERO,
+                || false,
+                |_| {
+                    panic!("failed DBSIZE must not publish zero");
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn keys_cancellation_before_requests_after_replies_and_between_ticks() {
+        let mut source = batches();
+        keys_hint(
+            &mut source,
+            b"s*",
+            10,
+            Duration::ZERO,
+            || true,
+            |_| panic!("cancelled"),
+        )
+        .unwrap();
+        assert_eq!(source.commands, Vec::<Vec<u8>>::new());
+        let checks = Cell::new(0);
+        keys_hint(
+            &mut source,
+            b"*",
+            10,
+            Duration::ZERO,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            },
+            |_| panic!("cancelled after DBSIZE"),
+        )
+        .unwrap();
+        assert_eq!(source.commands.len(), 1);
+
+        let mut source = batches();
+        let cancelled = Cell::new(false);
+        keys_hint(
+            &mut source,
+            b"s*",
+            10,
+            Duration::from_secs(60),
+            || cancelled.get(),
+            |hint| {
+                if hint.count > 0 {
+                    cancelled.set(true);
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(source.commands.len(), 2, "no next tick after cancellation");
+    }
+
     #[test]
     fn inclusive_negative_and_out_of_range_bounds() {
         for (len, start, stop, count) in [

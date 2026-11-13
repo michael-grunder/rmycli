@@ -15,6 +15,8 @@ pub struct Settings {
     pub history_per_server: bool,
     pub size_hints: bool,
     pub size_hint_threshold: u64,
+    pub tick_ms: u64,
+    pub keys_hints: KeysHints,
     pub prompt: crate::prompt::Prompt,
     pub encrypt_auth: bool,
     pub save_auth: crate::auth::SaveAuth,
@@ -30,6 +32,8 @@ impl Default for Settings {
             history_per_server: true,
             size_hints: true,
             size_hint_threshold: 10_000,
+            tick_ms: 100,
+            keys_hints: KeysHints::default(),
             prompt: crate::prompt::Prompt::default(),
             encrypt_auth: false,
             save_auth: crate::auth::SaveAuth::default(),
@@ -88,6 +92,12 @@ impl Settings {
         let settings: Self = toml::from_str(source)
             .map_err(|error: toml::de::Error| error.message().to_owned())?;
         validate_resp(settings.resp)?;
+        if settings.tick_ms == 0 || settings.keys_hints.tick_ms == Some(0) {
+            return Err("tick-ms must be a positive integer".into());
+        }
+        if settings.keys_hints.count == 0 {
+            return Err("keys-hints.count must be a positive integer".into());
+        }
         for (name, instance) in &settings.instances {
             if name.trim().is_empty() {
                 return Err("instance names must not be empty".into());
@@ -97,6 +107,24 @@ impl Settings {
                 .map_err(|error| format!("instance {name:?}: {error}"))?;
         }
         Ok(settings)
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct KeysHints {
+    pub enabled: bool,
+    pub count: u64,
+    pub tick_ms: Option<u64>,
+}
+
+impl Default for KeysHints {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            count: 1000,
+            tick_ms: None,
+        }
     }
 }
 
@@ -299,6 +327,10 @@ mod tests {
             let settings = Settings::parse(source).unwrap();
             assert!(settings.size_hints);
             assert_eq!(settings.size_hint_threshold, 10_000);
+            assert_eq!(settings.tick_ms, 100);
+            assert!(settings.keys_hints.enabled);
+            assert_eq!(settings.keys_hints.count, 1000);
+            assert_eq!(settings.keys_hints.tick_ms, None);
             assert_eq!(settings.theme.size_hint, Color::DarkCyan);
             assert_eq!(settings.theme.size_hint_warning, Color::Red);
         }
@@ -322,6 +354,17 @@ mod tests {
     }
 
     #[test]
+    fn keys_hint_settings_override_independently() {
+        let settings = Settings::parse(
+            "tick-ms = 250\n[keys-hints]\nenabled = false\ncount = 500\ntick-ms = 20",
+        ).unwrap();
+        assert_eq!(settings.tick_ms, 250);
+        assert!(!settings.keys_hints.enabled);
+        assert_eq!(settings.keys_hints.count, 500);
+        assert_eq!(settings.keys_hints.tick_ms, Some(20));
+    }
+
+    #[test]
     fn invalid_settings_are_rejected() {
         for source in [
             "unknown = true",
@@ -337,6 +380,17 @@ mod tests {
             "size-hint-threshold = -1",
             "size-hint-threshold = 1.5",
             "size-hint-threshold = '100'",
+            "tick-ms = 0",
+            "tick-ms = -1",
+            "tick-ms = 1.5",
+            "[keys-hints]\nenabled = 'yes'",
+            "[keys-hints]\ncount = 0",
+            "[keys-hints]\ncount = -1",
+            "[keys-hints]\ncount = 1.5",
+            "[keys-hints]\ntick-ms = 0",
+            "[keys-hints]\ntick-ms = -1",
+            "[keys-hints]\ntick-ms = 1.5",
+            "[keys-hints]\ntik-ms = 10",
             "[theme]\nsize-hint = 'invisible'",
             "[theme]\nsize-hint-warning = '#12345g'",
             "[theme]\ninline-hnit = 'red'",
