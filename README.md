@@ -298,9 +298,13 @@ For a shorter example, create `~/.config/rmycli.toml`:
 
 ```toml
 resp = 3
+size-hints = true
+size-hint-threshold = 10000
 
 [theme]
 inline-hint = "dark_grey"
+size-hint = "dark_cyan"
+size-hint-warning = "red"
 
 [theme.commands]
 GET = "cyan"
@@ -612,7 +616,9 @@ Encryption protects stored data, not an unlocked process on a compromised
 account or machine. Retained plaintext files, backups, and configuration
 passwords remain plaintext. An OS keychain backend is not implemented.
 
-The theme controls the foreground color of inline argument hints. Command
+The theme controls the foreground colors of inline argument and reply-size
+hints. `size-hint` defaults to `dark_cyan`; `size-hint-warning` defaults to
+`red` for counts at or above `size-hint-threshold` (default 10,000). Command
 names are case insensitive, with whitespace normalized; a subcommand's color
 overrides its parent's color, which overrides `inline-hint`. Matching uses the
 resolved metadata command, not key or argument text. Unknown command names
@@ -626,7 +632,7 @@ blue, magenta, and cyan. Also supported: `reset` (terminal default),
 For example, `inline-hint = "#ffffff"` selects white; hex digits accept either
 case. Keep the quotes because an unquoted `#` starts a TOML comment.
 Named colors follow the terminal palette; RGB rendering depends on terminal
-support. The built-in hint color remains `dark_grey`.
+support. The built-in argument hint color remains `dark_grey`.
 
 ### Read and edit settings from the command line
 
@@ -635,6 +641,9 @@ Local configuration commands run without connecting to Redis:
 ```sh
 rmycli config get theme.inline-hint
 rmycli config set theme.inline-hint cyan
+rmycli config set size-hints false
+rmycli config set size-hint-threshold 50000
+rmycli config set theme.size-hint-warning red
 rmycli config set theme.commands.LRANGE '#89b4fa'
 rmycli config set 'theme.commands."XGROUP CREATE"' yellow
 rmycli config unset theme.commands.LRANGE
@@ -940,7 +949,18 @@ keys combine. Unions add (`SUNION`, `ZUNION`), intersections take the minimum
 appear only with the cursor at the end of the line, and update after each edit.
 Missing keys count as zero. Wrong-type keys, unparsed `numkeys`, servers
 without key specs, and other commands show no hint. Hints are informational
-and never block execution. The accent color is currently fixed.
+and never block execution.
+
+In `rmycli.toml`, `size-hints` enables these hints by default; set it to `false`
+to hide them and stop their background probes. `theme.size-hint` sets the normal
+foreground color (default `dark_cyan`). Counts at or above `size-hint-threshold`
+(default 10,000) use `theme.size-hint-warning` (default `red`). Both colors
+accept the same named, RGB, and indexed formats as argument hints. The threshold
+must be a nonnegative integer; zero colors every count as a warning. It uses
+the displayed unit: members, fields, elements, or bytes for `GET`. Upper-bound
+estimates marked `≤` also use this threshold; their actual reply may be smaller.
+These settings are independent of `--reply-threshold` and `--yes`, which control
+confirmation before execution.
 
 Discovery and estimation use separate connections with the active database
 and credentials. They are paused during `MULTI`, `WATCH`, and streaming modes.

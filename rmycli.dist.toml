@@ -12,9 +12,9 @@
 #
 # All settings are optional. Unknown fields and invalid values are errors.
 # Uncomment examples as needed; do not define the same setting twice.
-# Protocol, cluster, history, prompt, theme, instance, and auth settings live here.
-# Timeouts, completion/scan limits, reply thresholds, --raw, and --yes remain
-# command-line options. See README.md and rmycli --help.
+# Protocol, cluster, history, prompt, size hints, theme, instance, and auth
+# settings live here. Timeouts, completion/scan limits, reply confirmation
+# thresholds, --raw, and --yes remain command-line options. See rmycli --help.
 #
 # Read or edit settings without connecting to Redis:
 #   rmycli config get theme.inline-hint
@@ -42,6 +42,17 @@ auto-cluster = true
 # Entries still retain their server tags in the shared rmycli_history file.
 #   rmycli config set history-per-server false
 history-per-server = true
+
+# Show live reply-size hints while typing, e.g. [3 members] (default: true).
+# false also disables their background probes. Execution confirmation is
+# controlled separately by --reply-threshold and --yes.
+size-hints = true
+
+# Use theme.size-hint-warning at or above this count (default: 10000).
+# Counts use the displayed unit: members, fields, elements, or bytes for GET.
+# Upper bounds (marked ≤) use the same threshold. Zero warns on every count.
+# Must be a nonnegative integer.
+size-hint-threshold = 10000
 
 # Encrypt saved credentials in ~/.config/rmycli/auth.enc (under XDG_CONFIG_HOME).
 # Prompts for a master passphrase when needed; requires terminal stdin.
@@ -152,6 +163,11 @@ prompt = "{color:cyan}{user}@{address}{database}{reset} {color:green}{ctrl}❯{r
 # Foreground color of inline argument hints. Default: "dark_grey".
 # This does not change typed input, command output, or completion popup colors.
 inline-hint = "dark_grey"
+
+# Foreground colors of live reply-size hints, separate from argument hints.
+# At or above size-hint-threshold, use size-hint-warning instead.
+size-hint = "dark_cyan"
+size-hint-warning = "red"
 
 # Supported color strings:
 #   "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",

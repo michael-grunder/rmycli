@@ -88,6 +88,11 @@ fn total(
     Some((u64::try_from(count).ok()?, upper))
 }
 
+pub struct SizeHint {
+    pub count: u64,
+    pub label: String,
+}
+
 /// A short `[N unit]` label, `≤` marking upper bounds. Wrong-type keys and
 /// failed probes give `None`; data can change before the command runs.
 pub fn size_hint(
@@ -95,7 +100,7 @@ pub fn size_hint(
     command: &str,
     args: &[Vec<u8>],
     keys: &[Vec<u8>],
-) -> Option<String> {
+) -> Option<SizeHint> {
     let (probe, unit, combine) = probe(command)?;
     let mut pipe = redis::pipe();
     for key in keys {
@@ -103,7 +108,10 @@ pub fn size_hint(
     }
     let counts: Vec<i64> = pipe.query(connection).ok()?;
     let (count, upper) = total(combine, &counts, args)?;
-    Some(format!("[{}{count} {unit}]", if upper { "≤" } else { "" }))
+    Some(SizeHint {
+        count,
+        label: format!("[{}{count} {unit}]", if upper { "≤" } else { "" }),
+    })
 }
 
 pub const fn needs_confirmation(

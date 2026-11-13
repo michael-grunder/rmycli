@@ -362,6 +362,44 @@ port = 6380 # private endpoint
 }
 
 #[test]
+fn size_hint_settings_can_be_read_set_and_unset() {
+    let fixture = Fixture::new();
+    for (key, default, value) in [
+        ("size-hints", "true", "false"),
+        ("size-hint-threshold", "10000", "500"),
+        ("theme.size-hint", "dark_cyan", "#12abef"),
+        ("theme.size-hint-warning", "red", "ansi_(123)"),
+    ] {
+        assert_eq!(
+            success(&mut fixture.config(&["get", key])),
+            format!("{default}\n")
+        );
+        assert_eq!(
+            success(&mut fixture.config(&["set", key, value])),
+            format!("{value}\n")
+        );
+        assert_eq!(
+            success(&mut fixture.config(&["get", key])),
+            format!("{value}\n")
+        );
+        success(&mut fixture.config(&["unset", key]));
+        assert_eq!(
+            success(&mut fixture.config(&["get", key])),
+            format!("{default}\n")
+        );
+    }
+    for (key, value, color) in [
+        ("theme.size-hint", "#12abef", "38;2;18;171;239"),
+        ("theme.size-hint-warning", "ansi_(123)", "38;5;123"),
+    ] {
+        let preview = success(
+            &mut fixture.config(&["set", key, value, "--color", "always"]),
+        );
+        assert!(preview.contains(&format!("\x1b[{color}msample text\x1b[0m")));
+    }
+}
+
+#[test]
 fn invalid_config_updates_leave_files_unchanged() {
     let fixture = Fixture::new();
     let source = "[instances.qa]\npassword-env = 'QA_AUTH'\n";
@@ -369,6 +407,11 @@ fn invalid_config_updates_leave_files_unchanged() {
     for (key, value) in [
         ("theme.inline-hnit", "red"),
         ("theme.inline-hint", "not-a-color"),
+        ("size-hints", "yes"),
+        ("size-hint-threshold", "-1"),
+        ("size-hint-threshold", "1.5"),
+        ("theme.size-hint", "not-a-color"),
+        ("theme.size-hint-warning", "#invalid"),
         ("instances.qa.port", "-1"),
         ("instances.qa.port", "65536"),
         ("instances.qa.port", "zero"),

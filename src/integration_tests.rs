@@ -458,10 +458,10 @@ fn size_hints_use_live_key_specs_and_typed_counts() {
         .exec(&mut connection)
         .unwrap();
     for (line, expected) in [
-        ("SMEMBERS s1", Some("[3 members]")),
-        ("SUNION s1 s2 missing", Some("[≤5 members]")),
-        ("SINTER s1 s2", Some("[≤2 members]")),
-        ("GET str", Some("[5 bytes]")),
+        ("SMEMBERS s1", Some((3, "[3 members]"))),
+        ("SUNION s1 s2 missing", Some((5, "[≤5 members]"))),
+        ("SINTER s1 s2", Some((2, "[≤2 members]"))),
+        ("GET str", Some((5, "[5 bytes]"))),
         ("SMEMBERS str", None),
     ] {
         let args: Vec<_> = input::parse(line)
@@ -473,7 +473,11 @@ fn size_hints_use_live_key_specs_and_typed_counts() {
         let keys = command.accessed_keys(&args).unwrap();
         let hint =
             estimate::size_hint(&mut connection, &command.name, &args, &keys);
-        assert_eq!(hint.as_deref(), expected, "{line}");
+        assert_eq!(
+            hint.as_ref().map(|hint| (hint.count, hint.label.as_str())),
+            expected,
+            "{line}"
+        );
     }
 }
 

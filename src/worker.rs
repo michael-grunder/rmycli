@@ -73,7 +73,7 @@ pub enum Event {
     SizeHinted {
         generation: u64,
         line: String,
-        hint: Option<String>,
+        hint: Option<estimate::SizeHint>,
     },
     Failed(String),
 }

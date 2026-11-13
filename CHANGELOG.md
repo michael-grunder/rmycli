@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Configurable live reply-size hints: `size-hints` (default enabled),
+  `theme.size-hint` (default `dark_cyan`), `size-hint-threshold` (default 10,000),
+  and `theme.size-hint-warning` (default `red`). Counts at or above the threshold
+  use the warning color. Disabling hints also stops their background probes.
+  All four settings support `config get/set/unset`.
+
 - Live reply-size hints while typing, such as `SMEMBERS s [3 members]` or
   `SUNION a b [≤5 members]`. Keys come from the server's `COMMAND` key specs;
   `SCARD`/`ZCARD`/`HLEN`/`LLEN`/`STRLEN` probes run on the background

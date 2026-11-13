@@ -206,13 +206,16 @@ impl SettingKey {
             .iter().map(|part| part.get().to_owned()).collect::<Vec<_>>();
         let names = parts.iter().map(String::as_str).collect::<Vec<_>>();
         let kind = match names.as_slice() {
-            ["auto-cluster" | "history-per-server" | "encrypt-auth"] => {
-                Kind::Boolean
-            }
-            ["resp"] => Kind::Integer,
+            [
+                "auto-cluster" | "history-per-server" | "encrypt-auth"
+                | "size-hints",
+            ] => Kind::Boolean,
+            ["resp" | "size-hint-threshold"] => Kind::Integer,
             ["save-auth"] => Kind::SaveAuth,
             ["prompt"] => Kind::String,
-            ["theme", "inline-hint"] => Kind::Color,
+            ["theme", "inline-hint" | "size-hint" | "size-hint-warning"] => {
+                Kind::Color
+            }
             ["theme", "commands", name] if !name.trim().is_empty() => {
                 Kind::Color
             }
@@ -278,7 +281,11 @@ impl SettingKey {
             return None;
         }
         Some(if self.parts.len() == 2 {
-            settings.theme.inline_hint
+            match self.parts[1].as_str() {
+                "size-hint" => settings.theme.size_hint,
+                "size-hint-warning" => settings.theme.size_hint_warning,
+                _ => settings.theme.inline_hint,
+            }
         } else {
             settings.theme.hint_color(&self.parts[2])
         })
@@ -324,6 +331,12 @@ impl SettingKey {
         }
         if self.parts == ["history-per-server"] {
             return Ok(settings.history_per_server.to_string());
+        }
+        if self.parts == ["size-hints"] {
+            return Ok(settings.size_hints.to_string());
+        }
+        if self.parts == ["size-hint-threshold"] {
+            return Ok(settings.size_hint_threshold.to_string());
         }
         if matches!(self.kind, Kind::SaveAuth) {
             return Ok("false".into());

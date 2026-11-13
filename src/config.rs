@@ -8,10 +8,13 @@ use serde::{Deserialize, Deserializer, de::Error};
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+#[allow(clippy::struct_excessive_bools)] // Independent user toggles, not states.
 pub struct Settings {
     pub resp: u8,
     pub auto_cluster: bool,
     pub history_per_server: bool,
+    pub size_hints: bool,
+    pub size_hint_threshold: u64,
     pub prompt: crate::prompt::Prompt,
     pub encrypt_auth: bool,
     pub save_auth: crate::auth::SaveAuth,
@@ -25,6 +28,8 @@ impl Default for Settings {
             resp: 2,
             auto_cluster: true,
             history_per_server: true,
+            size_hints: true,
+            size_hint_threshold: 10_000,
             prompt: crate::prompt::Prompt::default(),
             encrypt_auth: false,
             save_auth: crate::auth::SaveAuth::default(),
@@ -107,6 +112,8 @@ const fn validate_resp(version: u8) -> Result<(), &'static str> {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Theme {
     pub inline_hint: Color,
+    pub size_hint: Color,
+    pub size_hint_warning: Color,
     #[serde(deserialize_with = "command_colors")]
     pub commands: BTreeMap<String, Color>,
 }
@@ -115,6 +122,8 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             inline_hint: Color::DarkGrey,
+            size_hint: Color::DarkCyan,
+            size_hint_warning: Color::Red,
             commands: BTreeMap::new(),
         }
     }
@@ -285,6 +294,34 @@ mod tests {
     }
 
     #[test]
+    fn size_hint_defaults_and_overrides() {
+        for source in ["", include_str!("../rmycli.dist.toml")] {
+            let settings = Settings::parse(source).unwrap();
+            assert!(settings.size_hints);
+            assert_eq!(settings.size_hint_threshold, 10_000);
+            assert_eq!(settings.theme.size_hint, Color::DarkCyan);
+            assert_eq!(settings.theme.size_hint_warning, Color::Red);
+        }
+        let settings = Settings::parse(
+            "size-hints = false\nsize-hint-threshold = 0\n\
+             [theme]\nsize-hint = '#123456'\n\
+             size-hint-warning = 'ansi_(123)'",
+        )
+        .unwrap();
+        assert!(!settings.size_hints);
+        assert_eq!(settings.size_hint_threshold, 0);
+        assert_eq!(
+            settings.theme.size_hint,
+            Color::Rgb {
+                r: 18,
+                g: 52,
+                b: 86
+            }
+        );
+        assert_eq!(settings.theme.size_hint_warning, Color::AnsiValue(123));
+    }
+
+    #[test]
     fn invalid_settings_are_rejected() {
         for source in [
             "unknown = true",
@@ -295,6 +332,13 @@ mod tests {
             "auto-cluster = 1",
             "history-per-server = 'false'",
             "history-per-server = 1",
+            "size-hints = 'false'",
+            "size-hints = 1",
+            "size-hint-threshold = -1",
+            "size-hint-threshold = 1.5",
+            "size-hint-threshold = '100'",
+            "[theme]\nsize-hint = 'invisible'",
+            "[theme]\nsize-hint-warning = '#12345g'",
             "[theme]\ninline-hnit = 'red'",
             "[theme]\ninline-hint = 'invisible'",
             "[theme]\ninline-hint = '#12345g'",

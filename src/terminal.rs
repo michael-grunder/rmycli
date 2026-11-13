@@ -37,8 +37,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(40);
 /// Quick replies replace the submitted line directly. Only commands that
 /// outlast this delay get an intermediate prompt with a busy status.
 const BUSY_PROMPT_DELAY: Duration = Duration::from_millis(200);
-/// Accent for reply-size hints, distinct from the argument hint.
-const SIZE_HINT: Color = Color::DarkCyan;
 
 struct Screen {
     row: u16,
@@ -459,6 +457,8 @@ pub struct Options {
     pub reply_threshold: u64,
     pub yes: bool,
     pub history_per_server: bool,
+    pub size_hints: bool,
+    pub size_hint_threshold: u64,
     pub prompt: Prompt,
     pub theme: Theme,
 }
@@ -494,7 +494,7 @@ struct App {
     /// The line a size hint was last requested for; cleared on invalidation.
     size_requested: Option<String>,
     /// A `[N members]` reply-size hint and the line it describes.
-    size_hint: Option<(String, String)>,
+    size_hint: Option<(String, estimate::SizeHint)>,
     /// While set, hide the prompt during startup or below a submitted command.
     busy_until: Option<Instant>,
     options: Options,
@@ -678,7 +678,8 @@ impl App {
     /// from server key specs; only the counting probe is command specific.
     fn request_size_hint(&mut self) {
         let line = &self.editor.line;
-        if self.mode != Mode::Ready
+        if !self.options.size_hints
+            || self.mode != Mode::Ready
             || self.history_search.is_some()
             || self.size_requested.as_ref() == Some(line)
         {
@@ -1560,17 +1561,23 @@ impl App {
             return Ok(());
         };
         // Empty lines never have one, so inline status cannot collide.
-        if self.mode != Mode::Ready
+        if !self.options.size_hints
+            || self.mode != Mode::Ready
             || self.history_search.is_some()
             || *line != self.editor.line
             || self.editor.cursor != line.len()
         {
             return Ok(());
         }
-        let size = fit(&format!(" {size}"), width.saturating_sub(used));
+        let color = if size.count >= self.options.size_hint_threshold {
+            self.options.theme.size_hint_warning
+        } else {
+            self.options.theme.size_hint
+        };
+        let size = fit(&format!(" {}", size.label), width.saturating_sub(used));
         queue!(
             out,
-            SetForegroundColor(SIZE_HINT),
+            SetForegroundColor(color),
             SetAttribute(Attribute::Italic),
             Print(size),
             SetAttribute(Attribute::NoItalic),
@@ -1920,6 +1927,8 @@ mod tests {
                 reply_threshold: 100,
                 yes: false,
                 history_per_server: true,
+                size_hints: true,
+                size_hint_threshold: 10_000,
                 prompt: Prompt::try_from(
                     "{user}@{address}{database}{ctrl}> ".to_owned(),
                 )
@@ -2678,7 +2687,10 @@ mod tests {
         let hinted = |generation| Event::SizeHinted {
             generation,
             line: "SUNION a b".into(),
-            hint: Some("[≤7 members]".into()),
+            hint: Some(estimate::SizeHint {
+                count: 7,
+                label: "[≤7 members]".into(),
+            }),
         };
         app.on_worker(hinted(app.workers.current() + 1));
         assert!(app.size_hint.is_none(), "stale results are ignored");
@@ -2693,6 +2705,78 @@ mod tests {
         app.editor.line.push('c');
         app.editor.cursor += 1;
         assert!(!render(&mut app, &mut screen).contains("members]"));
+    }
+
+    #[test]
+    fn size_hint_colors_use_count_and_configured_threshold() {
+        let (mut app, _) = test_app();
+        app.editor.line = "SUNION a b".into();
+        app.editor.cursor = app.editor.line.len();
+        app.options.size_hint_threshold = 7;
+        app.options.theme.size_hint = Color::Blue;
+        app.options.theme.size_hint_warning = Color::Yellow;
+        for (count, color) in [
+            (0, Color::Blue),
+            (6, Color::Blue),
+            (7, Color::Yellow),
+            (8, Color::Yellow),
+        ] {
+            let label = format!("[≤{count} members]");
+            app.on_worker(Event::SizeHinted {
+                generation: app.workers.current(),
+                line: app.editor.line.clone(),
+                hint: Some(estimate::SizeHint {
+                    count,
+                    label: label.clone(),
+                }),
+            });
+            let mut rendered = Vec::new();
+            app.draw_size_hint(&mut rendered, 0, 80).unwrap();
+            assert_eq!(
+                String::from_utf8(rendered).unwrap(),
+                format!(
+                    "{}{} {label}{}{}",
+                    SetForegroundColor(color),
+                    SetAttribute(Attribute::Italic),
+                    SetAttribute(Attribute::NoItalic),
+                    ResetColor,
+                )
+            );
+        }
+        app.options.size_hint_threshold = 0;
+        app.size_hint.as_mut().unwrap().1.count = 0;
+        app.size_hint.as_mut().unwrap().1.label = "[≤0 members]".into();
+        let mut rendered = Vec::new();
+        app.draw_size_hint(&mut rendered, 0, 80).unwrap();
+        assert!(
+            String::from_utf8(rendered)
+                .unwrap()
+                .starts_with(&SetForegroundColor(Color::Yellow).to_string())
+        );
+    }
+
+    #[test]
+    fn disabled_size_hints_skip_requests_and_rendering() {
+        let (mut app, _) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.options.size_hints = false;
+        app.editor.line = "SMEMBERS s".into();
+        app.editor.cursor = app.editor.line.len();
+        app.request_size_hint();
+        assert!(requests.try_recv().is_err());
+        assert!(app.size_requested.is_none());
+        app.on_worker(Event::SizeHinted {
+            generation: app.workers.current(),
+            line: app.editor.line.clone(),
+            hint: Some(estimate::SizeHint {
+                count: 5_000_000,
+                label: "[5000000 members]".into(),
+            }),
+        });
+        let mut rendered = Vec::new();
+        app.draw_size_hint(&mut rendered, 0, 80).unwrap();
+        assert_eq!(rendered, [] as [u8; 0]);
     }
 
     #[test]
