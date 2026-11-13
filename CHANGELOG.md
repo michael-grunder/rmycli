@@ -11,7 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One-shot alternate execution with Ctrl+X followed by Enter, including through
   tmux without extended keyboard support. Configure `alternate-prefix` in
   `rmycli.toml` or with `config get/set/unset`. The prompt's `{ctrl}` indicator
-  shows the pending prefix; other keys cancel it and retain their normal action.
+  shows `[Alt]` for the pending prefix and `[Ctrl]` for held Ctrl; other keys
+  cancel the prefix and retain their normal action.
   Ctrl+Enter remains available on supporting terminals.
 
 - Live KEYS hints: `KEYS *` uses `DBSIZE`; other patterns update

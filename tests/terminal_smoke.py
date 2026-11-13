@@ -437,7 +437,7 @@ def tmux_history(socket, directory, redis):
         redis("SET", "tmux-prefix:one", "1")
         text("KEYS tmux-prefix:*")
         keys("C-x")
-        expect(f"default@{socket} [Ctrl]❯ KEYS tmux-prefix:*")
+        expect(f"default@{socket} [Alt]❯ KEYS tmux-prefix:*")
         keys("Enter")
         expect('"tmux-prefix:one"')
         pane = run("capture-pane", "-p", "-t", "history:0.0")

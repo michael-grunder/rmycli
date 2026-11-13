@@ -624,7 +624,7 @@ fn run_app(app: &mut App) -> io::Result<()> {
                                     "{}{}",
                                     app.options
                                         .prompt
-                                        .render(&app.config.info, false)
+                                        .render(&app.config.info, "")
                                         .text,
                                     app.editor.line
                                 ),
@@ -1367,7 +1367,7 @@ impl App {
         self.editor.remember();
         self.log([format!(
             "{}{}",
-            self.options.prompt.render(&self.config.info, false).text,
+            self.options.prompt.render(&self.config.info, "").text,
             if history::persistable(&self.editor.line) {
                 self.editor.line.as_str()
             } else {
@@ -1467,14 +1467,20 @@ impl App {
     }
 
     fn input_prompt(&self) -> Rendered {
-        let ctrl = self.alternate_pending || self.control_keys.contains(&true);
+        let indicator = if self.alternate_pending {
+            "[Alt]"
+        } else if self.control_keys.contains(&true) {
+            "[Ctrl]"
+        } else {
+            ""
+        };
         if self.history_search.is_some() {
             return Rendered {
-                text: if ctrl { "history[Ctrl]> " } else { "history> " }.into(),
+                text: format!("history{indicator}> "),
                 ..Rendered::default()
             };
         }
-        self.options.prompt.render(&self.config.info, ctrl)
+        self.options.prompt.render(&self.config.info, indicator)
     }
 
     fn hint_color(&self, line: &str) -> Color {
@@ -1760,7 +1766,7 @@ mod tests {
             assert_eq!(
                 Prompt::try_from("{user}@{address}{database}> ".to_owned())
                     .unwrap()
-                    .render(&url.into_connection_info().unwrap(), false)
+                    .render(&url.into_connection_info().unwrap(), "")
                     .text,
                 expected
             );
@@ -1771,7 +1777,7 @@ mod tests {
         assert_eq!(
             Prompt::try_from("{user}@{address}{database}> ".to_owned())
                 .unwrap()
-                .render(&socket, false)
+                .render(&socket, "")
                 .text,
             "default@/tmp/redis.sock> "
         );
@@ -1788,7 +1794,7 @@ mod tests {
         let template = "{color:cyan}你{color:green}❯ ";
         let prompt = Prompt::try_from(template.to_owned())
             .unwrap()
-            .render(&info, false);
+            .render(&info, "");
         let text = format!("{}abcd", prompt.text);
         for (width, expected, expected_column, expected_color) in [
             (9, "你❯ abcd", 8, Color::Cyan),
@@ -2131,7 +2137,10 @@ mod tests {
             let prefix =
                 KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL);
             assert!(!app.on_key(prefix));
-            assert!(app.input_prompt().text.contains("[Ctrl]"));
+            assert!(app.input_prompt().text.contains("[Alt]"));
+            app.control_keys = [true, false];
+            assert!(app.input_prompt().text.contains("[Alt]"));
+            assert!(!app.input_prompt().text.contains("[Ctrl]"));
             assert!(executed.try_recv().is_err());
             for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
                 app.on_key(KeyEvent::new_with_kind(
@@ -2148,6 +2157,7 @@ mod tests {
             };
             assert_eq!(pattern, b"a b\0\xff*");
             assert!(!app.alternate_pending);
+            assert!(!app.input_prompt().text.contains("[Alt]"));
             assert!(!app.input_prompt().text.contains("[Ctrl]"));
             app.mode = Mode::Ready;
             app.editor.line = "KEYS *".into();

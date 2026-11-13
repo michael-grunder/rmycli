@@ -117,8 +117,8 @@ prompt = "{color:cyan}{user}@{address}{database}{reset} {color:green}{ctrl}❯{r
 #   {db}         Current database number, INCLUDING zero: 0, 1, 2, ...
 #   {database}   Optional bracketed suffix: empty for db 0, otherwise [1], [2]...
 #   {transport}  "redis" for TCP, "rediss" for TLS, or "unix" for sockets.
-#   {ctrl}       "[Ctrl]" while the alternate prefix is pending or Ctrl is held.
-#                Held Ctrl requires modifier events. Omit to hide the indicator;
+#   {ctrl}       "[Alt]" while the alternate prefix is pending; otherwise "[Ctrl]"
+#                while Ctrl is held (requires modifier events). Omit to hide it;
 #                shortcuts still work. Command echoes omit the indicator.
 #
 # Values follow the active connection after successful AUTH, HELLO AUTH,

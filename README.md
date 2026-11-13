@@ -385,7 +385,7 @@ Restart an open shell to load changes. Named placeholders are case sensitive:
 | `{db}` | Current database number, including zero |
 | `{database}` | `[N]` for a nonzero database, otherwise empty |
 | `{transport}` | `redis`, `rediss`, or `unix` |
-| `{ctrl}` | `[Ctrl]` while the alternate prefix is pending, or Ctrl is held with modifier-event support |
+| `{ctrl}` | `[Alt]` while the alternate prefix is pending; otherwise `[Ctrl]` while Ctrl is held with modifier-event support |
 | `{color:cyan}` | Set foreground color for following prompt text |
 | `{reset}` | Restore the terminal's default foreground color |
 
@@ -819,7 +819,7 @@ yet. With a completion popup open, either Enter only accepts the candidate
 and consumes the prefix; press the prefix again before Enter to scan.
 
 Ctrl+X is a one-shot prefix: release it, then press Enter. The prompt's `{ctrl}`
-field shows `[Ctrl]` while waiting. Any other key cancels the prefix and retains
+field shows `[Alt]` while waiting. Any other key cancels the prefix and retains
 its normal action; pressing Ctrl+X again, pasting, or changing focus also clears
 it. The prefix is inactive during history search, help, confirmations, and busy
 or streaming work. It uses ordinary control bytes and works through tmux with

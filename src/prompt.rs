@@ -100,7 +100,7 @@ impl Prompt {
         &self.source
     }
 
-    pub fn render(&self, info: &ConnectionInfo, ctrl: bool) -> Rendered {
+    pub fn render(&self, info: &ConnectionInfo, indicator: &str) -> Rendered {
         let mut rendered = Rendered::default();
         let mut color = Color::Reset;
         for part in &self.parts {
@@ -110,7 +110,7 @@ impl Prompt {
                     continue;
                 }
                 Part::Text(text) => text.clone(),
-                Part::Field(name) => field(name, info, ctrl),
+                Part::Field(name) => field(name, info, indicator),
             };
             let start = rendered.text.len();
             // Connection values are data, never template syntax or terminal codes.
@@ -132,7 +132,7 @@ impl Prompt {
     }
 }
 
-fn field(name: &str, info: &ConnectionInfo, ctrl: bool) -> String {
+fn field(name: &str, info: &ConnectionInfo, indicator: &str) -> String {
     let settings = info.redis_settings();
     match name {
         "user" => settings.username().unwrap_or("default").to_owned(),
@@ -156,7 +156,7 @@ fn field(name: &str, info: &ConnectionInfo, ctrl: bool) -> String {
             _ => "unknown",
         }
         .into(),
-        "ctrl" if ctrl => "[Ctrl]".into(),
+        "ctrl" => indicator.to_owned(),
         _ => String::new(),
     }
 }
@@ -175,21 +175,21 @@ mod tests {
             .into_connection_info()
             .unwrap();
         assert_eq!(
-            prompt.render(&info, true).text,
+            prompt.render(&info, "[Ctrl]").text,
             "{alice} rediss localhost:6380 localhost 6380 2[2][Ctrl]"
         );
         let info = info.set_redis_settings(
             redis::RedisConnectionInfo::default().set_username("{db}\x1b[2J"),
         );
         assert_eq!(
-            prompt.render(&info, false).text,
+            prompt.render(&info, "").text,
             "{{db}\\u{1b}[2J} rediss localhost:6380 localhost 6380 0"
         );
         let socket = ConnectionAddr::Unix("/tmp/redis.sock".into())
             .into_connection_info()
             .unwrap();
         assert_eq!(
-            prompt.render(&socket, false).text,
+            prompt.render(&socket, "").text,
             "{default} unix /tmp/redis.sock /tmp/redis.sock  0"
         );
     }
@@ -201,7 +201,7 @@ mod tests {
             "{color:#12abef}你{color:ansi_(117)}❯{reset} ".to_owned(),
         )
         .unwrap()
-        .render(&info, false);
+        .render(&info, "");
         assert_eq!(rendered.text, "你❯ ");
         assert_eq!(
             rendered.colors,
@@ -219,7 +219,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            Prompt::default().render(&info, false).text,
+            Prompt::default().render(&info, "").text,
             "default@localhost:6379 ❯ "
         );
     }
@@ -245,7 +245,7 @@ mod tests {
             assert_eq!(
                 Prompt::try_from(source.to_owned())
                     .unwrap()
-                    .render(&info, true)
+                    .render(&info, "[Ctrl]")
                     .text,
                 expected
             );
