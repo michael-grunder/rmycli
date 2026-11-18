@@ -1151,13 +1151,17 @@ RMYCLI_TEST_BINARY=target/x86_64-unknown-linux-musl/release/rmycli \
 
 ### Publishing
 
-For your first release, sign in to [crates.io](https://crates.io), verify your
-email address, create an API token with permission to publish, and run
-`cargo login`. Paste the token at Cargo's prompt.
+Use the [release skill](.agents/skills/release-rmycli/SKILL.md) from a checkout.
+For example, ask Codex to “Use `$release-rmycli` to release version 0.1.0.”
+It updates the package version, reviews the documentation, consolidates the
+dated changelog, and runs the required checks before committing. It pushes
+the release commit and a detailed annotated `v<version>` tag to GitHub.
 
-Before publishing, move the release's changelog entries from `Unreleased` into
-a version heading dated `YYYY-MM-DD`, retaining an `Unreleased` section. Run the
-formatting, Clippy, and test checks above and commit the release changes. Then:
+After **CI** and **Distribution binaries** succeed for that commit, the
+maintainer publishes to crates.io from the tagged checkout. For your first
+release, sign in to [crates.io](https://crates.io), verify your email address,
+create an API token with permission to publish, and run `cargo login`.
+Paste the token at Cargo's prompt.
 
 ```sh
 cargo package --list
@@ -1168,9 +1172,8 @@ cargo publish --locked
 Review the package file list before uploading. The manifest explicitly includes
 source, bundled help and its license, tests, and project documentation; local
 recordings are excluded. The dry run builds the packaged source without
-uploading it. After a successful publish, tag the release commit (for example,
-`git tag v0.1.0`). A published version cannot be overwritten; corrections need
-a new version. See the [Cargo publishing guide][publishing] for details.
+uploading it. Corrections to a published crate require a new version.
+See the [Cargo publishing guide][publishing] for details.
 
 ## License
 

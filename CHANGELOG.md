@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add a repository release skill that prepares the version and release notes,
+  checks the build, and pushes an annotated tag and release commit to GitHub.
+
 - One-shot alternate execution with Ctrl+X followed by Enter, including through
   tmux without extended keyboard support. Configure `alternate-prefix` in
   `rmycli.toml` or with `config get/set/unset`. The prompt's `{ctrl}` indicator
