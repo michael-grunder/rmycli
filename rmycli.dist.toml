@@ -68,6 +68,15 @@ size-hint-threshold = 10000
 # Must be a positive integer. Does not change terminal input polling.
 tick-ms = 100
 
+# Refresh a displayed size hint while the line is unchanged, in milliseconds.
+# Each interval starts after the previous probe finishes; refreshes never
+# overlap, and the old hint stays until the new value is ready. Zero or a
+# negative value never refreshes (one probe per edit).
+# Cheap counts: SCARD, ZCARD, HLEN, LLEN, STRLEN, and DBSIZE for KEYS *.
+size-hint-refresh-ms = 500
+# KEYS <pattern> hints, which repeat a full SCAN MATCH pass (default: 5000).
+scan-hint-refresh-ms = 5000
+
 # Encrypt saved credentials in ~/.config/rmycli/auth.enc (under XDG_CONFIG_HOME).
 # Prompts for a master passphrase when needed; requires terminal stdin.
 # Existing encrypted files are detected even when this is false.

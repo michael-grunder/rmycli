@@ -305,6 +305,8 @@ resp = 3
 size-hints = true
 size-hint-threshold = 10000
 tick-ms = 100
+size-hint-refresh-ms = 500  # Cheap counts; 0 or less never refreshes.
+scan-hint-refresh-ms = 5000 # SCAN MATCH passes; 0 or less never refreshes.
 
 [keys-hints]
 enabled = true
@@ -656,6 +658,8 @@ rmycli config set size-hint-threshold 50000
 rmycli config set keys-hints.enabled false
 rmycli config set keys-hints.count 1000
 rmycli config set tick-ms 100
+rmycli config set size-hint-refresh-ms 1000
+rmycli config set scan-hint-refresh-ms 0
 rmycli config set keys-hints.tick-ms 50
 rmycli config unset keys-hints.tick-ms
 rmycli config set theme.size-hint-warning red
@@ -997,13 +1001,25 @@ The `~` remains because [SCAN can return duplicates][scan] and the database can
 change; counts are not deduplicated and can exceed the snapshot total. Empty
 batches do not end the scan. Each parsed pattern is passed through unchanged,
 including quoted and binary arguments. Editing or submitting the line cancels
-the old scan; a completed scan stays displayed until the next edit. Failed
-probes show no hint. The hint never executes `KEYS` itself.
+the old scan. Failed probes show no hint. The hint never executes `KEYS` itself.
+
+Hints stay current while the line is unchanged and the cursor is at its end.
+After a probe finishes, rmycli waits the configured interval and probes again.
+A refresh never overlaps an outstanding probe, so slow scans space themselves
+out rather than queueing. The old hint stays displayed until the refresh has
+its final value, then is replaced in one step: only the first scan for a line
+shows running `; scanning` counts. A failed refresh hides the hint until a later
+refresh succeeds. Probes that use cheap counts (`SCARD`, `HLEN`, `LLEN`,
+`STRLEN`, and `DBSIZE` for `KEYS *`) follow `size-hint-refresh-ms` (default
+500). `KEYS <pattern>` hints, which repeat a full `SCAN MATCH` pass, follow
+`scan-hint-refresh-ms` (default 5000). Zero or a negative value disables that
+kind of refresh, restoring a single probe per edit. Refreshes reuse one
+background connection while the line is unchanged.
 
 `[keys-hints]` has `enabled = true` and `count = 1000` by default. `count` is
 the `SCAN COUNT` work hint, not a strict batch-size limit. The global `tick-ms`
 (default 100) sets the delay after each batch, and `[keys-hints].tick-ms` can
-override it. Both count and intervals must be positive integers. The first
+override it. Both count and batch intervals must be positive integers. The first
 probe runs immediately; subsequent batches reuse the connection. Higher counts
 and shorter intervals increase background load. The global interval currently
 applies to KEYS scans, not terminal polling or one-shot size probes. All these

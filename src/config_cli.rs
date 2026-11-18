@@ -211,7 +211,13 @@ impl SettingKey {
                 | "size-hints",
             ]
             | ["keys-hints", "enabled"] => Kind::Boolean,
-            ["resp" | "size-hint-threshold" | "tick-ms"]
+            [
+                "resp"
+                | "size-hint-threshold"
+                | "tick-ms"
+                | "size-hint-refresh-ms"
+                | "scan-hint-refresh-ms",
+            ]
             | ["keys-hints", "count" | "tick-ms"] => Kind::Integer,
             ["save-auth"] => Kind::SaveAuth,
             ["prompt" | "alternate-prefix"] => Kind::String,
@@ -345,6 +351,12 @@ impl SettingKey {
         }
         if self.parts == ["tick-ms"] {
             return Ok(settings.tick_ms.to_string());
+        }
+        if self.parts == ["size-hint-refresh-ms"] {
+            return Ok(settings.size_hint_refresh_ms.to_string());
+        }
+        if self.parts == ["scan-hint-refresh-ms"] {
+            return Ok(settings.scan_hint_refresh_ms.to_string());
         }
         if self.parts == ["keys-hints", "enabled"] {
             return Ok(settings.keys_hints.enabled.to_string());

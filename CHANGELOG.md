@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Keep reply-size hints current while you pause on a line. Cheap counts such
+  as `SCARD` and `DBSIZE` refresh every 500 ms by default
+  (`size-hint-refresh-ms`), and `KEYS <pattern>` scans every 5000 ms
+  (`scan-hint-refresh-ms`). Each interval starts when the previous probe
+  finishes, so refreshes never pile up. The current hint is replaced only
+  when the new value is ready, without repeating the running count. Set
+  either value to zero or less to turn that refresh off.
+
 ### Fixed
 
 - Fix the macOS distribution workflow's `lipo` argument order so it can

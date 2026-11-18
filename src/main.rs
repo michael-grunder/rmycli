@@ -176,6 +176,8 @@ fn terminal_options(
         size_hint_threshold: settings.size_hint_threshold,
         keys_hints: settings.keys_hints,
         tick_ms: settings.tick_ms,
+        size_refresh: config::refresh_interval(settings.size_hint_refresh_ms),
+        scan_refresh: config::refresh_interval(settings.scan_hint_refresh_ms),
         prompt: settings.prompt,
         theme: settings.theme,
     }

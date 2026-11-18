@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::thread;
 use std::time::Duration;
 
-use redis::Value;
+use redis::{Connection, Value};
 
 use crate::estimate;
 use crate::metadata::Catalog;
@@ -29,6 +29,8 @@ pub enum Assistance {
         pattern: Vec<u8>,
         count: u64,
         tick: Duration,
+        /// Publish running counts; refreshes only publish the final count.
+        progress: bool,
     },
     Scan {
         generation: u64,
@@ -83,6 +85,8 @@ pub enum Event {
         generation: u64,
         line: String,
         hint: Option<estimate::SizeHint>,
+        /// The request finished; later events need a new request.
+        done: bool,
     },
     Failed(String),
 }
@@ -151,16 +155,52 @@ impl Workers {
     }
 }
 
+/// A size-hint connection reused while its generation is current, so periodic
+/// refreshes of an unchanged line do not reconnect. Commands that can change
+/// connection settings are submitted, which always advances the generation.
+type HintConnection = Option<(u64, Connection)>;
+
+/// How often an idle worker releases a stale hint connection.
+const IDLE_CHECK: Duration = Duration::from_secs(1);
+
+fn hint_connection<'a>(
+    cached: &'a mut HintConnection,
+    generation: u64,
+    config: &Config,
+) -> redis::RedisResult<&'a mut Connection> {
+    if cached
+        .as_ref()
+        .is_none_or(|(owner, _)| *owner != generation)
+    {
+        *cached = None;
+        *cached = Some((generation, config.connect_auxiliary()?));
+    }
+    Ok(&mut cached.as_mut().expect("connected above").1)
+}
+
 fn assist_loop(
     receiver: &Receiver<Assistance>,
     events: &SyncSender<Event>,
     generation: &AtomicU64,
 ) {
-    while let Ok(request) = receiver.recv() {
+    let mut cached: HintConnection = None;
+    loop {
+        let request = match receiver.recv_timeout(IDLE_CHECK) {
+            Ok(request) => request,
+            Err(RecvTimeoutError::Timeout) => {
+                if cached.as_ref().is_some_and(|(owner, _)| {
+                    *owner != generation.load(Ordering::Relaxed)
+                }) {
+                    cached = None;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         match request {
             request @ (Assistance::KeysHint { .. }
             | Assistance::SizeHint { .. }) => {
-                assist_size_hint(request, events, generation);
+                assist_size_hint(request, events, generation, &mut cached);
             }
             Assistance::Scan {
                 generation: expected,
@@ -231,6 +271,7 @@ fn assist_size_hint(
     request: Assistance,
     events: &SyncSender<Event>,
     generation: &AtomicU64,
+    cached: &mut HintConnection,
 ) {
     match request {
         Assistance::KeysHint {
@@ -240,36 +281,45 @@ fn assist_size_hint(
             pattern,
             count,
             tick,
+            progress,
         } => {
             let cancelled = || generation.load(Ordering::Relaxed) != expected;
             if cancelled() {
                 return;
             }
-            let result =
-                config.connect_auxiliary().and_then(|mut connection| {
+            let result = hint_connection(cached, expected, &config).and_then(
+                |connection| {
                     estimate::keys_hint(
-                        &mut connection,
+                        connection,
                         &pattern,
                         count,
                         tick,
+                        progress,
                         cancelled,
-                        |hint| {
+                        |hint, done| {
                             events
                                 .send(Event::SizeHinted {
                                     generation: expected,
                                     line: line.clone(),
                                     hint: Some(hint),
+                                    done,
                                 })
                                 .is_ok()
                         },
                     )
-                });
-            if result.is_err() && !cancelled() {
-                let _ = events.send(Event::SizeHinted {
-                    generation: expected,
-                    line,
-                    hint: None,
-                });
+                },
+            );
+            if result.is_err() {
+                // The stream may hold an unread reply after a timeout.
+                *cached = None;
+                if !cancelled() {
+                    let _ = events.send(Event::SizeHinted {
+                        generation: expected,
+                        line,
+                        hint: None,
+                        done: true,
+                    });
+                }
             }
         }
         Assistance::SizeHint {
@@ -284,14 +334,19 @@ fn assist_size_hint(
             if generation.load(Ordering::Relaxed) != expected {
                 return;
             }
-            let hint =
-                config.connect_auxiliary().ok().and_then(|mut connection| {
-                    estimate::size_hint(&mut connection, &command, &args, &keys)
-                });
+            let result = hint_connection(cached, expected, &config).and_then(
+                |connection| {
+                    estimate::size_hint(connection, &command, &args, &keys)
+                },
+            );
+            if result.is_err() {
+                *cached = None;
+            }
             let _ = events.send(Event::SizeHinted {
                 generation: expected,
                 line,
-                hint,
+                hint: result.ok().flatten(),
+                done: true,
             });
         }
         _ => unreachable!("only size hint requests are dispatched here"),

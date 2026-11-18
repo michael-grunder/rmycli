@@ -472,7 +472,9 @@ fn size_hints_use_live_key_specs_and_typed_counts() {
         let (command, _) = catalog.resolve(&args).unwrap();
         let keys = command.accessed_keys(&args).unwrap();
         let hint =
-            estimate::size_hint(&mut connection, &command.name, &args, &keys);
+            estimate::size_hint(&mut connection, &command.name, &args, &keys)
+                .ok()
+                .flatten();
         assert_eq!(
             hint.as_ref().map(|hint| (hint.count, hint.label.as_str())),
             expected,
@@ -518,6 +520,7 @@ async fn keys_hint_worker_uses_selected_db_and_restarts_during_long_ticks() {
                 pattern: pattern.to_vec(),
                 count,
                 tick,
+                progress: true,
             })
             .unwrap();
     };
@@ -543,6 +546,26 @@ async fn keys_hint_worker_uses_selected_db_and_restarts_during_long_ticks() {
     request(b"missing*", 1000, Duration::from_millis(1));
     assert_eq!(receive().unwrap().label, "[~0/200 keys; scanning]");
     assert_eq!(receive().unwrap().label, "[~0/200 keys]");
+    // Refreshes replace the hint with the final count only.
+    workers
+        .assistance
+        .send(Assistance::KeysHint {
+            generation: workers.current(),
+            config: config.clone(),
+            line: "KEYS s*".into(),
+            pattern: b"s*".to_vec(),
+            count: 10,
+            tick: Duration::from_millis(1),
+            progress: false,
+        })
+        .unwrap();
+    let Event::SizeHinted { hint, done, .. } =
+        workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+    else {
+        panic!("expected a hint");
+    };
+    assert!(done);
+    assert_eq!(hint.unwrap().label, "[~200/200 keys]");
     redis::cmd("ACL")
         .arg(&["SETUSER", "default", "-scan"])
         .query::<()>(&mut connection)

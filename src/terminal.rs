@@ -461,9 +461,35 @@ pub struct Options {
     pub size_hint_threshold: u64,
     pub keys_hints: crate::config::KeysHints,
     pub tick_ms: u64,
+    /// How often to refresh hints from cheap counts such as `SCARD`/`DBSIZE`.
+    pub size_refresh: Option<Duration>,
+    /// How often to refresh hints that need a full `SCAN MATCH` pass.
+    pub scan_refresh: Option<Duration>,
     pub prompt: Prompt,
     pub alternate_prefix: char,
     pub theme: Theme,
+}
+
+/// What a line's size hint measures, kept so refreshes can repeat it.
+enum SizeProbe {
+    /// The line has no hint, or its kind of hint is disabled.
+    None,
+    Keys(Vec<u8>),
+    Sized {
+        command: String,
+        args: Vec<Vec<u8>>,
+        keys: Vec<Vec<u8>>,
+    },
+}
+
+/// The size hint requested for the current line and its refresh state.
+struct SizeRequest {
+    line: String,
+    probe: SizeProbe,
+    /// A request is outstanding; refreshes never overlap.
+    pending: bool,
+    /// When the last request finished; the next refresh waits from here.
+    finished: Option<Instant>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -496,7 +522,7 @@ struct App {
     completion_span: Range<usize>,
     pending: Pending,
     /// The line a size hint was last requested for; cleared on invalidation.
-    size_requested: Option<String>,
+    size_requested: Option<SizeRequest>,
     /// A `[N members]` reply-size hint and the line it describes.
     size_hint: Option<(String, estimate::SizeHint)>,
     /// While set, hide the prompt during startup or below a submitted command.
@@ -597,7 +623,7 @@ fn run_app(app: &mut App) -> io::Result<()> {
             }
         }
         dirty |= app.tick(Instant::now());
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         if dirty {
             app.draw(&mut screen, &mut io::stdout(), terminal::size()?)?;
             dirty = false;
@@ -682,61 +708,127 @@ impl App {
         self.status.clear();
     }
 
-    /// Ask the worker to size the reply of the command being typed. Keys come
-    /// from server key specs; only the counting probe is command specific.
-    fn request_size_hint(&mut self) {
-        let line = &self.editor.line;
+    /// Ask the worker to size the reply of the command being typed, then
+    /// refresh it periodically. Keys come from server key specs; only the
+    /// counting probe is command specific.
+    fn request_size_hint(&mut self, now: Instant) {
         if !self.options.size_hints
             || self.mode != Mode::Ready
             || self.history_search.is_some()
-            || self.size_requested.as_ref() == Some(line)
         {
             return;
         }
-        self.size_requested = Some(line.clone());
+        let line = &self.editor.line;
+        let request = match &self.size_requested {
+            Some(request) if request.line == *line => {
+                if !self.refresh_due(request, now) {
+                    return;
+                }
+                self.send_size_probe(request, false);
+                self.size_requested.as_mut().expect("matched above")
+            }
+            _ => {
+                let request = SizeRequest {
+                    line: line.clone(),
+                    probe: self.size_probe(line),
+                    pending: false,
+                    finished: None,
+                };
+                self.send_size_probe(&request, true);
+                self.size_requested.insert(request)
+            }
+        };
+        request.pending = !matches!(request.probe, SizeProbe::None);
+    }
+
+    /// Cheap counts and `SCAN MATCH` passes refresh on separate intervals,
+    /// measured from when the previous request finished.
+    fn refresh_due(&self, request: &SizeRequest, now: Instant) -> bool {
+        let interval = match &request.probe {
+            SizeProbe::None => None,
+            SizeProbe::Keys(pattern) if pattern != b"*" => {
+                self.options.scan_refresh
+            }
+            SizeProbe::Keys(_) | SizeProbe::Sized { .. } => {
+                self.options.size_refresh
+            }
+        };
+        // A hidden hint (cursor inside the line) is not worth refreshing.
+        !request.pending
+            && self.editor.cursor == request.line.len()
+            && interval.zip(request.finished).is_some_and(
+                |(interval, finished)| {
+                    now.saturating_duration_since(finished) >= interval
+                },
+            )
+    }
+
+    fn size_probe(&self, line: &str) -> SizeProbe {
         let parsed = input::parse(line);
         if parsed.error.is_some() {
-            return;
+            return SizeProbe::None;
         }
         let args: Vec<_> = parsed.words.into_iter().map(|w| w.bytes).collect();
         if let [command, pattern] = args.as_slice()
             && command.eq_ignore_ascii_case(b"KEYS")
         {
-            if self.options.keys_hints.enabled {
-                let _ = self.workers.assistance.send(Assistance::KeysHint {
-                    generation: self.workers.current(),
-                    config: self.config.clone(),
-                    line: line.clone(),
-                    pattern: pattern.clone(),
-                    count: self.options.keys_hints.count,
-                    tick: Duration::from_millis(
-                        self.options
-                            .keys_hints
-                            .tick_ms
-                            .unwrap_or(self.options.tick_ms),
-                    ),
-                });
-            }
-            return;
+            return if self.options.keys_hints.enabled {
+                SizeProbe::Keys(pattern.clone())
+            } else {
+                SizeProbe::None
+            };
         }
-        let Some((command, keys)) =
-            self.catalog.resolve(&args).and_then(|(command, _)| {
+        self.catalog
+            .resolve(&args)
+            .and_then(|(command, _)| {
                 estimate::sized(&command.name)
                     .then(|| command.accessed_keys(&args))
                     .flatten()
                     .map(|keys| (command.name.clone(), keys))
             })
-        else {
-            return;
+            .map_or(SizeProbe::None, |(command, keys)| SizeProbe::Sized {
+                command,
+                args,
+                keys,
+            })
+    }
+
+    /// `progress` shows running counts; refreshes replace the old hint only
+    /// once the new count is final.
+    fn send_size_probe(&self, request: &SizeRequest, progress: bool) {
+        let generation = self.workers.current();
+        let config = self.config.clone();
+        let line = request.line.clone();
+        let assistance = match &request.probe {
+            SizeProbe::None => return,
+            SizeProbe::Keys(pattern) => Assistance::KeysHint {
+                generation,
+                config,
+                line,
+                pattern: pattern.clone(),
+                count: self.options.keys_hints.count,
+                tick: Duration::from_millis(
+                    self.options
+                        .keys_hints
+                        .tick_ms
+                        .unwrap_or(self.options.tick_ms),
+                ),
+                progress,
+            },
+            SizeProbe::Sized {
+                command,
+                args,
+                keys,
+            } => Assistance::SizeHint {
+                generation,
+                config,
+                line,
+                command: command.clone(),
+                args: args.clone(),
+                keys: keys.clone(),
+            },
         };
-        let _ = self.workers.assistance.send(Assistance::SizeHint {
-            generation: self.workers.current(),
-            config: self.config.clone(),
-            line: line.clone(),
-            command,
-            args,
-            keys,
-        });
+        let _ = self.workers.assistance.send(assistance);
     }
 
     fn on_worker(&mut self, event: Event) {
@@ -822,7 +914,15 @@ impl App {
                 generation,
                 line,
                 hint,
+                done,
             } if generation == self.workers.current() => {
+                if done
+                    && let Some(request) = &mut self.size_requested
+                    && request.line == line
+                {
+                    request.pending = false;
+                    request.finished = Some(Instant::now());
+                }
                 self.size_hint = hint.map(|hint| (line, hint));
             }
             Event::Estimated { generation, count }
@@ -1986,6 +2086,8 @@ mod tests {
                 size_hint_threshold: 10_000,
                 keys_hints: crate::config::KeysHints::default(),
                 tick_ms: 100,
+                size_refresh: Some(Duration::from_millis(500)),
+                scan_refresh: Some(Duration::from_millis(5000)),
                 prompt: Prompt::try_from(
                     "{user}@{address}{database}{ctrl}> ".to_owned(),
                 )
@@ -2839,7 +2941,7 @@ mod tests {
         ] {
             app.invalidate();
             app.editor.line = line.into();
-            app.request_size_hint();
+            app.request_size_hint(Instant::now());
             let Assistance::KeysHint {
                 pattern: sent,
                 count,
@@ -2852,12 +2954,12 @@ mod tests {
             assert_eq!(sent, pattern);
             assert_eq!(count, 123);
             assert_eq!(tick, Duration::from_millis(250));
-            app.request_size_hint();
+            app.request_size_hint(Instant::now());
             assert!(requests.try_recv().is_err());
         }
         app.invalidate();
         app.options.keys_hints.tick_ms = Some(20);
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         assert!(
             matches!(requests.try_recv(), Ok(Assistance::KeysHint { tick, .. }) if tick == Duration::from_millis(20))
         );
@@ -2865,7 +2967,7 @@ mod tests {
         {
             app.invalidate();
             app.editor.line = line.into();
-            app.request_size_hint();
+            app.request_size_hint(Instant::now());
             assert!(requests.try_recv().is_err(), "{line}");
         }
         app.editor.line = "KEYS s*".into();
@@ -2878,7 +2980,7 @@ mod tests {
         ] {
             app.invalidate();
             app.mode = mode;
-            app.request_size_hint();
+            app.request_size_hint(Instant::now());
             assert!(requests.try_recv().is_err());
         }
         app.mode = Mode::Ready;
@@ -2886,7 +2988,7 @@ mod tests {
             app.invalidate();
             app.options.size_hints = all;
             app.options.keys_hints.enabled = keys;
-            app.request_size_hint();
+            app.request_size_hint(Instant::now());
             assert!(requests.try_recv().is_err());
         }
     }
@@ -2898,7 +3000,7 @@ mod tests {
         app.workers.assistance = assistance;
         app.editor.line = "KEYS s".into();
         app.editor.cursor = app.editor.line.len();
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         let Assistance::KeysHint { generation, .. } =
             requests.try_recv().unwrap()
         else {
@@ -2911,6 +3013,7 @@ mod tests {
                 count: 2,
                 label: "[~2/500 keys; scanning]".into(),
             }),
+            done: false,
         };
         app.on_worker(hinted("KEYS s"));
         let mut rendered = Vec::new();
@@ -2925,7 +3028,7 @@ mod tests {
         assert!(app.size_hint.is_none());
         app.on_worker(hinted("KEYS s"));
         assert!(app.size_hint.is_none());
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         assert!(
             matches!(requests.try_recv(), Ok(Assistance::KeysHint { pattern, .. }) if pattern == b"s*")
         );
@@ -2939,7 +3042,7 @@ mod tests {
         app.workers.assistance = assistance;
         app.editor.line = "SUNION a \"b c\"".into();
         app.editor.cursor = app.editor.line.len();
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         let Ok(Assistance::SizeHint { command, keys, .. }) =
             requests.try_recv()
         else {
@@ -2947,7 +3050,7 @@ mod tests {
         };
         assert_eq!(command, "SUNION");
         assert_eq!(keys, [b"a".to_vec(), b"b c".to_vec()]);
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         assert!(requests.try_recv().is_err(), "same line requests once");
         for (line, mode) in [
             ("SUNIONSTORE d a", Mode::Ready),
@@ -2957,7 +3060,7 @@ mod tests {
             app.invalidate();
             app.mode = mode;
             app.editor.line = line.into();
-            app.request_size_hint();
+            app.request_size_hint(Instant::now());
             assert!(requests.try_recv().is_err(), "{line}");
         }
         app.mode = Mode::Ready;
@@ -2970,6 +3073,7 @@ mod tests {
                 count: 7,
                 label: "[≤7 members]".into(),
             }),
+            done: true,
         };
         app.on_worker(hinted(app.workers.current() + 1));
         assert!(app.size_hint.is_none(), "stale results are ignored");
@@ -2984,6 +3088,145 @@ mod tests {
         app.editor.line.push('c');
         app.editor.cursor += 1;
         assert!(!render(&mut app, &mut screen).contains("members]"));
+    }
+
+    fn finish_size_hint(app: &mut App, label: &str) {
+        let line = app.editor.line.clone();
+        app.on_worker(Event::SizeHinted {
+            generation: app.workers.current(),
+            line,
+            hint: Some(estimate::SizeHint {
+                count: 1,
+                label: label.into(),
+            }),
+            done: true,
+        });
+    }
+
+    #[test]
+    fn size_hints_refresh_after_finishing_without_overlap() {
+        let (mut app, _) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.options.size_refresh = Some(Duration::from_millis(500));
+        app.editor.line = "SMEMBERS s".into();
+        app.editor.cursor = app.editor.line.len();
+        let start = Instant::now();
+        app.request_size_hint(start);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Assistance::SizeHint { .. })
+        ));
+        let later = start + Duration::from_secs(10);
+        app.request_size_hint(later);
+        assert!(
+            requests.try_recv().is_err(),
+            "in-flight requests never stack"
+        );
+        finish_size_hint(&mut app, "[1 members]");
+        let finished = app.size_requested.as_ref().unwrap().finished.unwrap();
+        app.request_size_hint(finished + Duration::from_millis(499));
+        assert!(requests.try_recv().is_err(), "waits the full interval");
+        app.request_size_hint(finished + Duration::from_millis(500));
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Assistance::SizeHint { .. })
+        ));
+        assert!(
+            app.size_hint
+                .as_ref()
+                .is_some_and(|(_, hint)| { hint.label == "[1 members]" }),
+            "the old hint stays until the refresh has a value"
+        );
+        app.request_size_hint(later + Duration::from_secs(10));
+        assert!(requests.try_recv().is_err());
+        finish_size_hint(&mut app, "[2 members]");
+        assert_eq!(app.size_hint.as_ref().unwrap().1.label, "[2 members]");
+
+        // Hidden hints are not refreshed, and edits restart the cycle.
+        app.editor.cursor = 0;
+        app.request_size_hint(later + Duration::from_secs(60));
+        assert!(requests.try_recv().is_err());
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.request_size_hint(Instant::now());
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Assistance::SizeHint { keys, .. }) if keys == [b"sx".to_vec()]
+        ));
+        assert!(app.size_requested.as_ref().unwrap().finished.is_none());
+    }
+
+    #[test]
+    fn keys_hints_refresh_on_scan_or_count_intervals_without_progress() {
+        let (mut app, _) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.options.size_refresh = Some(Duration::from_millis(500));
+        app.options.scan_refresh = Some(Duration::from_millis(5000));
+        for (line, interval) in [("KEYS s*", 5000), ("KEYS *", 500)] {
+            app.invalidate();
+            app.editor.line = line.into();
+            app.editor.cursor = app.editor.line.len();
+            app.request_size_hint(Instant::now());
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(Assistance::KeysHint { progress: true, .. })
+            ));
+            // Running counts do not finish the request.
+            app.on_worker(Event::SizeHinted {
+                generation: app.workers.current(),
+                line: line.into(),
+                hint: None,
+                done: false,
+            });
+            assert!(app.size_requested.as_ref().unwrap().pending);
+            finish_size_hint(&mut app, "[~1 keys]");
+            let finished =
+                app.size_requested.as_ref().unwrap().finished.unwrap();
+            app.request_size_hint(
+                finished + Duration::from_millis(interval - 1),
+            );
+            assert!(requests.try_recv().is_err(), "{line}");
+            app.request_size_hint(finished + Duration::from_millis(interval));
+            assert!(
+                matches!(
+                    requests.try_recv(),
+                    Ok(Assistance::KeysHint {
+                        progress: false,
+                        ..
+                    })
+                ),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_refresh_intervals_never_repeat_requests() {
+        let (mut app, _) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.options.size_refresh = None;
+        app.options.scan_refresh = None;
+        for line in ["SMEMBERS s", "KEYS *", "KEYS s*"] {
+            app.invalidate();
+            app.editor.line = line.into();
+            app.editor.cursor = app.editor.line.len();
+            app.request_size_hint(Instant::now());
+            assert!(requests.try_recv().is_ok(), "{line}");
+            finish_size_hint(&mut app, "[1 members]");
+            app.request_size_hint(Instant::now() + Duration::from_secs(3600));
+            assert!(requests.try_recv().is_err(), "{line}");
+        }
+        // Lines without hints never schedule refreshes either.
+        app.options.size_refresh = Some(Duration::ZERO);
+        app.invalidate();
+        app.editor.line = "SET k v".into();
+        app.editor.cursor = app.editor.line.len();
+        app.request_size_hint(Instant::now());
+        app.request_size_hint(Instant::now() + Duration::from_secs(1));
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]
@@ -3008,6 +3251,7 @@ mod tests {
                     count,
                     label: label.clone(),
                 }),
+                done: true,
             });
             let mut rendered = Vec::new();
             app.draw_size_hint(&mut rendered, 0, 80).unwrap();
@@ -3042,7 +3286,7 @@ mod tests {
         app.options.size_hints = false;
         app.editor.line = "SMEMBERS s".into();
         app.editor.cursor = app.editor.line.len();
-        app.request_size_hint();
+        app.request_size_hint(Instant::now());
         assert!(requests.try_recv().is_err());
         assert!(app.size_requested.is_none());
         app.on_worker(Event::SizeHinted {
@@ -3052,6 +3296,7 @@ mod tests {
                 count: 5_000_000,
                 label: "[5000000 members]".into(),
             }),
+            done: true,
         });
         let mut rendered = Vec::new();
         app.draw_size_hint(&mut rendered, 0, 80).unwrap();

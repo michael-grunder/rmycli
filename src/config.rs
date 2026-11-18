@@ -18,6 +18,8 @@ pub struct Settings {
     pub size_hints: bool,
     pub size_hint_threshold: u64,
     pub tick_ms: u64,
+    pub size_hint_refresh_ms: i64,
+    pub scan_hint_refresh_ms: i64,
     pub keys_hints: KeysHints,
     pub prompt: crate::prompt::Prompt,
     pub encrypt_auth: bool,
@@ -36,6 +38,8 @@ impl Default for Settings {
             size_hints: true,
             size_hint_threshold: 10_000,
             tick_ms: 100,
+            size_hint_refresh_ms: 500,
+            scan_hint_refresh_ms: 5000,
             keys_hints: KeysHints::default(),
             prompt: crate::prompt::Prompt::default(),
             encrypt_auth: false,
@@ -64,6 +68,14 @@ where
         ));
     }
     Ok(letter)
+}
+
+/// A refresh interval in milliseconds; zero or negative disables refreshing.
+pub fn refresh_interval(ms: i64) -> Option<std::time::Duration> {
+    u64::try_from(ms)
+        .ok()
+        .filter(|&ms| ms > 0)
+        .map(std::time::Duration::from_millis)
 }
 
 impl Settings {
@@ -381,6 +393,8 @@ mod tests {
             assert!(settings.size_hints);
             assert_eq!(settings.size_hint_threshold, 10_000);
             assert_eq!(settings.tick_ms, 100);
+            assert_eq!(settings.size_hint_refresh_ms, 500);
+            assert_eq!(settings.scan_hint_refresh_ms, 5000);
             assert!(settings.keys_hints.enabled);
             assert_eq!(settings.keys_hints.count, 1000);
             assert_eq!(settings.keys_hints.tick_ms, None);
@@ -404,6 +418,31 @@ mod tests {
             }
         );
         assert_eq!(settings.theme.size_hint_warning, Color::AnsiValue(123));
+    }
+
+    #[test]
+    fn refresh_intervals_accept_never_and_milliseconds() {
+        let settings = Settings::parse(
+            "size-hint-refresh-ms = 0\nscan-hint-refresh-ms = -1",
+        )
+        .unwrap();
+        assert_eq!(refresh_interval(settings.size_hint_refresh_ms), None);
+        assert_eq!(refresh_interval(settings.scan_hint_refresh_ms), None);
+        let settings = Settings::parse(
+            "size-hint-refresh-ms = 250\nscan-hint-refresh-ms = 60000",
+        )
+        .unwrap();
+        assert_eq!(
+            refresh_interval(settings.size_hint_refresh_ms),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert_eq!(
+            refresh_interval(settings.scan_hint_refresh_ms),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(refresh_interval(i64::MIN), None);
+        assert!(Settings::parse("size-hint-refresh-ms = '500'").is_err());
+        assert!(Settings::parse("scan-hint-refresh-ms = 1.5").is_err());
     }
 
     #[test]

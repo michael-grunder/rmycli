@@ -95,13 +95,17 @@ pub struct SizeHint {
 }
 
 /// One pass over a pattern; count entries without storing or deduplicating keys.
+/// `publish` receives each hint and whether it is final. With `progress` off,
+/// as for refreshes, only the final count is published so a displayed hint is
+/// replaced rather than counted up again.
 pub fn keys_hint(
     connection: &mut impl redis::ConnectionLike,
     pattern: &[u8],
     count: u64,
     tick: Duration,
+    progress: bool,
     cancelled: impl Fn() -> bool,
-    mut publish: impl FnMut(SizeHint) -> bool,
+    mut publish: impl FnMut(SizeHint, bool) -> bool,
 ) -> redis::RedisResult<()> {
     if cancelled() {
         return Ok(());
@@ -111,16 +115,24 @@ pub fn keys_hint(
         return Ok(());
     }
     if pattern == b"*" {
-        publish(SizeHint {
-            count: dbsize,
-            label: format!("[~{dbsize} keys]"),
-        });
+        publish(
+            SizeHint {
+                count: dbsize,
+                label: format!("[~{dbsize} keys]"),
+            },
+            true,
+        );
         return Ok(());
     }
-    if !publish(SizeHint {
-        count: 0,
-        label: format!("[~0/{dbsize} keys; scanning]"),
-    }) {
+    if progress
+        && !publish(
+            SizeHint {
+                count: 0,
+                label: format!("[~0/{dbsize} keys; scanning]"),
+            },
+            false,
+        )
+    {
         return Ok(());
     }
     let mut cursor = 0_u64;
@@ -136,15 +148,19 @@ pub fn keys_hint(
         total = total.saturating_add(keys.len() as u64);
         drop(keys);
         cursor = next;
-        let progress = if cursor == 0 { "" } else { "; scanning" };
-        if cancelled()
-            || !publish(SizeHint {
-                count: total,
-                label: format!("[~{total}/{dbsize} keys{progress}]"),
-            })
-            || cursor == 0
-        {
+        let done = cursor == 0;
+        if cancelled() {
             return Ok(());
+        }
+        if done || progress {
+            let suffix = if done { "" } else { "; scanning" };
+            let hint = SizeHint {
+                count: total,
+                label: format!("[~{total}/{dbsize} keys{suffix}]"),
+            };
+            if !publish(hint, done) || done {
+                return Ok(());
+            }
         }
         // Even a long configured interval must yield promptly to edits.
         let started = Instant::now();
@@ -160,24 +176,28 @@ pub fn keys_hint(
 }
 
 /// A short `[N unit]` label, `≤` marking upper bounds. Wrong-type keys and
-/// failed probes give `None`; data can change before the command runs.
+/// failed probes are errors, and unsized commands or unparsable ranges give
+/// `None`; data can change before the command runs.
 pub fn size_hint(
-    connection: &mut Connection,
+    connection: &mut impl redis::ConnectionLike,
     command: &str,
     args: &[Vec<u8>],
     keys: &[Vec<u8>],
-) -> Option<SizeHint> {
-    let (probe, unit, combine) = probe(command)?;
+) -> redis::RedisResult<Option<SizeHint>> {
+    let Some((probe, unit, combine)) = probe(command) else {
+        return Ok(None);
+    };
     let mut pipe = redis::pipe();
     for key in keys {
         pipe.cmd(probe).arg(key);
     }
-    let counts: Vec<i64> = pipe.query(connection).ok()?;
-    let (count, upper) = total(combine, &counts, args)?;
-    Some(SizeHint {
-        count,
-        label: format!("[{}{count} {unit}]", if upper { "≤" } else { "" }),
-    })
+    let counts: Vec<i64> = pipe.query(connection)?;
+    Ok(
+        total(combine, &counts, args).map(|(count, upper)| SizeHint {
+            count,
+            label: format!("[{}{count} {unit}]", if upper { "≤" } else { "" }),
+        }),
+    )
 }
 
 pub const fn needs_confirmation(
@@ -266,9 +286,10 @@ mod tests {
             pattern,
             123,
             tick,
+            true,
             || false,
-            |hint| {
-                hints.push((hint.count, hint.label));
+            |hint, done| {
+                hints.push((hint.count, hint.label, done));
                 true
             },
         )
@@ -276,10 +297,10 @@ mod tests {
         assert_eq!(
             hints,
             [
-                (0, "[~0/500 keys; scanning]".into()),
-                (2, "[~2/500 keys; scanning]".into()),
-                (2, "[~2/500 keys; scanning]".into()),
-                (3, "[~3/500 keys]".into()),
+                (0, "[~0/500 keys; scanning]".into(), false),
+                (2, "[~2/500 keys; scanning]".into(), false),
+                (2, "[~2/500 keys; scanning]".into(), false),
+                (3, "[~3/500 keys]".into(), true),
             ]
         );
         assert_eq!(
@@ -312,14 +333,15 @@ mod tests {
             b"*",
             10,
             Duration::ZERO,
+            true,
             || false,
-            |hint| {
-                hints.push(hint.label);
+            |hint, done| {
+                hints.push((hint.label, done));
                 true
             },
         )
         .unwrap();
-        assert_eq!(hints, ["[~500 keys]"]);
+        assert_eq!(hints, [("[~500 keys]".to_owned(), true)]);
         assert_eq!(source.commands.len(), 1);
         source.replies =
             VecDeque::from([Err((redis::ErrorKind::Client, "denied").into())]);
@@ -329,8 +351,9 @@ mod tests {
                 b"s*",
                 10,
                 Duration::ZERO,
+                true,
                 || false,
-                |_| {
+                |_, _| {
                     panic!("failed DBSIZE must not publish zero");
                 }
             )
@@ -346,8 +369,9 @@ mod tests {
             b"s*",
             10,
             Duration::ZERO,
+            true,
             || true,
-            |_| panic!("cancelled"),
+            |_, _| panic!("cancelled"),
         )
         .unwrap();
         assert_eq!(source.commands, Vec::<Vec<u8>>::new());
@@ -357,11 +381,12 @@ mod tests {
             b"*",
             10,
             Duration::ZERO,
+            true,
             || {
                 checks.set(checks.get() + 1);
                 checks.get() > 1
             },
-            |_| panic!("cancelled after DBSIZE"),
+            |_, _| panic!("cancelled after DBSIZE"),
         )
         .unwrap();
         assert_eq!(source.commands.len(), 1);
@@ -373,8 +398,9 @@ mod tests {
             b"s*",
             10,
             Duration::from_secs(60),
+            true,
             || cancelled.get(),
-            |hint| {
+            |hint, _| {
                 if hint.count > 0 {
                     cancelled.set(true);
                 }
@@ -383,6 +409,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.commands.len(), 2, "no next tick after cancellation");
+    }
+
+    #[test]
+    fn refreshes_publish_only_the_final_count() {
+        let mut source = batches();
+        let mut hints = Vec::new();
+        keys_hint(
+            &mut source,
+            b"s*",
+            10,
+            Duration::ZERO,
+            false,
+            || false,
+            |hint, done| {
+                hints.push((hint.label, done));
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(hints, [("[~3/500 keys]".to_owned(), true)]);
+        assert!(source.replies.is_empty(), "the scan still runs to the end");
+
+        let mut source = batches();
+        let checks = Cell::new(0);
+        keys_hint(
+            &mut source,
+            b"s*",
+            10,
+            Duration::ZERO,
+            false,
+            || {
+                // Before and after DBSIZE, the loop, then after a SCAN reply.
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            |_, _| panic!("cancelled refreshes publish nothing"),
+        )
+        .unwrap();
+        assert_eq!(source.commands.len(), 2, "DBSIZE and one SCAN");
     }
 
     #[test]
