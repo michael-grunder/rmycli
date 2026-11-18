@@ -77,7 +77,7 @@ jobs:
             target/aarch64-apple-darwin/release/rmycli \
             target/x86_64-apple-darwin/release/rmycli \
             -output target/dist/package/rmycli
-          lipo -verify_arch arm64 x86_64 target/dist/package/rmycli
+          lipo target/dist/package/rmycli -verify_arch arm64 x86_64
           codesign --force --sign - target/dist/package/rmycli
           codesign --verify target/dist/package/rmycli
       - name: Package and checksum
