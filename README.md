@@ -13,7 +13,8 @@ and shows live reply-size hints such as `[3 members]` while typing.
 
 Common `redis-cli` connection, scripting, and output options are supported,
 including RESP3 and cluster redirects. Cluster-wide discovery, replication/RDB
-transfers, and estimates for commands other than `LRANGE` are not implemented.
+transfers, and pre-execution confirmation for commands other than `LRANGE`
+are not implemented.
 See **Compatibility and limits** below for metadata and streaming limitations.
 
 ## Install and connect
@@ -22,14 +23,17 @@ Use Rust 1.88 or newer (the current stable toolchain is recommended).
 Building from source also requires a C compiler and `make` for the bundled
 libsodium cryptography library.
 
-Once version 0.1.0 is published to crates.io, install it with:
+To install this release from GitHub:
 
 ```sh
-cargo install rmycli --locked
+cargo install --git https://github.com/michael-grunder/rmycli --tag v0.2.0 --locked
 ```
 
-To install from a source checkout instead, run `cargo install --path . --locked`
-in the project directory. Then connect to Redis:
+From a source checkout, run `cargo install --path . --locked` in the project
+directory. After the maintainer publishes v0.2.0 to crates.io, you can also run
+`cargo install rmycli --version 0.2.0 --locked`.
+
+Connect to Redis with any of these commands:
 
 ```sh
 rmycli
@@ -267,9 +271,9 @@ A dedicated reader keeps partial frames across waits and feeds a bounded
 64-message channel. User commands remain serialized on the same connection,
 including protocol changes, transactions, RESP2/RESP3 Pub/Sub, and `MONITOR`.
 This raw stream is needed because redis-rs's async multiplexer does not expose
-arbitrary streaming replies on an existing connection. Dropping a session
-aborts its reader; Ctrl-C still kills the exact server client to cancel a
-blocking command. Completion, estimation, and metadata use separate
+arbitrary streaming replies on an existing connection. Ctrl-C during a blocking
+command closes the session socket locally and aborts its reader.
+Completion, estimation, and metadata use separate
 synchronous connections with timeouts on their worker thread.
 
 ## Configuration and saved instances
@@ -1152,7 +1156,7 @@ RMYCLI_TEST_BINARY=target/x86_64-unknown-linux-musl/release/rmycli \
 ### Publishing
 
 Use the [release skill](.agents/skills/release-rmycli/SKILL.md) from a checkout.
-For example, ask Codex to “Use `$release-rmycli` to release version 0.1.0.”
+For example, ask Codex to “Use `$release-rmycli` to prepare a minor release.”
 It updates the package version, reviews the documentation, consolidates the
 dated changelog, and runs the required checks before committing. It pushes
 the release commit and a detailed annotated `v<version>` tag to GitHub.

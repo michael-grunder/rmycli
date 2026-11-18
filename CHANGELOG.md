@@ -6,116 +6,109 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-17
+
 ### Added
 
-- Add a repository release skill that prepares the version and release notes,
-  checks the build, and pushes an annotated tag and release commit to GitHub.
+- See live reply-size hints for `GET`, `LRANGE`, hash reads, and set and sorted
+  set operations. Counts show their units and multi-key bounds use `≤`.
+  Background probes pause during transactions, WATCH, and streaming. Configure
+  the colors and warning threshold (default 10,000), or disable probes with
+  `size-hints = false`.
+- Preview a `KEYS` pattern while typing. `KEYS *` uses one `DBSIZE` request.
+  Other patterns show a running estimate from `SCAN MATCH` alongside the
+  initial database size. Counts can include duplicates. Editing or submitting
+  cancels the scan. Configure the batch size and delay under `[keys-hints]`.
+- Press Ctrl+X followed by Enter to stream `KEYS <pattern>` using `SCAN`,
+  including inside tmux. Set `alternate-prefix` to change the shortcut.
+  Ctrl+Enter remains available on terminals that support it.
+- Recall the last 500 history entries across sessions. Recall and Ctrl-R search
+  use the current endpoint by default. Set `history-per-server = false` to
+  search all endpoints. Ctrl-R supports fuzzy and exact matches. Enter recalls
+  a command for editing, and Esc or Ctrl-C restores the draft.
+- Save multiple ACL accounts per endpoint in a separate credential store.
+  Automatic saving is off by default. Set `save-auth` to `"local"` or
+  `"always"` to save credentials after successful authentication, including
+  on redirect destinations. Select an account with `--user`, or set its
+  default offline with `--set-default-user`. Without either, the first
+  username in alphabetical order is used.
+- Encrypt saved credentials with a master passphrase using Argon2id and
+  XChaCha20-Poly1305. Set `encrypt-auth` for new saves. To migrate existing
+  credentials, run `rmycli auth encrypt`, verify the encrypted store, then
+  remove the retained plaintext file. Use `auth passwd` to change the
+  passphrase and interactive `\auth` commands to lock or unlock the store.
+- Complete shell options, configured instances, and locally saved usernames in
+  Bash, Zsh, Fish, PowerShell, and Elvish. Completion runs offline and leaves
+  encrypted credential stores locked.
+- Set the default RESP version globally or per instance with `resp = 2` or
+  `resp = 3`. Command-line `-2` and `-3` take precedence. Users of development
+  checkouts with the temporary `resp3` boolean should replace it with `resp`.
+- Follow standalone Valkey primary redirects, including during `--scan`.
+  Capability detection retries after authentication. Redirects are bounded
+  and skip watched or transactional commands.
+- GitHub Actions runs Linux and macOS CI and builds checksummed static Linux
+  x86-64 and ARM64 archives and a universal macOS archive. Contributors can
+  test a distribution binary with `RMYCLI_TEST_BINARY` and prepare a tagged
+  release with the repository release skill.
 
-- One-shot alternate execution with Ctrl+X followed by Enter, including through
-  tmux without extended keyboard support. Configure `alternate-prefix` in
-  `rmycli.toml` or with `config get/set/unset`. The prompt's `{ctrl}` indicator
-  shows `[Alt]` for the pending prefix and `[Ctrl]` for held Ctrl; other keys
-  cancel the prefix and retain their normal action.
-  Ctrl+Enter remains available on supporting terminals.
+### Changed
 
-- Live KEYS hints: `KEYS *` uses `DBSIZE`; other patterns update
-  `[~matches/dbsize keys; scanning]` after each background `SCAN MATCH` batch.
-  The database-size snapshot stays visible after scanning completes. Counts
-  include duplicates and remain estimates. Edits and submission cancel scans.
-  Configure `[keys-hints]` with `enabled` (default true), `count` (default 1000),
-  and optional `tick-ms`, inheriting the global `tick-ms` (default 100 ms).
-  These settings support `config get/set/unset`; `size-hints = false` also
-  disables KEYS probes.
-
-- Configurable live reply-size hints: `size-hints` (default enabled),
-  `theme.size-hint` (default `dark_cyan`), `size-hint-threshold` (default 10,000),
-  and `theme.size-hint-warning` (default `red`). Counts at or above the threshold
-  use the warning color. Disabling hints also stops their background probes.
-  All four settings support `config get/set/unset`.
-
-- Live reply-size hints while typing, such as `SMEMBERS s [3 members]` or
-  `SUNION a b [≤5 members]`. Keys come from the server's `COMMAND` key specs;
-  `SCARD`/`ZCARD`/`HLEN`/`LLEN`/`STRLEN` probes run on the background
-  connection and pause during `MULTI`, `WATCH`, and streaming. Supported:
-  `SMEMBERS`, `SUNION`, `SINTER`, `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF`,
-  `HGETALL`, `HKEYS`, `HVALS`, `LRANGE`, and `GET`.
-
-- Global numeric `resp` configuration (`2` or `3`, default `2`) with per-instance
-  overrides, replacing the unreleased `resp3` boolean. Instances inherit
-  the global default when omitted; `-2` and `-3` override configuration.
-  Read, set, or restore inheritance with `config get/set/unset`.
-
-- Dynamic shell completions for Bash, Zsh, Fish, PowerShell, and Elvish using
-  clap's command-line definitions. Complete configured instance names and local
-  saved usernames for the selected endpoint, including partial names. Completion
-  never connects or prompts; encrypted credential stores remain locked.
-
-- Optional encrypted credential storage using libsodium Argon2id and
-  XChaCha20-Poly1305. Enable `encrypt-auth` for new saves, or migrate with
-  `rmycli auth encrypt`, which retains the original plaintext file and prints
-  its path. Encrypted files are automatically detected. Hidden master-passphrase
-  prompts, `auth passwd`, and interactive `\auth lock|unlock|passwd` manage the
-  store. Private atomic writes reject stale updates from concurrent sessions.
-
-- Configurable interactive prompts with named connection placeholders, literal
-  brace escaping, and named, RGB, or indexed foreground colors. The default
-  uses cyan connection details and a green Unicode `❯`. Manage the template
-  with `config get/set/unset prompt`; the example config documents all fields,
-  color formats, limits, and copyable recipes, including the older ASCII prompt.
+- The default prompt shows the session user, endpoint, and nonzero database
+  with a colored `❯`. Customize `prompt` with connection fields and named,
+  RGB, or indexed colors. The sample config includes an ASCII template.
+- Ctrl-C at the idle prompt exits. During command execution or MONITOR it
+  closes the socket locally. The shell reconnects quietly after cancellation
+  or connection loss. A new command or `\reconnect` retries a failed
+  connection. Reconnection starts a fresh session without replaying commands
+  or restoring transactions, watches, or subscriptions.
+- Enter commands and add subscriptions while subscribed. Redis enforces the
+  protocol's command restrictions. Ctrl-C at the subscribed prompt removes
+  ordinary channel subscriptions while keeping the connection, pattern
+  subscriptions, and shard subscriptions active.
+- Detect cluster mode on connection and follow MOVED/ASK automatically.
+  Set `auto-cluster = false` to disable detection. The explicit `-c` switch
+  still enables redirect following.
+- Display queued SCAN, Pub/Sub, and MONITOR output as it arrives. MONITOR
+  preserves server quoting and hides the prompt until the stream ends.
+- `--askpass` supports paste, limits input to 1,024 bytes, and clears the
+  entered text from its buffer after use.
+- Source builds now require a C compiler and make for bundled libsodium.
 
 ### Fixed
 
-- Derive the terminal smoke test's `XGROUP DESTROY` hint expectation from
-  live command metadata, accommodating Redis versions that label the group
-  argument `groupname` instead of `group` while retaining color and cursor checks.
+- Drain all subscribe and unsubscribe acknowledgments, including RESP3 pushes
+  and multi-channel replies. Subsequent commands receive their own replies,
+  even when push display is disabled.
+- Quote bulk strings in interactive and `--no-raw` output. Format RESP3 maps
+  as numbered key/value pairs, mark set entries with `~`, label empty hashes
+  and sets, and align nested replies under multi-digit indexes.
+- Honor Shift and Caps Lock on Kitty keyboard protocol terminals. Decode
+  command names starting with a hex escape and reject malformed escapes such
+  as `\x+1`.
+- Follow repeated tokens in live `COMMAND DOCS`, retain hints for exclusive
+  score bounds, and accept mixed-case group names in `HELP @group`.
+- Keep WATCH active after a failed EXEC outside MULTI and ignore stray QUEUED
+  replies outside transactions.
+- Explain when authentication is required and refresh completion and help after
+  AUTH or HELLO AUTH without disturbing MULTI or WATCH. HELLO now parses
+  passwords and client names correctly when they resemble option names.
+- Skip unreadable or unsupported system certificate entries. Connections
+  using `--insecure` can start without a system certificate store.
+- Merge concurrent history saves and write history and plaintext credentials
+  atomically with owner-only permissions on Unix. Busy-file errors identify
+  the file and lock. Encrypted stores reject stale writes.
+- Terminal smoke tests wait for the post-authentication metadata refresh and
+  accept the server's argument name for `XGROUP DESTROY` across Redis versions.
 
-- Ctrl-C at an idle prompt now exits like `redis-cli` instead of clearing
-  the input. It still stops scans, unsubscribes while subscribed, and cancels
-  executing commands without exiting.
-- Render RESP3 maps as numbered `key => value` pairs, distinguish set entries
-  with `~`, and align collection indexes and nested replies.
+### Security
 
-- Show MONITOR lines with Redis's quoting and hide the prompt while monitoring.
-  Ctrl-C closes the socket locally before reconnecting, avoiding cancellation
-  handshake traffic in the monitor output and removing the need for CLIENT KILL
-  permissions.
+- Exclude credential-bearing Redis URLs from saved history and sensitive
+  commands from history recall and submitted-command transcripts.
 
-- Always double-quote bulk string replies in interactive and `--no-raw`
-  output, including strings inside collections, like redis-cli.
-- Accept interactive commands and additional subscriptions while subscribed,
-  leaving command restrictions to Redis. Ctrl-C sends argument-free `UNSUBSCRIBE`
-  without disconnecting; pattern and shard subscriptions remain active. Drain
-  every subscription acknowledgment and keep published messages separate from
-  command replies in RESP2 and RESP3, including when push display is disabled.
-- Type shifted characters correctly on Kitty keyboard protocol terminals, where
-  Shift+a produced `a` and Shift+; produced `;`. Caps Lock now applies as well.
-- Stop hanging on RESP3 `UNSUBSCRIBE`, `PUNSUBSCRIBE`, and `SUNSUBSCRIBE`, whose
-  acknowledgments are pushes, and read one acknowledgment per named channel so
-  later commands no longer receive the previous command's reply.
-- Recognize the `multiple_token` flag from live `COMMAND DOCS`, so hints and
-  completion follow repeated tokens such as `SORT key GET a GET b` on real
-  servers instead of only with bundled metadata.
-- Keep tracking `WATCH` after a failed `EXEC` without `MULTI`, which leaves the
-  server's watch in place, and ignore `QUEUED` replies outside a transaction.
-- Send commands whose first word starts with a `\xHH` escape as decoded bytes
-  rather than as a literal backslash command name.
-- Reject `\x+1` and similar sign-prefixed input instead of decoding it as hex.
-- Show `(empty hash)` and `(empty set)` for empty RESP3 replies. Empty maps
-  previously printed nothing. Align nested replies under indexes of 10 or more.
-- Keep inline hints for exclusive score bounds such as `ZCOUNT key (1 5`.
-- Accept any case in `HELP @group`.
-- Tolerate unreadable or unsupported entries in the system certificate store,
-  and do not require system certificates with `--insecure`.
+## [0.1.0] - 2026-11-04
 
-- Exclude credential-bearing Redis URLs from saved history, and omit sensitive
-  commands from recalled history and submitted-command transcripts.
+### Fixed
 
-- Synchronize the terminal authentication test with the metadata refresh so
-  release builds do not race completion against the catalog update.
-
-- Explain when a server requires authentication, and reload completion and help
-  metadata after successful AUTH or HELLO AUTH without disturbing MULTI/WATCH.
-- Parse HELLO options without mistaking passwords or client names for options.
 - Avoid flashing the startup metadata-loading message on fast connections;
   show it only after 200 ms or when you type.
 - Display RESP3 invalidations while the interactive prompt is idle, without
@@ -129,37 +122,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   status appears only when a reply takes longer than 200 ms or you type.
 
 ### Changed
-
-- History and plaintext credential saves share one locked, atomic write path.
-  A busy-file error now names the file as well as its stale lock.
-
-- Reconnect interactive sessions quietly after cancellation or connection loss.
-  Failed reconnects can be retried by submitting a new command or `\reconnect`.
-  Interrupted commands are never replayed; connection-local state such as
-  transactions, WATCH, and subscriptions is not restored.
-
-- Render queued streaming output without waiting for the input poll interval.
-  An interactive `KEYS` scan of 300,000 keys dropped from about 95 seconds to
-  about 1 second, and MONITOR and Pub/Sub output is no longer limited to 64
-  messages per 40 ms poll.
-- `--askpass` shares the hidden prompt used for master passphrases, adding
-  paste support, a 1024-byte limit, and zeroizing of the entered text.
-- Automatically select the first saved account in alphabetical username order
-  when no user or saved default is specified. Explicit users and saved defaults
-  retain precedence.
-- Include the session username in the prompt and command transcript, such as
-  `alice@127.0.0.1:6379>`, using `default` when no username is supplied.
-
-- Save credentials for successfully authenticated MOVED, ASK, and Valkey REDIRECT
-  destinations when permitted by `save-auth`, so later direct connections to
-  those nodes can authenticate automatically.
-
-- Automatically detect cluster mode after connecting; `auto-cluster = false`
-  disables automatic MOVED/ASK following, while `-c` remains an explicit override.
-
-- Show the current host and port (or Unix socket path) in the interactive
-  prompt and command transcript, like redis-cli, retaining nonzero database
-  suffixes and the Ctrl indicator.
 
 - Use Ctrl+Enter instead of Shift+Enter for alternate KEYS scanning. Request
   modifier press/release events and show `[Ctrl]` in the prompt while either
@@ -194,38 +156,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- Keep multiple saved ACL accounts per server, preserving existing credentials.
-  Accounts can be selected with `--user` or a saved default.
-  `--set-default-user USER` selects an existing saved account without
-  connecting, including `default` for password-only authentication.
-- `history-per-server` setting (default: `true`); set it to `false` for flat
-  history recall and search across servers while retaining stored server tags.
-- Persistent interactive history in `~/.config/rmycli_history` (or the XDG
-  configuration directory), shared in one file capped at 500 entries across
-  servers. Recall and search load only the connected endpoint's history;
-  sessions merge new entries on exit using atomic, owner-only writes on Unix.
-  Common credential-bearing commands are excluded from disk history.
-- Ctrl-R history search with fuzzy terms, apostrophe-prefixed exact substrings,
-  smart case, and newest-first deduplicated matches. Enter recalls without
-  executing; Esc/Ctrl-C restores the draft and cursor. Includes plain terminal
-  and isolated tmux coverage without requiring extended keyboard support.
-- GitHub Actions checks for formatting, Clippy, and the existing Rust/Redis
-  tests on Linux and macOS, plus Linux terminal smoke tests.
-- Manual and version-tag distribution builds for static musl Linux x86-64
-  and ARM64 binaries and a universal macOS binary, with release-build tests,
-  architecture/linkage checks, packaged documentation, and SHA-256 checksums.
-- `RMYCLI_TEST_BINARY` selects a binary for the terminal smoke suite, allowing
-  the same tests to exercise distribution builds.
-
-- Detect Valkey and negotiate `CLIENT CAPA REDIRECT` to follow standalone
-  primary redirects, including during `--scan`. Preserve connection settings,
-  cap redirect chains, and avoid replaying transactional or watched commands.
-  Retry detection after successful authentication without disturbing session
-  state; unsupported or denied probes leave manual commands available.
-- Separate `rmycli-auth.toml` server credentials, with automatic matching by
-  endpoint and opt-in `save-auth = false`, `"local"`, or `"always"` in the main
-  config. Successful authentication can save credentials atomically with
-  owner-only permissions on Unix; automatic saving defaults to off.
 - Link the GitHub repository as both the package homepage and source repository.
 - License the application source code under MIT, retaining the bundled Redis
   documentation's separate CC BY-SA 4.0 license and attribution.
