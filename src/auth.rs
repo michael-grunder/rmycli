@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::auth_vault::Vault;
 use redis::{ConnectionAddr, ConnectionInfo};
@@ -90,6 +90,99 @@ struct Server {
 }
 
 impl AuthFile {
+    /// Number of saved accounts across all endpoints.
+    pub fn accounts(&self) -> usize {
+        self.servers
+            .values()
+            .map(|server| server.credentials().len())
+            .sum()
+    }
+
+    /// Add accounts from `other` that `self` lacks. An account saved in both
+    /// with different passwords is a conflict and leaves `self` unchanged;
+    /// `self` keeps its default user when both name one.
+    pub fn merge(&mut self, other: Self) -> io::Result<()> {
+        let conflicts = other
+            .servers
+            .iter()
+            .filter_map(|(key, server)| {
+                Some((key, server, self.servers.get(key)?.credentials()))
+            })
+            .flat_map(|(key, server, saved)| {
+                server
+                    .credentials()
+                    .into_iter()
+                    .filter(move |(name, (_, password))| {
+                        saved
+                            .get(name)
+                            .is_some_and(|(_, existing)| existing != password)
+                    })
+                    .map(move |(name, _)| {
+                        format!(
+                            "{} (user '{}')",
+                            key.escape_default(),
+                            name.escape_default()
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return Err(io::Error::other(format!(
+                "both credential stores have different passwords for {}; remove one copy and retry",
+                conflicts.join(", ")
+            )));
+        }
+        let mut merged = self.clone();
+        for (key, server) in other.servers {
+            let Some(target) = merged.servers.get_mut(&key) else {
+                merged.servers.insert(key, server);
+                continue;
+            };
+            for (name, (user, password)) in server.credentials() {
+                if !target.credentials().contains_key(name) {
+                    target.add(user, password);
+                }
+            }
+            if target.default_user.is_none() {
+                target.default_user.clone_from(&server.default_user);
+            }
+        }
+        merged.validate()?;
+        *self = merged;
+        Ok(())
+    }
+
+    /// Render as a plaintext auth file using the documented layout.
+    fn to_document(&self) -> DocumentMut {
+        let mut servers = Table::new();
+        servers.set_implicit(true);
+        for (key, server) in &self.servers {
+            let mut table = Table::new();
+            if let Some(user) = &server.user {
+                table.insert("user", value(user.as_str()));
+            }
+            if let Some(password) = &server.password {
+                table.insert("password", value(password.as_str()));
+            }
+            if let Some(user) = &server.default_user {
+                table.insert("default-user", value(user.as_str()));
+            }
+            if !server.users.is_empty() {
+                let mut users = Table::new();
+                for (user, password) in &server.users {
+                    users.insert(user, value(password.as_str()));
+                }
+                table.insert("users", Item::Table(users));
+            }
+            servers.insert(key, Item::Table(table));
+        }
+        let mut document = DocumentMut::new();
+        if !servers.is_empty() {
+            document.insert("servers", Item::Table(servers));
+        }
+        document
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         if self
             .servers
@@ -121,6 +214,22 @@ impl Server {
             );
         }
         accounts
+    }
+
+    /// Add an account whose name is not yet saved for this endpoint.
+    fn add(&mut self, user: Option<&str>, password: &str) {
+        let password = Zeroizing::new(password.to_owned());
+        if let Some(user) = user {
+            self.users.insert(user.to_owned(), password);
+            return;
+        }
+        // A password-only account replaces the legacy single-account slot;
+        // its previous named account moves to the users table.
+        if let Some(old) = self.password.take() {
+            let old_user = self.user.take().unwrap_or_else(|| "default".into());
+            self.users.insert(old_user, old);
+        }
+        self.password = Some(password);
     }
 
     fn valid(&self) -> bool {
@@ -255,20 +364,78 @@ impl Store {
             .change_passphrase(&self.path, passphrase.as_bytes())
     }
 
-    pub fn migrate(&self, source: &Self) -> io::Result<()> {
-        if self.path.try_exists()? {
-            return Err(io::Error::other(
-                "encrypted auth file already exists; refusing to overwrite it",
-            ));
-        }
-        let (file, _) = source.read_file()?;
-        self.unlock()?;
+    fn vault(&self) -> io::Result<std::sync::MutexGuard<'_, Vault>> {
         self.vault
             .as_ref()
-            .ok_or_else(|| io::Error::other("destination is not encrypted"))?
+            .ok_or_else(|| {
+                io::Error::other("credential storage is not encrypted")
+            })?
             .lock()
-            .map_err(|_| io::Error::other("credential store unavailable"))?
-            .import(&self.path, file)
+            .map_err(|_| io::Error::other("credential store unavailable"))
+    }
+
+    /// Merge the plaintext `source` into this encrypted store and verify the
+    /// written file. Returns the source text that was migrated, so callers
+    /// can confirm it is unchanged before deleting it.
+    pub fn migrate(&self, source: &Self) -> io::Result<Zeroizing<String>> {
+        let (file, text) = source.read_file()?;
+        self.unlock()?;
+        let mut vault = self.vault()?;
+        vault.merge(&self.path, file)?;
+        vault.verify(&self.path)?;
+        drop(vault);
+        Ok(text)
+    }
+
+    /// Unlock this encrypted store and copy its credentials.
+    pub fn export(&self) -> io::Result<AuthFile> {
+        self.unlock()?;
+        Ok(self.vault()?.file()?.clone())
+    }
+
+    /// Merge `file` into this plaintext store. `file`'s default users win
+    /// over existing ones; conflicting passwords write nothing.
+    pub fn import(&self, file: AuthFile) -> io::Result<()> {
+        crate::locked_file::replace(&self.path, "toml.lock", |_| {
+            let (existing, _) = self.read_file()?;
+            let mut merged = file;
+            merged.merge(existing)?;
+            let text = Zeroizing::new(merged.to_document().to_string());
+            Ok(Some(text.as_bytes().to_vec()))
+        })?;
+        // The rename must be durable before the encrypted copy is deleted.
+        sync_parent(&self.path)
+    }
+
+    /// Delete this plaintext store if it still holds exactly `expected`.
+    pub fn remove_plaintext(&self, expected: &str) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            result => result?,
+        };
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(io::Error::other(
+                "the plaintext auth file is a symlink or has other hard links; delete every copy yourself",
+            ));
+        }
+        crate::locked_file::replace(&self.path, "toml.lock", |path| {
+            if *Zeroizing::new(std::fs::read_to_string(path)?) != expected {
+                return Err(io::Error::other(
+                    "the plaintext auth file changed during migration; run rmycli auth encrypt again",
+                ));
+            }
+            std::fs::remove_file(path)?;
+            Ok(None)
+        })?;
+        sync_parent(&self.path)
+    }
+
+    /// Delete this encrypted store if it is unchanged since unlocking.
+    pub fn remove_encrypted(&self) -> io::Result<()> {
+        self.vault()?.remove(&self.path)
     }
 
     fn read_file(&self) -> io::Result<(AuthFile, Zeroizing<String>)> {
@@ -544,14 +711,38 @@ impl Action {
     }
 }
 
+type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()
+}
+
+/// Both store locations under the user config directory.
+fn stores(dir: &Path) -> (Store, Store) {
+    (
+        Store::plaintext(dir.join("rmycli-auth.toml"), SaveAuth::Never),
+        Store::encrypted(dir.join("rmycli/auth.enc"), SaveAuth::Never),
+    )
+}
+
 pub fn run(
     args: &[std::ffi::OsString],
     disabled: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if args.len() != 2
-        || !matches!(args[1].to_str(), Some("encrypt" | "passwd"))
-    {
-        return Err("usage: rmycli auth encrypt | rmycli auth passwd".into());
+    config: Option<&Path>,
+) -> CliResult<()> {
+    let action = match args {
+        [_, action] => action.to_str(),
+        _ => None,
+    };
+    if !matches!(action, Some("encrypt" | "decrypt" | "passwd")) {
+        return Err(
+            "usage: rmycli auth encrypt | rmycli auth decrypt | rmycli auth passwd"
+                .into(),
+        );
     }
     if disabled {
         return Err("auth commands cannot be used with --no-config".into());
@@ -559,28 +750,129 @@ pub fn run(
     let dir = xdg::BaseDirectories::new()
         .get_config_home()
         .ok_or("cannot locate the user config directory")?;
-    let target = Store::encrypted(dir.join("rmycli/auth.enc"), SaveAuth::Never);
-    if args[1] == "encrypt" {
-        let source =
-            Store::plaintext(dir.join("rmycli-auth.toml"), SaveAuth::Never);
-        target.migrate(&source)?;
-        println!("Encrypted credentials saved to {}", target.path.display());
-        if source.path.try_exists()? {
-            eprintln!(
-                "Warning: the unencrypted auth file is still at {}. Delete it after verifying encrypted authentication works.",
-                source.path.display()
-            );
+    let (plaintext, encrypted) = stores(&dir);
+    match action {
+        Some("encrypt") => encrypt(&plaintext, &encrypted, config),
+        Some("decrypt") => decrypt(&plaintext, &encrypted, config),
+        _ => {
+            if !encrypted.path.try_exists()? {
+                return Err(
+                    "no encrypted auth file exists; use auth encrypt first"
+                        .into(),
+                );
+            }
+            encrypted.change_passphrase()?;
+            println!("Master passphrase changed");
+            Ok(())
         }
-    } else {
-        if !target.path.try_exists()? {
-            return Err(
-                "no encrypted auth file exists; use auth encrypt first".into(),
-            );
-        }
-        target.change_passphrase()?;
-        println!("Master passphrase changed");
     }
+}
+
+/// Plaintext is deleted last, so an interruption leaves the encrypted
+/// store (which takes precedence) in use.
+fn encrypt(
+    plaintext: &Store,
+    encrypted: &Store,
+    config: Option<&Path>,
+) -> CliResult<()> {
+    let migrated = encrypted.migrate(plaintext)?;
+    println!(
+        "Encrypted credentials saved to {} and verified",
+        encrypted.path.display()
+    );
+    if crate::config_cli::set_encrypt_auth(config, true)? {
+        println!("Set encrypt-auth = true");
+    }
+    if !plaintext.path.try_exists()? {
+        return Ok(());
+    }
+    let question = format!(
+        "Delete the plaintext auth file {}?",
+        plaintext.path.display()
+    );
+    if !crate::secret::confirm(&question, true)? {
+        eprintln!(
+            "Warning: the unencrypted auth file is still at {}. Delete it after verifying encrypted authentication works.",
+            plaintext.path.display()
+        );
+        return Ok(());
+    }
+    plaintext.remove_plaintext(&migrated).map_err(|error| {
+        format!(
+            "{error}. Encrypted credentials are in use, but {} still exists",
+            plaintext.path.display()
+        )
+    })?;
+    println!("Deleted {}", plaintext.path.display());
+    eprintln!(
+        "Deleting a file does not securely erase it from disks or backups. If the plaintext file may have been copied, change those Redis passwords."
+    );
     Ok(())
+}
+
+/// The encrypted file is deleted last, so an interruption leaves it in use
+/// and the command can simply be run again.
+fn decrypt(
+    plaintext: &Store,
+    encrypted: &Store,
+    config: Option<&Path>,
+) -> CliResult<()> {
+    if !encrypted.path.try_exists()? {
+        return Err("no encrypted auth file exists".into());
+    }
+    let file = encrypted.export()?;
+    let question = format!(
+        "Write {} saved password(s) as plaintext to {}?",
+        file.accounts(),
+        plaintext.path.display()
+    );
+    if !crate::secret::confirm(&question, false)? {
+        return Err("decryption cancelled; nothing changed".into());
+    }
+    plaintext.import(file)?;
+    println!(
+        "Plaintext credentials saved to {}",
+        plaintext.path.display()
+    );
+    if crate::config_cli::set_encrypt_auth(config, false)? {
+        println!("Removed encrypt-auth = true from the config");
+    }
+    encrypted.remove_encrypted().map_err(|error| {
+        format!(
+            "{error}. Run rmycli auth decrypt again to merge newer credentials"
+        )
+    })?;
+    println!("Deleted {}", encrypted.path.display());
+    Ok(())
+}
+
+/// Explain credentials that an `encrypt-auth` change leaves behind.
+pub fn storage_hint(encrypt: bool) -> Option<String> {
+    storage_hint_in(&xdg::BaseDirectories::new().get_config_home()?, encrypt)
+}
+
+fn storage_hint_in(dir: &Path, encrypt: bool) -> Option<String> {
+    let (plaintext, encrypted) = stores(dir);
+    if encrypt {
+        return match plaintext.read_file() {
+            Ok((file, _)) if file.accounts() == 0 => None,
+            Ok((file, _)) => Some(format!(
+                "Note: {} saved account(s) in {} were not encrypted; run `rmycli auth encrypt` to move them.",
+                file.accounts(),
+                plaintext.path.display()
+            )),
+            Err(_) => Some(format!(
+                "Note: {} could not be read and was not encrypted.",
+                plaintext.path.display()
+            )),
+        };
+    }
+    std::fs::symlink_metadata(&encrypted.path).is_ok().then(|| {
+        format!(
+            "Note: {} still exists and takes precedence over this setting; run `rmycli auth decrypt` to switch to plaintext storage.",
+            encrypted.path.display()
+        )
+    })
 }
 
 fn insert_user(
@@ -948,5 +1240,228 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&store.path).unwrap(), source);
         }
+    }
+
+    fn writable(store: &Store) -> Store {
+        Store {
+            policy: SaveAuth::Always,
+            ..store.clone()
+        }
+    }
+
+    fn passphrase(store: &Store) {
+        store
+            .vault()
+            .unwrap()
+            .unlock(&store.path, |_| Ok(Zeroizing::new("master".into())))
+            .unwrap();
+    }
+
+    fn parse(text: &str) -> AuthFile {
+        let file: AuthFile = toml::from_str(text).unwrap();
+        file.validate().unwrap();
+        file
+    }
+
+    fn json(file: &AuthFile) -> serde_json::Value {
+        serde_json::to_value(file).unwrap()
+    }
+
+    #[test]
+    fn merging_adds_missing_accounts_and_rejects_conflicts() {
+        let mut target =
+            parse("[servers.'redis://a:1']\nuser = 'alice'\npassword = 'a1'\n");
+        let source = parse(concat!(
+            "[servers.'redis://a:1']\npassword = 'default-pw'\n",
+            "default-user = 'default'\nusers = { alice = 'a1', bob = 'b1' }\n",
+            "[servers.'redis://b:2']\npassword = 'b2'\n",
+        ));
+        target.merge(source.clone()).unwrap();
+        assert_eq!(target.accounts(), 4);
+        let a = &target.servers["redis://a:1"];
+        assert_eq!(a.user, None);
+        assert_eq!(
+            a.password.as_deref().map(String::as_str),
+            Some("default-pw")
+        );
+        assert_eq!(a.users["alice"].as_str(), "a1");
+        assert_eq!(a.users["bob"].as_str(), "b1");
+        assert_eq!(a.default_user.as_deref(), Some("default"));
+        // Merging the same accounts again is a no-op.
+        let before = json(&target);
+        target.merge(source).unwrap();
+        assert_eq!(json(&target), before);
+
+        // The target's default user wins over the source's.
+        let mut chosen = parse(
+            "[servers.'redis://a:1']\ndefault-user = 'bob'\nusers = { bob = 'b1' }\n",
+        );
+        chosen
+            .merge(parse(
+                "[servers.'redis://a:1']\ndefault-user = 'carol'\nusers = { carol = 'c1' }\n",
+            ))
+            .unwrap();
+        assert_eq!(
+            chosen.servers["redis://a:1"].default_user.as_deref(),
+            Some("bob")
+        );
+
+        let conflict = parse(concat!(
+            "[servers.'redis://a:1']\nusers = { alice = 'other-secret' }\n",
+            "[servers.'redis://c:3']\npassword = 'c3'\n",
+        ));
+        let error = target.merge(conflict).unwrap_err().to_string();
+        assert!(error.contains("redis://a:1 (user 'alice')"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert_eq!(json(&target), before);
+    }
+
+    #[test]
+    fn plaintext_rendering_round_trips() {
+        let file = parse(concat!(
+            "[servers.'redis://localhost:6379']\nuser = 'alice'\n",
+            "password = 'a \"quoted\" secret'\ndefault-user = 'bob'\n",
+            "users = { bob = 'b1', 'dotted.name' = 'd1' }\n",
+            "[servers.'unix:/tmp/redis.sock']\npassword = 'sock'\n",
+        ));
+        let text = file.to_document().to_string();
+        assert_eq!(json(&parse(&text)), json(&file));
+        assert_eq!(AuthFile::default().to_document().to_string(), "");
+    }
+
+    #[test]
+    fn encrypt_merges_into_an_existing_store_and_deletes_only_unchanged_plaintext()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (plaintext, encrypted) = stores(dir.path());
+        let text = "[servers.'redis://localhost:7000']\npassword = 'old'\n";
+        std::fs::write(&plaintext.path, text).unwrap();
+        passphrase(&encrypted);
+        writable(&encrypted)
+            .save(&info("localhost", Some("old")))
+            .unwrap();
+        writable(&encrypted)
+            .save(&info("127.0.0.1", Some("loopback")))
+            .unwrap();
+        let migrated = encrypted.migrate(&plaintext).unwrap();
+        assert_eq!(*migrated, text);
+        assert_eq!(encrypted.export().unwrap().accounts(), 2);
+
+        std::fs::write(&plaintext.path, format!("{text}# edited\n")).unwrap();
+        assert!(
+            plaintext
+                .remove_plaintext(&migrated)
+                .unwrap_err()
+                .to_string()
+                .contains("changed during migration")
+        );
+        assert!(plaintext.path.exists());
+        let copy = dir.path().join("copy.toml");
+        std::fs::hard_link(&plaintext.path, &copy).unwrap();
+        assert!(plaintext.remove_plaintext("unused").is_err());
+        std::fs::remove_file(&copy).unwrap();
+        let mut current = Zeroizing::new(String::new());
+        current.push_str(&std::fs::read_to_string(&plaintext.path).unwrap());
+        plaintext.remove_plaintext(&current).unwrap();
+        assert!(!plaintext.path.exists());
+        plaintext.remove_plaintext(&current).unwrap();
+
+        // A conflicting plaintext password leaves the encrypted file alone.
+        std::fs::write(
+            &plaintext.path,
+            "[servers.'redis://localhost:7000']\npassword = 'new'\n",
+        )
+        .unwrap();
+        let before = std::fs::read(&encrypted.path).unwrap();
+        assert!(encrypted.migrate(&plaintext).is_err());
+        assert_eq!(before, std::fs::read(&encrypted.path).unwrap());
+    }
+
+    #[test]
+    fn decrypt_writes_plaintext_before_removing_the_encrypted_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (plaintext, encrypted) = stores(dir.path());
+        passphrase(&encrypted);
+        writable(&encrypted)
+            .save(&info("localhost", Some("secret")))
+            .unwrap();
+        let mut named = info("localhost", Some("alice-pw"));
+        named = named.clone().set_redis_settings(
+            named.redis_settings().clone().set_username("alice"),
+        );
+        writable(&encrypted).save(&named).unwrap();
+        encrypted.set_default_user(named.addr(), "alice").unwrap();
+        std::fs::write(
+            &plaintext.path,
+            "[servers.'redis://other:7000']\npassword = 'kept'\n",
+        )
+        .unwrap();
+        let file = encrypted.export().unwrap();
+
+        // Another session's write makes removal refuse after plaintext exists.
+        let racing = Store::encrypted(encrypted.path.clone(), SaveAuth::Always);
+        passphrase(&racing);
+        racing.save(&info("127.0.0.1", Some("late"))).unwrap();
+        plaintext.import(file).unwrap();
+        assert!(encrypted.remove_encrypted().is_err());
+        assert!(encrypted.path.exists());
+        // Rerunning merges the newer account; the identical ones are skipped.
+        encrypted.lock().unwrap();
+        passphrase(&encrypted);
+        plaintext.import(encrypted.export().unwrap()).unwrap();
+        encrypted.remove_encrypted().unwrap();
+        assert!(!encrypted.path.exists());
+
+        let mut selected = info("localhost", None);
+        plaintext.apply(&mut selected).unwrap();
+        assert_eq!(selected.redis_settings().username(), Some("alice"));
+        assert_eq!(selected.redis_settings().password(), Some("alice-pw"));
+        let mut late = info("127.0.0.1", None);
+        plaintext.apply(&mut late).unwrap();
+        assert_eq!(late.redis_settings().password(), Some("late"));
+        let mut other = info("other", None);
+        plaintext.apply(&mut other).unwrap();
+        assert_eq!(other.redis_settings().password(), Some("kept"));
+        assert_eq!(
+            std::fs::metadata(&plaintext.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        // Conflicts write nothing.
+        let before = std::fs::read(&plaintext.path).unwrap();
+        let conflict =
+            parse("[servers.'redis://other:7000']\npassword = 'x'\n");
+        assert!(plaintext.import(conflict).is_err());
+        assert_eq!(before, std::fs::read(&plaintext.path).unwrap());
+    }
+
+    #[test]
+    fn setting_hints_describe_credentials_left_in_the_other_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plaintext, encrypted) = stores(dir.path());
+        assert_eq!(storage_hint_in(dir.path(), true), None);
+        assert_eq!(storage_hint_in(dir.path(), false), None);
+        std::fs::write(
+            &plaintext.path,
+            "[servers.'redis://a:1']\npassword = 'p'\nusers = { bob = 'b' }\n",
+        )
+        .unwrap();
+        let hint = storage_hint_in(dir.path(), true).unwrap();
+        assert!(hint.contains("2 saved account(s)"), "{hint}");
+        assert!(hint.contains("rmycli auth encrypt"), "{hint}");
+        std::fs::write(&plaintext.path, "password = 'leaked'").unwrap();
+        let hint = storage_hint_in(dir.path(), true).unwrap();
+        assert!(!hint.contains("leaked"), "{hint}");
+        passphrase(&encrypted);
+        writable(&encrypted)
+            .save(&info("localhost", Some("p")))
+            .unwrap();
+        let hint = storage_hint_in(dir.path(), false).unwrap();
+        assert!(hint.contains("rmycli auth decrypt"), "{hint}");
     }
 }

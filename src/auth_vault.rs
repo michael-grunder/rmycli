@@ -135,19 +135,8 @@ impl Vault {
         let key = header.key(passphrase.as_bytes())?;
         drop(passphrase);
         let file = if let Some(bytes) = &snapshot {
-            let mut plaintext =
-                Zeroizing::new(vec![
-                    0;
-                    bytes.len() - HEADER_LEN - aead::MAC_LENGTH
-                ]);
-            aead::decrypt(
-                &bytes[HEADER_LEN..],
-                Some(&header.bytes),
-                &key,
-                header.bytes[36..60].try_into().unwrap(),
-                &mut plaintext,
-            )
-            .map_err(|_| invalid("wrong passphrase or damaged file"))?;
+            let plaintext = payload(&header, &key, bytes)
+                .map_err(|_| invalid("wrong passphrase or damaged file"))?;
             let file: AuthFile = serde_json::from_slice(&plaintext)
                 .map_err(|_| invalid("invalid encrypted credential payload"))?;
             file.validate()?;
@@ -164,16 +153,47 @@ impl Vault {
         Ok(())
     }
 
-    pub fn import(&mut self, path: &Path, file: AuthFile) -> io::Result<()> {
-        if self.state()?.snapshot.is_some() {
+    /// Add accounts from `file`; any conflicting password aborts unchanged.
+    pub fn merge(&mut self, path: &Path, file: AuthFile) -> io::Result<()> {
+        self.update(path, |target| target.merge(file))
+    }
+
+    /// Decrypt the file on disk with the cached key and compare it with the
+    /// cached credentials, proving a completed write can be read back.
+    pub fn verify(&self, path: &Path) -> io::Result<()> {
+        let state = self.state()?;
+        let failed = || invalid("encrypted auth file failed verification");
+        let bytes = read_path(path)?.ok_or_else(failed)?;
+        let header = Header::parse(&bytes)?;
+        // The key is bound to the salt; a different salt means another writer.
+        if header.bytes[..36] != state.header.bytes[..36] {
+            return Err(failed());
+        }
+        let plaintext =
+            payload(&header, &state.key, &bytes).map_err(|_| failed())?;
+        let expected = Zeroizing::new(
+            serde_json::to_vec(&state.file).map_err(|_| failed())?,
+        );
+        if plaintext.as_slice() != expected.as_slice() {
+            return Err(failed());
+        }
+        Ok(())
+    }
+
+    /// Delete the encrypted file if it still matches the unlocked snapshot,
+    /// then lock. The stable lock file and private directory remain.
+    pub fn remove(&mut self, path: &Path) -> io::Result<()> {
+        let state = self.state()?;
+        let dir = directory(path, false)?;
+        let _lock = writer_lock(&dir)?;
+        if read(&dir)? != state.snapshot {
             return Err(io::Error::other(
-                "encrypted auth file already exists; refusing to overwrite it",
+                "encrypted auth file changed since unlocking; it was not deleted",
             ));
         }
-        self.update(path, |target| {
-            *target = file;
-            Ok(())
-        })
+        fs::unlinkat(&dir, FILE, AtFlags::empty())?;
+        self.lock();
+        dir.sync_all()
     }
 
     pub fn file(&self) -> io::Result<&AuthFile> {
@@ -226,6 +246,23 @@ impl Vault {
         self.unlocked = Some(replacement);
         Ok(())
     }
+}
+
+fn payload(
+    header: &Header,
+    key: &aead::Key<alkali::mem::FullAccess>,
+    bytes: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, alkali::AlkaliError> {
+    let mut plaintext =
+        Zeroizing::new(vec![0; bytes.len() - HEADER_LEN - aead::MAC_LENGTH]);
+    aead::decrypt(
+        &bytes[HEADER_LEN..],
+        Some(&header.bytes),
+        key,
+        header.bytes[36..60].try_into().unwrap(),
+        &mut plaintext,
+    )?;
+    Ok(plaintext)
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -307,16 +344,22 @@ fn read_path(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// Holds the stable writer lock until dropped.
+fn writer_lock(dir: &File) -> io::Result<File> {
+    let lock = open(dir, LOCK, OFlags::RDWR | OFlags::CREATE)?;
+    fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(
+        |_| io::Error::other("encrypted auth file is busy; retry later"),
+    )?;
+    Ok(lock)
+}
+
 fn persist(
     path: &Path,
     state: &mut Unlocked,
     file: &AuthFile,
 ) -> io::Result<()> {
     let dir = directory(path, true)?;
-    let lock = open(&dir, LOCK, OFlags::RDWR | OFlags::CREATE)?;
-    fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(
-        |_| io::Error::other("encrypted auth file is busy; retry later"),
-    )?;
+    let _lock = writer_lock(&dir)?;
     if read(&dir)? != state.snapshot {
         return Err(io::Error::other(
             "encrypted auth file changed since unlocking; lock and unlock again before retrying",
@@ -390,7 +433,7 @@ mod tests {
     fn create(path: &Path) -> Vault {
         let mut vault = Vault::default();
         unlock(&mut vault, path, "master-secret").unwrap();
-        vault.import(path, credentials()).unwrap();
+        vault.merge(path, credentials()).unwrap();
         vault
     }
 
@@ -540,7 +583,7 @@ mod tests {
                 .contains("changed since unlocking")
         );
         assert!(second.change_passphrase(&path, b"replacement").is_err());
-        assert!(second.import(&path, AuthFile::default()).is_err());
+        assert!(second.merge(&path, AuthFile::default()).is_err());
         assert_eq!(before, std::fs::read(&path).unwrap());
         second.lock();
         unlock(&mut second, &path, "master-secret").unwrap();
@@ -551,7 +594,7 @@ mod tests {
         unlock(&mut racing, &new_path, "master-secret").unwrap();
         create(&new_path);
         let before = std::fs::read(&new_path).unwrap();
-        assert!(racing.import(&new_path, AuthFile::default()).is_err());
+        assert!(racing.merge(&new_path, AuthFile::default()).is_err());
         assert_eq!(before, std::fs::read(&new_path).unwrap());
     }
 
@@ -612,5 +655,47 @@ mod tests {
         )
         .unwrap();
         assert!(read_path(&path).is_err());
+    }
+
+    #[test]
+    fn verification_and_removal_require_the_unlocked_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/auth.enc");
+        let mut vault = create(&path);
+        vault.verify(&path).unwrap();
+
+        // Another writer re-encrypts with a new salt: verification fails.
+        let mut other = Vault::default();
+        unlock(&mut other, &path, "master-secret").unwrap();
+        other.change_passphrase(&path, b"other").unwrap();
+        assert!(vault.verify(&path).is_err());
+        let changed = std::fs::read(&path).unwrap();
+        assert!(
+            vault
+                .remove(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("was not deleted")
+        );
+        assert_eq!(changed, std::fs::read(&path).unwrap());
+
+        // A held writer lock also prevents removal.
+        let lock = File::open(path.with_file_name(LOCK)).unwrap();
+        fs::flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert!(
+            other
+                .remove(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("busy")
+        );
+        drop(lock);
+        assert!(path.exists());
+
+        other.remove(&path).unwrap();
+        assert!(!path.exists());
+        assert!(!other.is_unlocked());
+        assert!(path.with_file_name(LOCK).exists());
+        assert!(Vault::default().remove(&path).is_err());
     }
 }

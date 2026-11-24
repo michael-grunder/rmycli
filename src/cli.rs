@@ -140,7 +140,7 @@ pub struct Options {
     pub certificates: TlsOptions,
     #[command(flatten, next_help_heading = "Execution")]
     pub batch: crate::batch::Options,
-    /// Redis command, `config get/set/unset`, or `auth encrypt/passwd`
+    /// Redis command, `config get/set/unset`, or `auth encrypt/decrypt/passwd`
     #[arg(trailing_var_arg = true)]
     pub command: Vec<OsString>,
 }

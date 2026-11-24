@@ -706,6 +706,15 @@ fn encrypted_auth_commands_require_hidden_terminal_prompts() {
             .contains("no encrypted auth file")
     );
     assert!(
+        error(fixture.base_command().args(["auth", "decrypt"]))
+            .contains("no encrypted auth file")
+    );
+    assert!(
+        error(fixture.base_command().args(["auth", "decrypt", "extra"]))
+            .contains("rmycli auth decrypt")
+    );
+    assert_eq!(before, std::fs::read(&source).unwrap());
+    assert!(
         error(fixture.base_command().args([
             "auth",
             "encrypt",

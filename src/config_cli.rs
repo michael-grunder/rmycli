@@ -105,14 +105,49 @@ pub fn run(
             let settings = Settings::parse(&document.to_string())?;
             save(&write_path(path)?, &document)?;
             display(&key, &document, &settings, colors, true)?;
+            storage_hint(&key, &settings);
         }
         Action::Unset { .. } => {
             edit(&mut document, &key, None)?;
-            Settings::parse(&document.to_string())?;
+            let settings = Settings::parse(&document.to_string())?;
             save(&write_path(path)?, &document)?;
+            storage_hint(&key, &settings);
         }
     }
     Ok(())
+}
+
+/// Changing `encrypt-auth` selects a store; it never moves credentials.
+fn storage_hint(key: &SettingKey, settings: &Settings) {
+    if key.parts == ["encrypt-auth"]
+        && let Some(hint) = crate::auth::storage_hint(settings.encrypt_auth)
+    {
+        eprintln!("{hint}");
+    }
+}
+
+/// Record the credential backend chosen by `rmycli auth encrypt/decrypt`.
+/// Disabling removes the explicit setting. Returns whether the file changed.
+pub fn set_encrypt_auth(path: Option<&Path>, enabled: bool) -> Result<bool> {
+    let source_path = Settings::find(path)?;
+    let mut document = read_document(source_path.as_deref(), true)?;
+    if !toggle_encrypt_auth(&mut document, enabled)? {
+        return Ok(false);
+    }
+    save(&write_path(path)?, &document)?;
+    Ok(true)
+}
+
+fn toggle_encrypt_auth(
+    document: &mut DocumentMut,
+    enabled: bool,
+) -> Result<bool> {
+    if Settings::parse(&document.to_string())?.encrypt_auth == enabled {
+        return Ok(false);
+    }
+    let key = SettingKey::parse("encrypt-auth")?;
+    edit(document, &key, enabled.then(|| Value::from(true)))?;
+    Ok(true)
 }
 
 fn read_document(
@@ -462,4 +497,37 @@ fn display(
     }
     writeln!(out)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_auth_toggle_sets_true_and_removes_it_when_disabled() {
+        let mut document: DocumentMut =
+            "# keep\nsave-auth = 'local' # trailing\n".parse().unwrap();
+        assert!(!toggle_encrypt_auth(&mut document, false).unwrap());
+        assert!(toggle_encrypt_auth(&mut document, true).unwrap());
+        assert!(Settings::parse(&document.to_string()).unwrap().encrypt_auth);
+        assert!(!toggle_encrypt_auth(&mut document, true).unwrap());
+        assert!(toggle_encrypt_auth(&mut document, false).unwrap());
+        let text = document.to_string();
+        assert!(!text.contains("encrypt-auth"), "{text}");
+        assert!(text.contains("# keep") && text.contains("# trailing"));
+    }
+
+    #[test]
+    fn encrypt_auth_is_written_to_an_explicit_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom.toml");
+        assert!(set_encrypt_auth(Some(&path), true).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            "encrypt-auth = true"
+        );
+        assert!(!set_encrypt_auth(Some(&path), true).unwrap());
+        assert!(set_encrypt_auth(Some(&path), false).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "");
+    }
 }

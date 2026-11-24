@@ -83,7 +83,11 @@ async fn run(
             .first()
             .is_some_and(|command| command == "auth")
     {
-        return auth::run(&options.command, options.settings.no_config);
+        return auth::run(
+            &options.command,
+            options.settings.no_config,
+            options.settings.config.as_deref(),
+        );
     }
     let mut config = options.config(&settings)?;
     if let Some(user) = &options.set_default_user {

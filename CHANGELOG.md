@@ -18,6 +18,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   when the new value is ready, without repeating the running count. Set
   either value to zero or less to turn that refresh off.
 
+- Switch saved credentials back to plaintext with `rmycli auth decrypt`. It
+  requires the master passphrase and an explicit confirmation, merges into any
+  existing plaintext auth file, clears `encrypt-auth`, and deletes the
+  encrypted file only after the plaintext copy is safely written.
+- `rmycli config set encrypt-auth` and `config unset encrypt-auth` now explain
+  when saved credentials remain in the other store and which `rmycli auth`
+  command moves them.
+
+### Changed
+
+- `rmycli auth encrypt` now merges into an existing encrypted store instead of
+  refusing, so enabling `encrypt-auth` before migrating no longer strands
+  plaintext credentials. Conflicting passwords are reported by endpoint and
+  user without changing either store. It verifies the encrypted file by reading
+  it back, sets `encrypt-auth = true`, and offers to delete the plaintext file.
+
 ### Fixed
 
 - Fix the macOS distribution workflow's `lipo` argument order so it can

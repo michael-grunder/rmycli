@@ -528,37 +528,72 @@ background connections or reconnects.
 
 ### Encrypted saved authentication
 
-To encrypt credentials from the first save, put this before any table headings
-in `rmycli.toml` (or use `rmycli config set encrypt-auth true`):
+To switch an existing setup to encrypted storage, including credentials that
+are already saved, run:
+
+```sh
+rmycli auth encrypt
+```
+
+This moves all accounts and saved default-user choices from the plaintext auth
+file into the encrypted store at `$XDG_CONFIG_HOME/rmycli/auth.enc` (normally
+`~/.config/rmycli/auth.enc`). It works as follows:
+
+1. Asks for the master passphrase: a new one, entered twice, when no encrypted
+   store exists; otherwise the existing one.
+2. Adds the plaintext accounts to the encrypted store. Accounts saved in both
+   with the same password are kept once. If any account has a different
+   password in each store, it names the endpoints and users (never passwords)
+   and changes nothing. The encrypted store keeps its default user when both
+   name one.
+3. Reads back and decrypts the written file to verify it.
+4. Sets `encrypt-auth = true` in `rmycli.toml` (or the `--config` file).
+5. Asks whether to delete the plaintext file (default yes). The file is deleted
+   only if it is unchanged since step 2 and is not a symlink or hard link.
+   Deleting does not securely erase data from SSDs, copy-on-write
+   filesystems, or backups. If the plaintext file may have been copied, change
+   those Redis passwords.
+
+To switch back to plaintext storage, run:
+
+```sh
+rmycli auth decrypt
+```
+
+This asks for the master passphrase, then asks you to confirm writing the
+stated number of passwords as plaintext (default no). It merges the accounts
+into `rmycli-auth.toml` with the same conflict rules; here the encrypted
+store's default users win. The plaintext file is rewritten in the standard
+layout without its comments, and it is owner-only (mode 0600) on Unix. Then
+`encrypt-auth` is removed from the config and the encrypted file is deleted.
+
+Both commands delete the old copy last. An existing encrypted file always
+takes precedence, so an interrupted run leaves a consistent store in use and
+can be repeated. If another session saves credentials during the run, the old
+copy is kept and the command asks you to run it again. Both commands require a
+terminal and never connect to Redis.
+
+Alternatively, to encrypt credentials from the first save, put this before any
+table headings in `rmycli.toml` (or use `rmycli config set encrypt-auth true`):
 
 ```toml
 encrypt-auth = true
 save-auth = "local" # Or "always"; encryption does not enable automatic saving.
 ```
 
-The encrypted store is `$XDG_CONFIG_HOME/rmycli/auth.enc`, normally
-`~/.config/rmycli/auth.enc`. The first successful authentication that needs to
-save credentials asks for a new master passphrase twice, with terminal echo
+Changing `encrypt-auth` only selects a store; it never moves credentials.
+`rmycli config set` prints a note when that leaves plaintext accounts behind,
+or when an existing encrypted file will still take precedence over
+`encrypt-auth = false`. The first successful authentication that needs to save
+credentials asks for a new master passphrase twice, with terminal echo
 disabled. Later sessions prompt when saved credentials are first needed.
 An existing encrypted file takes precedence even if `encrypt-auth` is false;
 its magic, version, and algorithms are validated before unlocking. A malformed
 file or failed unlock never falls back to plaintext. `--no-config` disables
 both stores. Explicit connection passwords bypass saved-password lookup.
-
-To migrate all accounts and saved default-user choices from the existing
-plaintext auth file, run:
-
-```sh
-rmycli auth encrypt
-```
-
-This creates a new encrypted file and refuses to overwrite an existing one.
-It asks for and confirms a master passphrase, then prints a warning naming the
-plaintext file that remains. Verify a new connection works, then delete that
-plaintext file yourself. Existing shells should be restarted after migration.
-Setting `encrypt-auth = true` alone starts a separate store; it does not import
-or delete plaintext credentials. Migration does not move passwords stored in
-`[instances]` in `rmycli.toml`; use environment variables for those passwords.
+Existing shells should be restarted after switching storage. Neither command
+moves passwords stored in `[instances]` in `rmycli.toml`; use environment
+variables for those passwords.
 
 Change the master passphrase without connecting to Redis:
 

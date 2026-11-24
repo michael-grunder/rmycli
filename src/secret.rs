@@ -41,6 +41,39 @@ pub fn master_passphrase(create: bool) -> io::Result<Zeroizing<String>> {
     Ok(first)
 }
 
+/// Ask a yes/no question on the terminal; Enter accepts `default` and
+/// end of input declines.
+pub fn confirm(question: &str, default: bool) -> io::Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::other(
+            "confirmation requires a terminal on stdin",
+        ));
+    }
+    let choices = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        eprint!("{question} {choices} ");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            eprintln!();
+            return Ok(false);
+        }
+        if let Some(answer) = answer(&line, default) {
+            return Ok(answer);
+        }
+        eprintln!("Please answer yes or no.");
+    }
+}
+
+fn answer(line: &str, default: bool) -> Option<bool> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "hidden input cancelled")
 }
@@ -112,4 +145,24 @@ pub fn read(label: &str) -> io::Result<Zeroizing<String>> {
     eprint!("\r\n");
     drop(guard);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::answer;
+
+    #[test]
+    fn confirmation_answers_use_the_default_only_for_empty_input() {
+        assert_eq!(answer("\n", true), Some(true));
+        assert_eq!(answer("  \n", false), Some(false));
+        for yes in ["y", "Y", "yes", " YES \n"] {
+            assert_eq!(answer(yes, false), Some(true));
+        }
+        for no in ["n", "No", "no\n"] {
+            assert_eq!(answer(no, true), Some(false));
+        }
+        for other in ["maybe", "ye", "yess", "0"] {
+            assert_eq!(answer(other, true), None);
+        }
+    }
 }
