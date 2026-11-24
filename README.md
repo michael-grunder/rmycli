@@ -895,6 +895,22 @@ In-memory history is bounded to 500 commands. Pasting text never
 submits a command. Output retention is controlled by your terminal's scrollback
 settings; the application does not keep a separate transcript.
 
+## Redis configuration parameter completion
+
+Press Tab after `CONFIG GET slowlog-` to choose from the connected server's
+matching parameter names. A plain prefix gets a trailing `*` for lookup.
+An explicit glob such as `slowlog-*` or `*max-len` goes to Redis as typed.
+Press Enter on `CONFIG GET slowlog-*` to display every matching name and value.
+
+`CONFIG SET` offers the same lookup in each parameter-name position. For
+example, `CONFIG SET slowlog-max-l<Tab>` completes the name so you can enter
+its value. Accepting a suggestion only edits the command line.
+
+Tab runs a single `CONFIG GET` on a background connection and uses only the
+names in its reply. Above `--completion-threshold`, the editor asks before
+showing the list. If your account lacks permission for `CONFIG GET`, you can
+still enter parameter names manually.
+
 ## Key completion
 
 For example:

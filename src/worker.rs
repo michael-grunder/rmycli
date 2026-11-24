@@ -22,6 +22,11 @@ pub enum Execution {
 }
 
 pub enum Assistance {
+    ConfigNames {
+        generation: u64,
+        config: Config,
+        pattern: Vec<u8>,
+    },
     KeysHint {
         generation: u64,
         config: Config,
@@ -73,9 +78,9 @@ pub enum Event {
     },
     Output(Vec<String>),
     Push(Vec<String>),
-    Scanned {
+    Discovered {
         generation: u64,
-        state: Discovery,
+        result: Result<Discovery, String>,
     },
     Estimated {
         generation: u64,
@@ -178,6 +183,32 @@ fn hint_connection<'a>(
     Ok(&mut cached.as_mut().expect("connected above").1)
 }
 
+fn discover_config(
+    config: &Config,
+    pattern: &[u8],
+) -> Result<Discovery, String> {
+    let entries = config
+        .connect_auxiliary()
+        .and_then(|mut connection| {
+            // Drop each value during decoding, including credentials.
+            redis::cmd("CONFIG")
+                .arg("GET")
+                .arg(pattern)
+                .query::<Vec<(Vec<u8>, ())>>(&mut connection)
+        })
+        .map_err(|error| {
+            format!(
+                "CONFIG GET completion unavailable ({})",
+                error.code().unwrap_or("lookup failed")
+            )
+        })?;
+    Ok(Discovery {
+        names: entries.into_iter().map(|(name, ())| name).collect(),
+        complete: true,
+        ..Discovery::default()
+    })
+}
+
 fn assist_loop(
     receiver: &Receiver<Assistance>,
     events: &SyncSender<Event>,
@@ -198,6 +229,19 @@ fn assist_loop(
             Err(RecvTimeoutError::Disconnected) => return,
         };
         match request {
+            Assistance::ConfigNames {
+                generation: expected,
+                config,
+                pattern,
+            } => {
+                if generation.load(Ordering::Relaxed) != expected {
+                    continue;
+                }
+                let _ = events.send(Event::Discovered {
+                    generation: expected,
+                    result: discover_config(&config, &pattern),
+                });
+            }
             request @ (Assistance::KeysHint { .. }
             | Assistance::SizeHint { .. }) => {
                 assist_size_hint(request, events, generation, &mut cached);
@@ -242,9 +286,9 @@ fn assist_loop(
                         ..state
                     },
                 };
-                let _ = events.send(Event::Scanned {
+                let _ = events.send(Event::Discovered {
                     generation: expected,
-                    state,
+                    result: Ok(state),
                 });
             }
             Assistance::Estimate {

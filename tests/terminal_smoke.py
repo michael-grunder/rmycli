@@ -729,6 +729,11 @@ def main():
             )
             terminal.send(b"PING\r")
             terminal.expect("PONG")
+            terminal.send(b"config set slowlog-max-l\t")
+            terminal.expect("config set slowlog-max-len")
+            terminal.send(b"\x15config get slowlog-*\r")
+            terminal.expect('"slowlog-log-slower-than"')
+            terminal.expect('"slowlog-max-len"')
             terminal.send(b"lrange")
             frame = terminal.expect_frame(
                 lambda f: f.hint_is_inline("lrange", " key start stop"),

@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Complete Redis parameter names with Tab in `CONFIG GET` and `CONFIG SET`.
+  Both accept prefixes and Redis globs for lookup, including `slowlog-*`.
 - Keep reply-size hints current while you pause on a line. Cheap counts such
   as `SCARD` and `DBSIZE` refresh every 500 ms by default
   (`size-hint-refresh-ms`), and `KEYS <pattern>` scans every 5000 ms

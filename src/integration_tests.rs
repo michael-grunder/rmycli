@@ -108,6 +108,60 @@ fn worker_command(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn config_completion_reads_matching_names_and_handles_denied_lookups() {
+    use crate::worker::{Assistance, Event, Workers};
+
+    let fixture = RedisFixture::new();
+    let workers =
+        Workers::start(Session::open(fixture.config.clone()).await.unwrap());
+    assert!(matches!(
+        workers.events.recv().unwrap(),
+        Event::Connected { .. }
+    ));
+    let lookup = |pattern: &[u8]| {
+        workers
+            .assistance
+            .send(Assistance::ConfigNames {
+                generation: workers.current(),
+                config: fixture.config.clone(),
+                pattern: pattern.to_vec(),
+            })
+            .unwrap();
+        let Event::Discovered { result, .. } =
+            workers.events.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected configuration names")
+        };
+        result
+    };
+    let slowlog = lookup(b"slowlog-*").unwrap();
+    assert!(slowlog.complete);
+    assert!(slowlog.names.contains(b"slowlog-max-len".as_slice()));
+    assert!(
+        slowlog
+            .names
+            .contains(b"slowlog-log-slower-than".as_slice())
+    );
+    assert!(
+        slowlog
+            .names
+            .iter()
+            .all(|name| name.starts_with(b"slowlog-"))
+    );
+    assert_eq!(
+        lookup(b"sl?wlog-*-le[n]").unwrap().names,
+        [b"slowlog-max-len".to_vec()].into()
+    );
+    assert!(lookup(b"no-such-parameter-*").unwrap().names.is_empty());
+    assert_eq!(
+        worker_command(&workers, "ACL SETUSER default -config|get"),
+        ["OK"]
+    );
+    assert!(lookup(b"slowlog-*").unwrap_err().contains("NOPERM"));
+    assert_eq!(worker_command(&workers, "PING"), ["PONG"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn alternate_keys_scans_selected_database_and_empty_batches() {
     use crate::worker::{Event, Execution, Workers};
     use std::sync::{Arc, atomic::AtomicBool};
@@ -412,8 +466,8 @@ fn live_metadata_typed_scan_binary_keys_and_estimates() {
         || false,
     );
     assert!(state.complete);
-    assert_eq!(state.keys.len(), 3);
-    assert!(state.keys.contains(b"list: b\xff".as_slice()));
+    assert_eq!(state.names.len(), 3);
+    assert!(state.names.contains(b"list: b\xff".as_slice()));
     let state = scan::discover(
         &mut connection,
         b"list:[x]*",
@@ -422,7 +476,7 @@ fn live_metadata_typed_scan_binary_keys_and_estimates() {
         &Limits::default(),
         || false,
     );
-    assert_eq!(state.keys.len(), 1);
+    assert_eq!(state.names.len(), 1);
     let args = input::parse("LRANGE list:a 0 -1")
         .words
         .into_iter()
@@ -596,7 +650,7 @@ async fn session_database_transaction_and_background_isolation() {
         &Limits::default(),
         || false,
     );
-    assert_eq!(scan.keys.len(), 1);
+    assert_eq!(scan.names.len(), 1);
     let Value::Array(replies) = execute(&mut session, "EXEC").await else {
         panic!("expected EXEC array")
     };

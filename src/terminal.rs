@@ -905,10 +905,10 @@ impl App {
                 self.status = message;
                 self.mode = Mode::Disconnected;
             }
-            Event::Scanned { generation, state }
-                if generation == self.workers.current() && !state.cancelled =>
+            Event::Discovered { generation, result }
+                if generation == self.workers.current() =>
             {
-                self.scan_result(state);
+                self.discovery_result(result);
             }
             Event::SizeHinted {
                 generation,
@@ -1224,7 +1224,7 @@ impl App {
                     if let Some(state) = self.scan.take() {
                         self.status = state.count_description();
                         self.show_candidates(
-                            self.key_candidates(state.keys),
+                            self.quote_candidates(state.names),
                             false,
                         );
                     }
@@ -1259,6 +1259,20 @@ impl App {
         self.invalidate();
         let ctx = input::context(&self.editor.line, self.editor.cursor);
         self.completion_span = ctx.replace.clone();
+        if let Some(pattern) = hints::config_parameter_pattern(&ctx) {
+            if self.mode == Mode::Ready {
+                self.status = "Looking up configuration parameters…".into();
+                let _ = self.workers.assistance.send(Assistance::ConfigNames {
+                    generation: self.workers.current(),
+                    config: self.config.clone(),
+                    pattern,
+                });
+            } else {
+                self.status =
+                    "Configuration lookup paused for session state".into();
+            }
+            return;
+        }
         let literals = self.catalog.literals(&ctx);
         if self
             .catalog
@@ -1296,7 +1310,7 @@ impl App {
         self.status = "Discovering keys… Esc or editing cancels".into();
         let mut limits = self.options.limits.clone();
         // Each explicit continuation permits another threshold-sized page.
-        limits.threshold = limits.threshold.saturating_add(state.keys.len());
+        limits.threshold = limits.threshold.saturating_add(state.names.len());
         let _ = self.workers.assistance.send(Assistance::Scan {
             generation: self.workers.current(),
             config: self.config.clone(),
@@ -1308,10 +1322,19 @@ impl App {
         });
     }
 
-    fn scan_result(&mut self, state: Discovery) {
+    fn discovery_result(&mut self, result: Result<Discovery, String>) {
+        let state = match result {
+            Ok(state) if state.cancelled => return,
+            Ok(state) => state,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
         self.status = format!("{} {}", state.count_description(), state.notice);
-        if state.complete && state.keys.len() <= self.options.limits.threshold {
-            self.show_candidates(self.key_candidates(state.keys), true);
+        if state.complete && state.names.len() <= self.options.limits.threshold
+        {
+            self.show_candidates(self.quote_candidates(state.names), true);
         } else {
             self.status.push_str(if state.complete || state.hard_limit {
                 " • Show candidates? [y/N]"
@@ -1322,13 +1345,14 @@ impl App {
         }
     }
 
-    fn key_candidates(
+    fn quote_candidates(
         &self,
-        keys: std::collections::BTreeSet<Vec<u8>>,
+        names: std::collections::BTreeSet<Vec<u8>>,
     ) -> Vec<String> {
         let original = &self.editor.line[self.completion_span.clone()];
-        keys.into_iter()
-            .map(|key| input::quote_like(&key, original))
+        names
+            .into_iter()
+            .map(|name| input::quote_like(&name, original))
             .collect()
     }
 
@@ -2099,6 +2123,50 @@ mod tests {
     }
 
     #[test]
+    fn config_completion_confirms_large_lists_and_only_edits_the_name() {
+        let (mut app, mut executed) = test_app();
+        let (assistance, requests) = std::sync::mpsc::channel();
+        app.workers.assistance = assistance;
+        app.editor.line = "config set 'slowlog-*' 128".into();
+        app.editor.cursor = "config set 'slowlog-*".len();
+        app.options.limits.threshold = 1;
+
+        app.mode = Mode::Stateful;
+        app.complete(false);
+        assert!(requests.try_recv().is_err());
+        app.mode = Mode::Ready;
+        app.complete(false);
+        let Assistance::ConfigNames {
+            generation,
+            pattern,
+            ..
+        } = requests.try_recv().unwrap()
+        else {
+            panic!("expected CONFIG lookup")
+        };
+        assert_eq!(pattern, b"slowlog-*");
+        app.on_worker(Event::Discovered {
+            generation,
+            result: Ok(Discovery {
+                names: [
+                    b"slowlog-max-len".to_vec(),
+                    b"slowlog-log-slower-than".to_vec(),
+                ]
+                .into(),
+                complete: true,
+                ..Discovery::default()
+            }),
+        });
+        assert!(app.popup.is_none());
+        assert!(app.status.contains("2 matches"));
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.line, "config set 'slowlog-max-len' 128");
+        assert!(executed.try_recv().is_err());
+    }
+
+    #[test]
     fn history_search_recalls_without_executing_and_ignores_stale_work() {
         let (mut app, mut executed) = test_app();
         app.editor.line.clear();
@@ -2117,13 +2185,15 @@ mod tests {
             generation: 0,
             count: Some(1),
         });
-        app.on_worker(Event::Scanned {
+        app.on_worker(Event::Discovered {
             generation: 0,
-            state: Discovery {
-                keys: std::collections::BTreeSet::from([b"unrelated".to_vec()]),
+            result: Ok(Discovery {
+                names: std::collections::BTreeSet::from(
+                    [b"unrelated".to_vec()],
+                ),
                 complete: true,
                 ..Discovery::default()
-            },
+            }),
         });
         assert!(app.popup.is_none());
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
@@ -3439,13 +3509,13 @@ mod tests {
     fn editing_invalidates_scan_results_and_pending_execution() {
         let (mut app, mut executed) = test_app();
         app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        app.on_worker(Event::Scanned {
+        app.on_worker(Event::Discovered {
             generation: 0,
-            state: Discovery {
-                keys: std::collections::BTreeSet::from([b"a-key".to_vec()]),
+            result: Ok(Discovery {
+                names: std::collections::BTreeSet::from([b"a-key".to_vec()]),
                 complete: true,
                 ..Discovery::default()
-            },
+            }),
         });
         app.on_worker(Event::Estimated {
             generation: 0,

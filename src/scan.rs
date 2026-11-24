@@ -29,7 +29,7 @@ impl Default for Limits {
 #[derive(Clone, Debug, Default)]
 pub struct Discovery {
     pub cursor: u64,
-    pub keys: BTreeSet<Vec<u8>>,
+    pub names: BTreeSet<Vec<u8>>,
     pub bytes: usize,
     pub complete: bool,
     pub hard_limit: bool,
@@ -40,9 +40,9 @@ pub struct Discovery {
 impl Discovery {
     pub fn count_description(&self) -> String {
         if self.complete {
-            format!("{} matches", self.keys.len())
+            format!("{} matches", self.names.len())
         } else {
-            format!("at least {} matches (partial scan)", self.keys.len())
+            format!("at least {} matches (partial scan)", self.names.len())
         }
     }
 }
@@ -118,10 +118,10 @@ pub fn discover(
         }
         state.cursor = batch.0;
         for key in batch.1 {
-            if !key.starts_with(prefix) || state.keys.contains(&key) {
+            if !key.starts_with(prefix) || state.names.contains(&key) {
                 continue;
             }
-            if state.keys.len() >= limits.keys
+            if state.names.len() >= limits.keys
                 || key.len() > limits.bytes.saturating_sub(state.bytes)
             {
                 state.hard_limit = true;
@@ -129,10 +129,10 @@ pub fn discover(
                 return state;
             }
             state.bytes += key.len();
-            state.keys.insert(key);
+            state.names.insert(key);
         }
         state.complete = state.cursor == 0;
-        if state.complete || state.keys.len() > limits.threshold {
+        if state.complete || state.names.len() > limits.threshold {
             return state;
         }
     }
@@ -185,7 +185,7 @@ mod tests {
         );
         assert_eq!(source.calls, 3);
         assert!(state.complete);
-        assert_eq!(state.keys.len(), 2);
+        assert_eq!(state.names.len(), 2);
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
             || false,
         );
         assert!(state.complete);
-        assert_eq!(state.keys.len(), 2);
+        assert_eq!(state.names.len(), 2);
     }
 
     #[test]
@@ -242,7 +242,7 @@ mod tests {
             || false,
         );
         assert!(!state.complete);
-        assert_eq!(state.keys.len(), 1);
+        assert_eq!(state.names.len(), 1);
         let state = discover(
             &mut source,
             b"list:",
@@ -301,7 +301,7 @@ mod tests {
         );
         assert!(partial.hard_limit);
         assert!(!partial.complete);
-        assert!(partial.keys.is_empty());
+        assert!(partial.names.is_empty());
     }
 
     #[test]
